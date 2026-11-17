@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import {
   AlertTriangle,
   Columns3,
+  Download,
   ExternalLink,
   FolderDown,
   Github,
@@ -13,6 +14,7 @@ import {
   Mail,
   MessageCircle,
   MessageSquare,
+  RefreshCw,
   ShieldCheck,
   SlidersHorizontal,
   UserRound,
@@ -22,9 +24,11 @@ import { APP_VERSION } from '../core/appInfo'
 import { getSavePicker } from '../core/save'
 
 const titleRef = ref<HTMLHeadingElement | null>(null)
+const isDesktopApp = window.location.port === '47831'
+const updateState = ref<'idle' | 'checking' | 'started' | 'error'>('idle')
+const updateMessage = ref('')
 
-const runtimeLabel =
-  window.location.port === '47831' ? '免安装 EXE · 本机服务' : '浏览器页面 · 本机处理'
+const runtimeLabel = isDesktopApp ? '免安装 EXE · 本机服务' : '浏览器页面 · 本机处理'
 
 const saveLocationLabel = getSavePicker()
   ? '系统保存对话框'
@@ -88,6 +92,16 @@ const features = [
     title: '保存与恢复',
     detail: 'PNG / JPEG / WebP，导出后保留一次恢复快照',
   },
+  {
+    icon: Download,
+    title: '检查更新',
+    detail: '启动自动检查，也可在关于页或托盘手动检查',
+  },
+  {
+    icon: RefreshCw,
+    title: '自动安装',
+    detail: '下载显示进度，校验后自动替换并重启',
+  },
 ]
 
 const shortcuts = [
@@ -98,6 +112,30 @@ const shortcuts = [
   { keys: ['↑', '↓', '←', '→'], label: '平移画面' },
   { keys: ['Alt', '↑', '↓'], label: '调整队列顺序' },
 ]
+
+async function checkForUpdate(): Promise<void> {
+  if (!isDesktopApp || updateState.value === 'checking') {
+    return
+  }
+
+  updateState.value = 'checking'
+  updateMessage.value = '正在打开检查窗口…'
+  try {
+    const response = await fetch('/api/update/check', {
+      method: 'POST',
+      headers: { 'X-Yisi-Update': '1' },
+    })
+    if (!response.ok) {
+      throw new Error(`本地更新服务返回 ${response.status}`)
+    }
+    updateState.value = 'started'
+    updateMessage.value = '已发起检查，请在弹出的窗口查看结果。'
+  } catch (error) {
+    updateState.value = 'error'
+    updateMessage.value =
+      error instanceof Error ? error.message : '无法连接本地更新服务，请稍后重试。'
+  }
+}
 
 function focusTitle(): void {
   titleRef.value?.focus()
@@ -151,7 +189,46 @@ defineExpose({ focusTitle })
           <dt>输出格式</dt>
           <dd>PNG / JPEG / WebP · 原图尺寸 · 白底</dd>
         </div>
+        <div class="about-fact">
+          <dt>更新来源</dt>
+          <dd>GitHub / Gitee Release</dd>
+        </div>
+        <div class="about-fact">
+          <dt>更新方式</dt>
+          <dd>启动检查 · 下载进度 · SHA-256 校验</dd>
+        </div>
       </dl>
+    </section>
+
+    <section class="about-section" aria-labelledby="about-update-title">
+      <div class="about-update-head">
+        <h3 id="about-update-title">软件更新</h3>
+        <span class="about-update-badge">自动检查已开启</span>
+      </div>
+      <p class="about-update-copy">
+        启动后自动检查更新，最多每 24 小时一次。下载会显示进度并校验 SHA-256，
+        通过后由安装器替换并重启；浏览器页面不能直接覆盖 EXE。
+      </p>
+      <div v-if="isDesktopApp" class="about-update-actions">
+        <button
+          type="button"
+          class="about-update-button"
+          :disabled="updateState === 'checking'"
+          @click="checkForUpdate"
+        >
+          <RefreshCw :size="13" :stroke-width="1.9" aria-hidden="true" />
+          {{ updateState === 'checking' ? '正在检查…' : '立即检查更新' }}
+        </button>
+        <span
+          v-if="updateMessage"
+          class="about-update-status"
+          :class="{ 'about-update-status--error': updateState === 'error' }"
+          role="status"
+        >
+          {{ updateMessage }}
+        </span>
+      </div>
+      <p v-else class="about-update-note">更新检查与安装仅在免安装 EXE 中可用。</p>
     </section>
 
     <section class="about-section" aria-labelledby="about-features-title">
@@ -409,6 +486,83 @@ defineExpose({ focusTitle })
 
 .about-fact dd a:hover {
   text-decoration: underline;
+}
+
+.about-update-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 9px;
+}
+
+.about-update-head h3 {
+  margin: 0;
+}
+
+.about-update-badge {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border: 1px solid var(--accent-line);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.about-update-copy {
+  max-width: 760px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.7;
+}
+
+.about-update-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.about-update-button {
+  display: inline-flex;
+  height: 30px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  border: 1px solid var(--accent-line-strong);
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background-color 0.15s var(--ease),
+    border-color 0.15s var(--ease);
+}
+
+.about-update-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--surface-accent);
+}
+
+.about-update-button:disabled {
+  cursor: wait;
+  opacity: 0.64;
+}
+
+.about-update-status,
+.about-update-note {
+  color: var(--text-faint);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+.about-update-status--error {
+  color: var(--danger);
 }
 
 .about-projects {

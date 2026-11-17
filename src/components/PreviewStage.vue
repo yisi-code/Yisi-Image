@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   ImagePlus,
   Loader2,
@@ -34,7 +34,6 @@ const emit = defineEmits<{
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 const viewportRef = ref<HTMLDivElement | null>(null)
-const thumbnailRailRef = ref<HTMLElement | null>(null)
 const zoom = ref(1)
 const maxZoom = ref(4)
 const offset = ref({ x: 0, y: 0 })
@@ -68,28 +67,6 @@ function resetView(): void {
   offset.value = { x: 0, y: 0 }
   isPanning.value = false
   panState = null
-}
-
-async function scrollActiveThumbnail(id: string | null): Promise<void> {
-  await nextTick()
-  const rail = thumbnailRailRef.value
-  if (!rail || !id) {
-    return
-  }
-  const button = Array.from(rail.querySelectorAll<HTMLElement>('[data-image-id]')).find(
-    (element) => element.dataset.imageId === id,
-  )
-  if (!button) {
-    return
-  }
-
-  const top = button.offsetTop
-  const bottom = top + button.offsetHeight
-  if (top < rail.scrollTop + 6) {
-    rail.scrollTop = Math.max(0, top - 6)
-  } else if (bottom > rail.scrollTop + rail.clientHeight - 6) {
-    rail.scrollTop = bottom - rail.clientHeight + 6
-  }
 }
 
 function updateActiveImage(): void {
@@ -365,10 +342,6 @@ watch(
   { flush: 'post' },
 )
 
-watch(activeImageId, (id) => {
-  void scrollActiveThumbnail(id)
-})
-
 onMounted(() => {
   scheduleRender()
   window.addEventListener('resize', handleResize)
@@ -388,10 +361,35 @@ defineExpose({ focusImage })
     v-on="dropHandlers"
   >
     <div v-if="images.length > 0" class="preview-workbench">
+      <nav
+        class="preview-thumbnails"
+        :class="`preview-thumbnails--${layout.direction}`"
+        aria-label="图片缩略图导航"
+      >
+        <button
+          v-for="(image, index) in images"
+          :key="image.id"
+          class="preview-thumbnail"
+          :class="{ 'is-active': image.id === activeImageId }"
+          type="button"
+          :data-image-id="image.id"
+          :aria-label="`定位并放大到第 ${index + 1} 张：${image.name}`"
+          :aria-current="image.id === activeImageId ? 'true' : undefined"
+          @click="focusImage(index)"
+        >
+          <img :src="image.url" alt="" draggable="false" />
+          <span class="preview-thumbnail__index tnum">{{ index + 1 }}</span>
+        </button>
+      </nav>
+
       <div
         ref="viewportRef"
         class="stage-viewport"
-        :class="{ 'is-panning': isPanning, 'is-zoomed': zoom > 1 }"
+        :class="{
+          'stage-viewport--vertical': layout.direction === 'vertical',
+          'is-panning': isPanning,
+          'is-zoomed': zoom > 1,
+        }"
         role="region"
         tabindex="0"
         aria-label="预览视口，滚轮缩放，放大后可拖动查看，按 0 恢复适应窗口"
@@ -410,27 +408,6 @@ defineExpose({ focusImage })
           :aria-label="previewLabel"
         />
       </div>
-
-      <nav
-        ref="thumbnailRailRef"
-        class="preview-thumbnails"
-        aria-label="图片缩略图导航"
-      >
-        <button
-          v-for="(image, index) in images"
-          :key="image.id"
-          class="preview-thumbnail"
-          :class="{ 'is-active': image.id === activeImageId }"
-          type="button"
-          :data-image-id="image.id"
-          :aria-label="`定位并放大到第 ${index + 1} 张：${image.name}`"
-          :aria-current="image.id === activeImageId ? 'true' : undefined"
-          @click="focusImage(index)"
-        >
-          <img :src="image.url" alt="" draggable="false" />
-          <span class="preview-thumbnail__index tnum">{{ index + 1 }}</span>
-        </button>
-      </nav>
     </div>
 
     <div v-else-if="isImporting" class="stage-loading" role="status">
@@ -507,7 +484,12 @@ defineExpose({ focusImage })
       <span class="zoom-hint" aria-hidden="true">滚轮缩放 · 拖动查看</span>
     </div>
 
-    <div v-if="isImporting && images.length > 0" class="stage-busy" role="status">
+    <div
+      v-if="isImporting && images.length > 0"
+      class="stage-busy"
+      :class="{ 'stage-busy--beside-rail': layout.direction === 'vertical' }"
+      role="status"
+    >
       <Loader2 class="spin" :size="13" :stroke-width="2" />
       <span class="tnum">正在添加 {{ progress.done }}/{{ progress.total }}</span>
     </div>
@@ -547,7 +529,7 @@ defineExpose({ focusImage })
 
 .stage-viewport {
   position: absolute;
-  inset: 24px 102px 24px 24px;
+  inset: 82px 24px 24px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -557,28 +539,40 @@ defineExpose({ focusImage })
   touch-action: none;
 }
 
+.stage-viewport--vertical {
+  inset: 24px 102px 24px 24px;
+}
+
 .preview-thumbnails {
   position: absolute;
   z-index: 2;
-  top: 14px;
-  right: 10px;
-  bottom: 54px;
   display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  overflow: hidden;
+  padding: 0;
+}
+
+.preview-thumbnails--horizontal {
+  top: 14px;
+  right: 24px;
+  left: 24px;
+  height: 54px;
+  flex-direction: row;
+}
+
+.preview-thumbnails--vertical {
+  top: 24px;
+  right: 24px;
+  bottom: 24px;
   width: 74px;
   flex-direction: column;
-  gap: 6px;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  padding: 2px;
-  scrollbar-width: thin;
 }
 
 .preview-thumbnail {
   position: relative;
   display: block;
-  width: 70px;
-  height: 50px;
-  flex: 0 0 auto;
   overflow: hidden;
   padding: 0;
   border: 2px solid transparent;
@@ -589,6 +583,23 @@ defineExpose({ focusImage })
   transition:
     border-color 0.15s var(--ease),
     box-shadow 0.15s var(--ease);
+}
+
+.preview-thumbnails--horizontal .preview-thumbnail {
+  width: auto;
+  min-width: 0;
+  max-width: 86px;
+  height: 50px;
+  flex: 1 1 0;
+}
+
+.preview-thumbnails--vertical .preview-thumbnail {
+  width: 70px;
+  max-width: 70px;
+  height: auto;
+  min-height: 0;
+  max-height: 50px;
+  flex: 1 1 0;
 }
 
 .preview-thumbnail img {
@@ -848,8 +859,9 @@ defineExpose({ focusImage })
 
 .stage-busy {
   position: absolute;
-  top: 12px;
-  right: 98px;
+  right: 24px;
+  bottom: 52px;
+  z-index: 3;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -861,6 +873,10 @@ defineExpose({ focusImage })
   font-size: 10.5px;
   box-shadow: var(--shadow-xs);
   backdrop-filter: blur(4px);
+}
+
+.stage-busy--beside-rail {
+  right: 106px;
 }
 
 .stage-drop-overlay {
@@ -909,18 +925,40 @@ defineExpose({ focusImage })
   }
 
   .stage-viewport {
+    inset: 64px 16px 16px;
+  }
+
+  .stage-viewport--vertical {
     inset: 16px 86px 16px 16px;
   }
 
   .preview-thumbnails {
-    right: 6px;
-    bottom: 50px;
-    width: 68px;
+    gap: 4px;
   }
 
-  .preview-thumbnail {
+  .preview-thumbnails--horizontal {
+    top: 10px;
+    right: 16px;
+    left: 16px;
+    height: 48px;
+  }
+
+  .preview-thumbnails--vertical {
+    top: 16px;
+    right: 16px;
+    bottom: 16px;
     width: 62px;
+  }
+
+  .preview-thumbnails--horizontal .preview-thumbnail {
     height: 44px;
+    max-width: 70px;
+  }
+
+  .preview-thumbnails--vertical .preview-thumbnail {
+    width: 58px;
+    max-width: 58px;
+    max-height: 44px;
   }
 
   .zoom-toolbar {
@@ -929,7 +967,12 @@ defineExpose({ focusImage })
   }
 
   .stage-busy {
-    right: 82px;
+    right: 16px;
+    bottom: 46px;
+  }
+
+  .stage-busy--beside-rail {
+    right: 88px;
   }
 
   .zoom-hint {

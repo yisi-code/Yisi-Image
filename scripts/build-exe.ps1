@@ -58,7 +58,14 @@ try {
 
     $icon = Join-Path $launcher 'icon.ico'
     $manifest = Join-Path $launcher 'app.manifest'
-    $source = Join-Path $launcher 'Program.cs'
+    $sources = @(Get-ChildItem -LiteralPath $launcher -Filter '*.cs' | Sort-Object Name | ForEach-Object { $_.FullName })
+    $webExtensions = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\System.Web.Extensions.dll'
+    if (!(Test-Path -LiteralPath $webExtensions)) {
+        $webExtensions = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\System.Web.Extensions.dll'
+    }
+    if (!(Test-Path -LiteralPath $webExtensions)) {
+        throw 'System.Web.Extensions.dll was not found.'
+    }
 
     $cscArgs = @(
         '/nologo',
@@ -75,9 +82,10 @@ try {
         '/reference:System.Windows.Forms.dll',
         '/reference:System.IO.Compression.dll',
         '/reference:System.IO.Compression.FileSystem.dll',
-        ('/out:' + $tempExe),
-        $source
+        ('/reference:' + $webExtensions),
+        ('/out:' + $tempExe)
     )
+    $cscArgs += $sources
 
     & $csc $cscArgs
     if ($LASTEXITCODE -ne 0) {

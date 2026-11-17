@@ -15,8 +15,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("本地多图拼接工具")]
 [assembly: AssemblyProduct("Yisi 图像工具")]
 [assembly: AssemblyCompany("Yisi")]
-[assembly: AssemblyVersion("0.5.0.0")]
-[assembly: AssemblyFileVersion("0.5.0.0")]
+[assembly: AssemblyVersion("0.6.0.0")]
+[assembly: AssemblyFileVersion("0.6.0.0")]
 
 namespace Yisi.ImageTool
 {
@@ -30,6 +30,13 @@ namespace Yisi.ImageTool
         private static void Main(string[] args)
         {
             bool openBrowser = !HasArgument(args, "--no-browser");
+            bool autoUpdate = !HasArgument(args, "--no-update");
+            bool devUpdate = HasArgument(args, "--dev-update");
+            if (devUpdate)
+            {
+                UpdateService.UseCustomSource(Environment.GetEnvironmentVariable("YISI_UPDATE_BASE"));
+            }
+
             bool createdNew;
             using (Mutex mutex = new Mutex(true, MutexName, out createdNew))
             {
@@ -56,6 +63,13 @@ namespace Yisi.ImageTool
                     return;
                 }
 
+                UpdateInstaller.CleanupOldFiles();
+                if (HasArgument(args, "--dev-update-selftest"))
+                {
+                    RunUpdateSelfTest();
+                    return;
+                }
+
                 try
                 {
                     Application.EnableVisualStyles();
@@ -65,7 +79,7 @@ namespace Yisi.ImageTool
                         ShowError("运行异常：\n" + e.Exception.Message);
                     };
 
-                    Application.Run(new TrayContext(openBrowser));
+                    Application.Run(new TrayContext(openBrowser, autoUpdate));
                 }
                 catch (Exception ex)
                 {
@@ -109,6 +123,52 @@ namespace Yisi.ImageTool
         internal static void ShowError(string message)
         {
             MessageBox.Show(message, "Yisi 图像工具", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+
+        /// <summary>
+        /// 仅用于自动化验证更新链路：不显示界面，直接检查、下载、校验并交给替换脚本。
+        /// 必须在 --dev-update 且设置 YISI_UPDATE_BASE 时使用。
+        /// </summary>
+        private static void RunUpdateSelfTest()
+        {
+            string log = Path.Combine(Path.GetTempPath(), "YisiImageTool-update-selftest.log");
+            StringBuilder lines = new StringBuilder();
+            try
+            {
+                lines.AppendLine("CURRENT " + UpdateService.FormatVersion(UpdateService.CurrentVersion()));
+                UpdateInfo info = UpdateService.CheckForUpdate();
+                if (info == null)
+                {
+                    lines.AppendLine("NO_UPDATE");
+                }
+                else
+                {
+                    lines.AppendLine("FOUND " + info.VersionText + " " + info.Source);
+                    string path = UpdateService.Download(
+                        info,
+                        delegate(int percent, long received, long total)
+                        {
+                            lines.AppendLine("PROGRESS " + percent + " " + received + "/" + total);
+                        },
+                        delegate { return false; });
+                    lines.AppendLine("DOWNLOADED " + path);
+                    UpdateInstaller.Launch(path);
+                    lines.AppendLine("LAUNCHED");
+                }
+            }
+            catch (Exception ex)
+            {
+                lines.AppendLine("ERROR " + ex.Message);
+            }
+
+            try
+            {
+                File.WriteAllText(log, lines.ToString(), new UTF8Encoding(false));
+            }
+            catch
+            {
+                // 自测日志写不了时不影响进程状态。
+            }
         }
 
         private static bool HasArgument(string[] args, string value)
@@ -162,10 +222,19 @@ namespace Yisi.ImageTool
         private readonly ContextMenuStrip trayMenu;
         private readonly StaticServer server;
         private readonly Icon appIcon;
+        private readonly SynchronizationContext uiContext;
+        private readonly ToolStripMenuItem updateItem;
+        private readonly System.Windows.Forms.Timer updateTimer;
+        private bool isCheckingUpdate;
         private bool isCleanedUp;
 
-        public TrayContext(bool openBrowser)
+        public TrayContext(bool openBrowser, bool autoUpdate)
         {
+            uiContext = SynchronizationContext.Current;
+            if (uiContext == null)
+            {
+                uiContext = new WindowsFormsSynchronizationContext();
+            }
             server = new StaticServer(Program.AppUrl);
             server.Start();
 
@@ -175,11 +244,22 @@ namespace Yisi.ImageTool
             openItem.Font = new Font(openItem.Font, FontStyle.Bold);
             openItem.Click += delegate { Program.OpenBrowser(); };
 
+            updateItem = new ToolStripMenuItem("检查更新");
+            updateItem.Click += delegate { CheckForUpdates(true); };
+
+            // 关于页只能发起检查；下载、校验和替换由启动器负责。
+            server.CheckUpdateRequested = delegate
+            {
+                uiContext.Post(delegate { CheckForUpdates(true); }, null);
+            };
+
             ToolStripMenuItem exitItem = new ToolStripMenuItem("退出");
             exitItem.Click += delegate { ExitApplication(); };
 
             trayMenu = new ContextMenuStrip();
             trayMenu.Items.Add(openItem);
+            trayMenu.Items.Add(new ToolStripSeparator());
+            trayMenu.Items.Add(updateItem);
             trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add(exitItem);
 
@@ -189,6 +269,18 @@ namespace Yisi.ImageTool
             trayIcon.ContextMenuStrip = trayMenu;
             trayIcon.DoubleClick += delegate { Program.OpenBrowser(); };
             trayIcon.Visible = true;
+
+            updateTimer = new System.Windows.Forms.Timer();
+            updateTimer.Interval = 3000;
+            updateTimer.Tick += delegate
+            {
+                updateTimer.Stop();
+                if (autoUpdate && UpdateSettings.ShouldAutoCheck())
+                {
+                    CheckForUpdates(false);
+                }
+            };
+            updateTimer.Start();
 
             if (openBrowser)
             {
@@ -219,6 +311,97 @@ namespace Yisi.ImageTool
             return (Icon)SystemIcons.Application.Clone();
         }
 
+        private void CheckForUpdates(bool manual)
+        {
+            if (isCheckingUpdate)
+            {
+                return;
+            }
+
+            isCheckingUpdate = true;
+            updateItem.Enabled = false;
+            updateItem.Text = "正在检查更新…";
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                UpdateInfo info = null;
+                string error = null;
+                try
+                {
+                    info = UpdateService.CheckForUpdate();
+                }
+                catch (Exception ex)
+                {
+                    error = ex.Message;
+                }
+
+                uiContext.Post(delegate { FinishUpdateCheck(manual, info, error); }, null);
+            });
+        }
+
+        private void FinishUpdateCheck(bool manual, UpdateInfo info, string error)
+        {
+            isCheckingUpdate = false;
+            updateItem.Enabled = true;
+            updateItem.Text = "检查更新";
+
+            if (!string.IsNullOrWhiteSpace(error))
+            {
+                if (manual)
+                {
+                    Program.ShowError("检查更新失败：\n" + error + "\n\n请检查网络后重试。");
+                }
+                return;
+            }
+
+            UpdateSettings.MarkChecked();
+            if (info == null)
+            {
+                if (manual)
+                {
+                    MessageBox.Show(
+                        "当前已是最新版本 v" +
+                        UpdateService.FormatVersion(UpdateService.CurrentVersion()) + "。",
+                        "Yisi 图像工具",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                }
+                return;
+            }
+
+            if (!manual &&
+                string.Equals(
+                    UpdateSettings.PromptedVersion(),
+                    info.VersionText,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            UpdateSettings.MarkPrompted(info.VersionText);
+            using (UpdateForm form = new UpdateForm(info, UpdateService.CurrentVersion(), appIcon))
+            {
+                form.ShowDialog();
+                if (!form.InstallRequested || string.IsNullOrWhiteSpace(form.DownloadedPath))
+                {
+                    return;
+                }
+
+                try
+                {
+                    UpdateInstaller.Launch(form.DownloadedPath);
+                    Cleanup();
+                    ExitThread();
+                }
+                catch (Exception ex)
+                {
+                    Program.ShowError(
+                        "无法启动自动安装：\n" + ex.Message +
+                        "\n\n程序仍可继续使用，请稍后到发布页手动下载。");
+                }
+            }
+        }
+
         private void ExitApplication()
         {
             Cleanup();
@@ -233,6 +416,8 @@ namespace Yisi.ImageTool
             }
 
             isCleanedUp = true;
+            updateTimer.Stop();
+            updateTimer.Dispose();
             trayIcon.Visible = false;
             trayIcon.Dispose();
             trayMenu.Dispose();
@@ -257,6 +442,12 @@ namespace Yisi.ImageTool
         private readonly Dictionary<string, byte[]> assets;
         private TcpListener listener;
         private volatile bool running;
+
+        /// <summary>
+        /// 关于页点「检查更新」时由本地 HTTP 线程转回 WinForms UI 线程。
+        /// 页面本身没有权限替换 EXE，实际下载与安装仍由更新窗口完成。
+        /// </summary>
+        internal Action CheckUpdateRequested { get; set; }
 
         public StaticServer(string url)
         {
@@ -353,7 +544,7 @@ namespace Yisi.ImageTool
                         }
 
                         string method = parts[0].ToUpperInvariant();
-                        if (method != "GET" && method != "HEAD")
+                        if (method != "GET" && method != "HEAD" && method != "POST")
                         {
                             WriteResponse(
                                 stream,
@@ -379,6 +570,55 @@ namespace Yisi.ImageTool
                         catch
                         {
                             path = target;
+                        }
+
+                        if (path == "/api/update/check")
+                        {
+                            if (method != "POST" ||
+                                request.IndexOf(
+                                    "X-Yisi-Update: 1",
+                                    StringComparison.OrdinalIgnoreCase) < 0)
+                            {
+                                WriteResponse(
+                                    stream,
+                                    "403 Forbidden",
+                                    "text/plain; charset=utf-8",
+                                    Encoding.UTF8.GetBytes("Forbidden"),
+                                    false);
+                                return;
+                            }
+
+                            Action callback = CheckUpdateRequested;
+                            if (callback == null)
+                            {
+                                WriteResponse(
+                                    stream,
+                                    "503 Service Unavailable",
+                                    "text/plain; charset=utf-8",
+                                    Encoding.UTF8.GetBytes("Updater unavailable"),
+                                    false);
+                                return;
+                            }
+
+                            callback();
+                            WriteResponse(
+                                stream,
+                                "202 Accepted",
+                                "application/json; charset=utf-8",
+                                Encoding.UTF8.GetBytes("{\"ok\":true}"),
+                                false);
+                            return;
+                        }
+
+                        if (method == "POST")
+                        {
+                            WriteResponse(
+                                stream,
+                                "405 Method Not Allowed",
+                                "text/plain; charset=utf-8",
+                                Encoding.UTF8.GetBytes("Method Not Allowed"),
+                                false);
+                            return;
                         }
 
                         if (string.IsNullOrEmpty(path) || path == "/")
