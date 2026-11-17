@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   ImagePlus,
   Loader2,
@@ -18,6 +18,12 @@ import {
   getPreviewFit,
 } from '../core/preview'
 import { renderStitchView } from '../core/render'
+import { THUMBNAIL_SIZE_PX } from '../core/settings'
+import type {
+  ThumbnailFit,
+  ThumbnailOrientation,
+  ThumbnailSize,
+} from '../core/settings'
 import type { ImportProgress, StitchImage, StitchLayout } from '../core/types'
 
 const props = defineProps<{
@@ -25,6 +31,9 @@ const props = defineProps<{
   layout: StitchLayout
   isImporting: boolean
   progress: ImportProgress
+  thumbOrientation: ThumbnailOrientation
+  thumbSize: ThumbnailSize
+  thumbFit: ThumbnailFit
 }>()
 
 const emit = defineEmits<{
@@ -39,6 +48,7 @@ const maxZoom = ref(4)
 const offset = ref({ x: 0, y: 0 })
 const isPanning = ref(false)
 const activeImageId = ref<string | null>(null)
+const thumbnailRailRef = ref<HTMLElement | null>(null)
 let renderFrame = 0
 let panState: {
   pointerId: number
@@ -56,6 +66,21 @@ const { isFileDragging, dropHandlers } = useFileDrop((files) => emit('add', file
 
 const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`)
 const maxZoomPercent = computed(() => `${Math.round(maxZoom.value * 100)}%`)
+
+const resolvedThumbOrientation = computed<'horizontal' | 'vertical'>(() =>
+  props.thumbOrientation === 'auto'
+    ? props.layout.direction
+    : props.thumbOrientation,
+)
+
+const thumbStyle = computed<Record<string, string>>(() => {
+  const size = THUMBNAIL_SIZE_PX[props.thumbSize]
+  return {
+    '--thumb-w': `${size.width}px`,
+    '--thumb-h': `${size.height}px`,
+    '--thumb-fit': props.thumbFit,
+  }
+})
 
 const previewLabel = computed(
   () =>
@@ -119,6 +144,65 @@ function focusImage(index: number): void {
   )
   activeImageId.value = item.id
   scheduleRender()
+}
+
+async function scrollActiveThumbnail(id: string | null): Promise<void> {
+  await nextTick()
+  const rail = thumbnailRailRef.value
+  if (!rail || !id) {
+    return
+  }
+  const button = Array.from(
+    rail.querySelectorAll<HTMLElement>('[data-image-id]'),
+  ).find((item) => item.dataset.imageId === id)
+  if (!button) {
+    return
+  }
+
+  const padding = 8
+  const railRect = rail.getBoundingClientRect()
+  const buttonRect = button.getBoundingClientRect()
+  if (resolvedThumbOrientation.value === 'horizontal') {
+    if (buttonRect.left < railRect.left + padding) {
+      rail.scrollBy({
+        left: buttonRect.left - railRect.left - padding,
+        behavior: 'smooth',
+      })
+    } else if (buttonRect.right > railRect.right - padding) {
+      rail.scrollBy({
+        left: buttonRect.right - railRect.right + padding,
+        behavior: 'smooth',
+      })
+    }
+    return
+  }
+
+  if (buttonRect.top < railRect.top + padding) {
+    rail.scrollBy({
+      top: buttonRect.top - railRect.top - padding,
+      behavior: 'smooth',
+    })
+  } else if (buttonRect.bottom > railRect.bottom - padding) {
+    rail.scrollBy({
+      top: buttonRect.bottom - railRect.bottom + padding,
+      behavior: 'smooth',
+    })
+  }
+}
+
+function onThumbWheel(event: WheelEvent): void {
+  if (resolvedThumbOrientation.value !== 'horizontal') {
+    return
+  }
+  if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) {
+    return
+  }
+  const rail = thumbnailRailRef.value
+  if (!rail) {
+    return
+  }
+  event.preventDefault()
+  rail.scrollLeft += event.deltaY
 }
 
 function clampOffset(next: { x: number; y: number }) {
@@ -322,6 +406,15 @@ function scheduleRender(): void {
 
 watch(() => props.layout, scheduleRender, { flush: 'post' })
 watch(zoom, scheduleRender, { flush: 'post' })
+watch(activeImageId, (id) => void scrollActiveThumbnail(id))
+watch(
+  [resolvedThumbOrientation, () => props.thumbSize],
+  () => {
+    scheduleRender()
+    void scrollActiveThumbnail(activeImageId.value)
+  },
+  { flush: 'post' },
+)
 
 let previousImageIds: string[] = []
 watch(
@@ -358,13 +451,16 @@ defineExpose({ focusImage })
   <div
     class="preview-stage"
     :class="{ 'is-file-dragging': isFileDragging }"
+    :style="thumbStyle"
     v-on="dropHandlers"
   >
     <div v-if="images.length > 0" class="preview-workbench">
       <nav
+        ref="thumbnailRailRef"
         class="preview-thumbnails"
-        :class="`preview-thumbnails--${layout.direction}`"
+        :class="`preview-thumbnails--${resolvedThumbOrientation}`"
         aria-label="图片缩略图导航"
+        @wheel="onThumbWheel"
       >
         <button
           v-for="(image, index) in images"
@@ -386,7 +482,7 @@ defineExpose({ focusImage })
         ref="viewportRef"
         class="stage-viewport"
         :class="{
-          'stage-viewport--vertical': layout.direction === 'vertical',
+          'stage-viewport--thumb-vertical': resolvedThumbOrientation === 'vertical',
           'is-panning': isPanning,
           'is-zoomed': zoom > 1,
         }"
@@ -487,7 +583,7 @@ defineExpose({ focusImage })
     <div
       v-if="isImporting && images.length > 0"
       class="stage-busy"
-      :class="{ 'stage-busy--beside-rail': layout.direction === 'vertical' }"
+      :class="{ 'stage-busy--beside-rail': resolvedThumbOrientation === 'vertical' }"
       role="status"
     >
       <Loader2 class="spin" :size="13" :stroke-width="2" />
@@ -506,6 +602,10 @@ defineExpose({ focusImage })
 
 <style scoped>
 .preview-stage {
+  --thumb-w: 92px;
+  --thumb-h: 56px;
+  --thumb-fit: contain;
+
   position: relative;
   display: flex;
   min-height: 0;
@@ -529,7 +629,7 @@ defineExpose({ focusImage })
 
 .stage-viewport {
   position: absolute;
-  inset: 82px 24px 24px;
+  inset: calc(var(--thumb-h) + 36px) 24px 24px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -539,8 +639,8 @@ defineExpose({ focusImage })
   touch-action: none;
 }
 
-.stage-viewport--vertical {
-  inset: 24px 102px 24px 24px;
+.stage-viewport--thumb-vertical {
+  inset: 24px calc(var(--thumb-w) + 42px) 24px 24px;
 }
 
 .preview-thumbnails {
@@ -548,31 +648,60 @@ defineExpose({ focusImage })
   z-index: 2;
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   gap: 6px;
-  overflow: hidden;
   padding: 0;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+  scrollbar-width: thin;
+  overscroll-behavior: contain;
+}
+
+.preview-thumbnails::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.preview-thumbnails::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.preview-thumbnails::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: var(--scrollbar-thumb);
+}
+
+.preview-thumbnails::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
 }
 
 .preview-thumbnails--horizontal {
   top: 14px;
   right: 24px;
   left: 24px;
-  height: 54px;
+  height: calc(var(--thumb-h) + 14px);
   flex-direction: row;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0 2px 8px;
+  scroll-snap-type: x proximity;
 }
 
 .preview-thumbnails--vertical {
   top: 24px;
   right: 24px;
   bottom: 24px;
-  width: 74px;
+  width: calc(var(--thumb-w) + 14px);
   flex-direction: column;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 2px 8px 2px 2px;
+  scroll-snap-type: y proximity;
 }
 
 .preview-thumbnail {
   position: relative;
   display: block;
+  flex: 0 0 auto;
   overflow: hidden;
   padding: 0;
   border: 2px solid transparent;
@@ -580,33 +709,28 @@ defineExpose({ focusImage })
   background: var(--surface);
   box-shadow: 0 0 0 1px var(--border);
   cursor: pointer;
+  scroll-snap-align: start;
   transition:
     border-color 0.15s var(--ease),
     box-shadow 0.15s var(--ease);
 }
 
 .preview-thumbnails--horizontal .preview-thumbnail {
-  width: auto;
-  min-width: 0;
-  max-width: 86px;
-  height: 50px;
-  flex: 1 1 0;
+  width: var(--thumb-w);
+  height: var(--thumb-h);
 }
 
 .preview-thumbnails--vertical .preview-thumbnail {
-  width: 70px;
-  max-width: 70px;
-  height: auto;
-  min-height: 0;
-  max-height: 50px;
-  flex: 1 1 0;
+  width: var(--thumb-w);
+  height: var(--thumb-h);
 }
 
 .preview-thumbnail img {
   display: block;
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  background: var(--surface);
+  object-fit: var(--thumb-fit);
 }
 
 .preview-thumbnail__index {
@@ -876,7 +1000,7 @@ defineExpose({ focusImage })
 }
 
 .stage-busy--beside-rail {
-  right: 106px;
+  right: calc(var(--thumb-w) + 42px);
 }
 
 .stage-drop-overlay {
@@ -925,11 +1049,11 @@ defineExpose({ focusImage })
   }
 
   .stage-viewport {
-    inset: 64px 16px 16px;
+    inset: calc(var(--thumb-h) + 28px) 16px 16px;
   }
 
-  .stage-viewport--vertical {
-    inset: 16px 86px 16px 16px;
+  .stage-viewport--thumb-vertical {
+    inset: 16px calc(var(--thumb-w) + 34px) 16px 16px;
   }
 
   .preview-thumbnails {
@@ -940,25 +1064,14 @@ defineExpose({ focusImage })
     top: 10px;
     right: 16px;
     left: 16px;
-    height: 48px;
+    height: calc(var(--thumb-h) + 14px);
   }
 
   .preview-thumbnails--vertical {
     top: 16px;
     right: 16px;
     bottom: 16px;
-    width: 62px;
-  }
-
-  .preview-thumbnails--horizontal .preview-thumbnail {
-    height: 44px;
-    max-width: 70px;
-  }
-
-  .preview-thumbnails--vertical .preview-thumbnail {
-    width: 58px;
-    max-width: 58px;
-    max-height: 44px;
+    width: calc(var(--thumb-w) + 14px);
   }
 
   .zoom-toolbar {
@@ -972,7 +1085,7 @@ defineExpose({ focusImage })
   }
 
   .stage-busy--beside-rail {
-    right: 88px;
+    right: calc(var(--thumb-w) + 38px);
   }
 
   .zoom-hint {

@@ -15,6 +15,7 @@ import {
   MessageCircle,
   MessageSquare,
   RefreshCw,
+  Settings2,
   ShieldCheck,
   SlidersHorizontal,
   UserRound,
@@ -86,6 +87,11 @@ const features = [
     icon: ZoomIn,
     title: '缩放查看',
     detail: '50% 起，单张可占满视口；缩略图定位',
+  },
+  {
+    icon: Settings2,
+    title: '缩略图设置',
+    detail: '方向、大小、显示方式可调，设置保存在本机',
   },
   {
     icon: FolderDown,

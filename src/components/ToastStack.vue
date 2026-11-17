@@ -2,9 +2,13 @@
 import { AlertCircle, CheckCircle2, Info, X } from 'lucide-vue-next'
 import type { ToastItem } from '../composables/useToasts'
 
-defineProps<{
-  toasts: ToastItem[]
-}>()
+withDefaults(
+  defineProps<{
+    toasts: ToastItem[]
+    rightOffset?: number
+  }>(),
+  { rightOffset: 22 },
+)
 
 const emit = defineEmits<{
   dismiss: [id: string]
@@ -19,7 +23,11 @@ const toneIcons = {
 
 <template>
   <Teleport to="body">
-    <div class="toast-region" aria-label="操作提示">
+    <div
+      class="toast-region"
+      aria-label="操作提示"
+      :style="{ '--toast-right': `${rightOffset}px` }"
+    >
       <TransitionGroup name="toast" tag="div" class="toast-list">
         <div
           v-for="toast in toasts"
@@ -54,8 +62,8 @@ const toneIcons = {
 .toast-region {
   position: fixed;
   z-index: 60;
-  /* 让开右侧垂直缩略图轨；横向拼接时提示仍在底部控制条上方。 */
-  right: 128px;
+  /* 让开右侧垂直缩略图轨；横向拼接时由父组件传回 22px。 */
+  right: var(--toast-right, 22px);
   /* 避开底部拼接控制条，避免提示遮住间距输入与导出说明。 */
   bottom: 108px;
   width: min(360px, calc(100vw - 32px));

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import {
   AlertTriangle,
   ArrowLeft,
@@ -7,11 +7,13 @@ import {
   Info,
   Layers3,
   Loader2,
+  Settings,
   ShieldCheck,
 } from 'lucide-vue-next'
 import AboutPage from './components/AboutPage.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import PreviewStage from './components/PreviewStage.vue'
+import SettingsPage from './components/SettingsPage.vue'
 import StitchControls from './components/StitchControls.vue'
 import StitchQueue from './components/StitchQueue.vue'
 import ToastStack from './components/ToastStack.vue'
@@ -36,6 +38,13 @@ import {
   writeBlobToHandle,
 } from './core/save'
 import type { SaveFileHandle } from './core/save'
+import {
+  DEFAULT_SETTINGS,
+  THUMBNAIL_SIZE_PX,
+  loadSettings,
+  saveSettings,
+} from './core/settings'
+import type { ToolSettings } from './core/settings'
 import type { StitchDirection } from './core/types'
 
 const direction = ref<StitchDirection>('vertical')
@@ -45,12 +54,27 @@ const supportedFormats = getSupportedExportFormats()
 const activeFormat = computed(() => getExportFormat(exportFormat.value))
 const isExporting = ref(false)
 const isClearDialogOpen = ref(false)
-const activeView = ref<'workspace' | 'about'>('workspace')
+const activeView = ref<'workspace' | 'about' | 'settings'>('workspace')
+const settings = ref<ToolSettings>(loadSettings())
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const aboutButtonRef = ref<HTMLButtonElement | null>(null)
+const settingsButtonRef = ref<HTMLButtonElement | null>(null)
 const aboutPageRef = ref<{ focusTitle: () => void } | null>(null)
+const settingsPageRef = ref<{ focusTitle: () => void } | null>(null)
 const previewStageRef = ref<{ focusImage: (index: number) => void } | null>(null)
 const canChooseSaveLocation = getSavePicker() !== null
+const resolvedThumbOrientation = computed(() =>
+  settings.value.thumbnailOrientation === 'auto'
+    ? direction.value
+    : settings.value.thumbnailOrientation,
+)
+const toastRightOffset = computed(() =>
+  resolvedThumbOrientation.value === 'vertical'
+    ? THUMBNAIL_SIZE_PX[settings.value.thumbnailSize].width + 80
+    : 22,
+)
+
+watch(settings, (value) => saveSettings(value))
 
 function focusQueueImage(index: number): void {
   previewStageRef.value?.focusImage(index)
@@ -151,6 +175,28 @@ async function closeAbout(): Promise<void> {
   activeView.value = 'workspace'
   await nextTick()
   aboutButtonRef.value?.focus()
+}
+
+async function openSettings(): Promise<void> {
+  // 设置页不显示工作区提示，避免遮住选项。
+  dismissAll()
+  activeView.value = 'settings'
+  await nextTick()
+  settingsPageRef.value?.focusTitle()
+}
+
+async function closeSettings(): Promise<void> {
+  activeView.value = 'workspace'
+  await nextTick()
+  settingsButtonRef.value?.focus()
+}
+
+function updateSettings(patch: Partial<ToolSettings>): void {
+  settings.value = { ...settings.value, ...patch }
+}
+
+function resetSettings(): void {
+  settings.value = { ...DEFAULT_SETTINGS }
 }
 
 function openFilePicker(): void {
@@ -365,11 +411,33 @@ async function handleExport(): Promise<void> {
             <span class="header-page-label header-page-label--collapse">关于</span>
           </button>
           <button
-            v-else
+            v-if="activeView === 'workspace'"
+            ref="settingsButtonRef"
+            class="button button-secondary header-page-button header-page-button--collapse"
+            type="button"
+            title="调整缩略图方向、大小与显示方式"
+            aria-label="设置"
+            @click="openSettings"
+          >
+            <Settings :size="14" :stroke-width="1.9" />
+            <span class="header-page-label header-page-label--collapse">设置</span>
+          </button>
+          <button
+            v-if="activeView === 'about'"
             class="button button-secondary header-page-button"
             type="button"
             title="返回拼接工作区"
             @click="closeAbout"
+          >
+            <ArrowLeft :size="14" :stroke-width="1.9" />
+            <span class="header-page-label">返回拼接</span>
+          </button>
+          <button
+            v-else-if="activeView === 'settings'"
+            class="button button-secondary header-page-button"
+            type="button"
+            title="返回拼接工作区"
+            @click="closeSettings"
           >
             <ArrowLeft :size="14" :stroke-width="1.9" />
             <span class="header-page-label">返回拼接</span>
@@ -446,6 +514,9 @@ async function handleExport(): Promise<void> {
           :layout="layout"
           :is-importing="isImporting"
           :progress="progress"
+          :thumb-orientation="settings.thumbnailOrientation"
+          :thumb-size="settings.thumbnailSize"
+          :thumb-fit="settings.thumbnailFit"
           @pick="openFilePicker"
           @add="handleAdd"
         />
@@ -460,8 +531,18 @@ async function handleExport(): Promise<void> {
       </section>
     </main>
 
-    <main v-else class="about-main">
+    <main v-else-if="activeView === 'about'" class="about-main">
       <AboutPage ref="aboutPageRef" />
+    </main>
+
+    <main v-else class="settings-main">
+      <SettingsPage
+        ref="settingsPageRef"
+        :settings="settings"
+        :stitch-direction="direction"
+        @update="updateSettings"
+        @reset="resetSettings"
+      />
     </main>
 
     <input
@@ -473,7 +554,11 @@ async function handleExport(): Promise<void> {
       @change="onFileChange"
     />
 
-    <ToastStack :toasts="toasts" @dismiss="dismiss" />
+    <ToastStack
+      :toasts="toasts"
+      :right-offset="toastRightOffset"
+      @dismiss="dismiss"
+    />
 
     <ConfirmDialog
       :open="isClearDialogOpen"
@@ -624,7 +709,8 @@ async function handleExport(): Promise<void> {
   padding: 22px 24px 24px;
 }
 
-.about-main {
+.about-main,
+.settings-main {
   width: 100%;
   min-height: 0;
   flex: 1;
@@ -745,7 +831,8 @@ async function handleExport(): Promise<void> {
     gap: 14px;
   }
 
-  .about-main {
+  .about-main,
+  .settings-main {
     flex: none;
     overflow: visible;
     padding: 14px;
@@ -814,7 +901,8 @@ async function handleExport(): Promise<void> {
     gap: 10px;
   }
 
-  .about-main {
+  .about-main,
+  .settings-main {
     padding: 10px;
   }
 
