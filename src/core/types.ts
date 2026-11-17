@@ -1,14 +1,45 @@
 export type StitchDirection = 'vertical' | 'horizontal'
+export type StitchImageKind = 'image' | 'blank'
+
+export interface AnnotationPoint {
+  x: number
+  y: number
+}
+
+interface AnnotationBase {
+  id: string
+  color: string
+  width: number
+}
+
+export interface TextAnnotation extends AnnotationBase {
+  type: 'text'
+  x: number
+  y: number
+  text: string
+  fontSize: number
+}
+
+export interface StrokeAnnotation extends AnnotationBase {
+  type: 'brush' | 'heal'
+  points: AnnotationPoint[]
+}
+
+export type StitchAnnotation = TextAnnotation | StrokeAnnotation
+export type AnnotationTool = 'select' | 'text' | 'brush' | 'eraser' | 'heal'
 
 export interface StitchImage {
   id: string
-  file: File
+  kind: StitchImageKind
+  file?: File
   name: string
   url: string
   width: number
   height: number
   size: number
-  element: HTMLImageElement
+  element?: HTMLImageElement
+  backgroundColor?: string
+  annotations: StitchAnnotation[]
 }
 
 export interface LayoutItem {

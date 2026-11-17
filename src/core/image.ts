@@ -48,6 +48,7 @@ export async function decodeImageFile(file: File): Promise<StitchImage> {
 
     return {
       id: createImageId(),
+      kind: 'image',
       file,
       name: file.name,
       url,
@@ -55,6 +56,7 @@ export async function decodeImageFile(file: File): Promise<StitchImage> {
       height: element.naturalHeight,
       size: file.size,
       element,
+      annotations: [],
     }
   } catch (error) {
     element.onload = null
@@ -65,7 +67,31 @@ export async function decodeImageFile(file: File): Promise<StitchImage> {
   }
 }
 
+export const DEFAULT_BLANK_WIDTH = 1200
+export const DEFAULT_BLANK_HEIGHT = 800
+
+export function createBlankPage(
+  name: string,
+  width = DEFAULT_BLANK_WIDTH,
+  height = DEFAULT_BLANK_HEIGHT,
+): StitchImage {
+  return {
+    id: createImageId(),
+    kind: 'blank',
+    name,
+    url: '',
+    width,
+    height,
+    size: 0,
+    backgroundColor: '#ffffff',
+    annotations: [],
+  }
+}
+
 export function releaseImage(image: StitchImage): void {
+  if (!image.element) {
+    return
+  }
   image.element.onload = null
   image.element.onerror = null
   image.element.removeAttribute('src')

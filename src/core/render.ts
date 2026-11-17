@@ -1,3 +1,4 @@
+import { drawAnnotations } from './annotations'
 import { getPreviewFit } from './preview'
 import type { PreviewOffset } from './preview'
 import type { StitchImage, StitchLayout } from './types'
@@ -15,6 +16,28 @@ export interface ViewportRenderOptions {
   offset: PreviewOffset
   dpr?: number
   background?: string
+}
+
+function paintStitchImage(
+  context: CanvasRenderingContext2D,
+  image: StitchImage,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): void {
+  if (image.kind === 'blank') {
+    context.fillStyle = image.backgroundColor ?? '#ffffff'
+    context.fillRect(x, y, width, height)
+  } else if (image.element) {
+    context.drawImage(image.element, x, y, width, height)
+  }
+
+  context.save()
+  context.translate(x, y)
+  context.scale(width / image.width, height / image.height)
+  drawAnnotations(context, image)
+  context.restore()
 }
 
 export function renderStitch(
@@ -55,7 +78,7 @@ export function renderStitch(
     if (!image) {
       continue
     }
-    context.drawImage(image.element, item.x, item.y, item.width, item.height)
+    paintStitchImage(context, image, item.x, item.y, item.width, item.height)
   }
 
   context.setTransform(1, 0, 0, 1, 0, 0)
@@ -136,7 +159,7 @@ export function renderStitchView(
     if (!image) {
       continue
     }
-    context.drawImage(image.element, item.x, item.y, item.width, item.height)
+    paintStitchImage(context, image, item.x, item.y, item.width, item.height)
   }
   context.restore()
 

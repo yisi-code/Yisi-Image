@@ -62,6 +62,7 @@ const settingsButtonRef = ref<HTMLButtonElement | null>(null)
 const aboutPageRef = ref<{ focusTitle: () => void } | null>(null)
 const settingsPageRef = ref<{ focusTitle: () => void } | null>(null)
 const previewStageRef = ref<{ focusImage: (index: number) => void } | null>(null)
+const activeImageId = ref<string | null>(null)
 const canChooseSaveLocation = getSavePicker() !== null
 const resolvedThumbOrientation = computed(() =>
   settings.value.thumbnailOrientation === 'auto'
@@ -86,12 +87,18 @@ const {
   progress,
   clearedCount,
   addFiles,
+  addBlankAt,
+  resizeBlank,
   removeImage,
   moveImage,
   clearImages,
   restoreCleared,
 } = useImageQueue()
 const { toasts, push, dismiss, dismissAll } = useToasts()
+
+const activeIndex = computed(() =>
+  images.value.findIndex((image) => image.id === activeImageId.value),
+)
 
 const layout = computed(() =>
   calculateStitchLayout(images.value, direction.value, gap.value),
@@ -260,6 +267,19 @@ async function handleAdd(files: File[]): Promise<void> {
       message: `${summarize(report.failed)}。请确认文件完整后重试。`,
     })
   }
+}
+
+function insertBlankPage(): void {
+  if (isImporting.value) {
+    return
+  }
+  const insertAt = activeIndex.value >= 0 ? activeIndex.value + 1 : images.value.length
+  const index = addBlankAt(insertAt)
+  void nextTick(() => previewStageRef.value?.focusImage(index))
+}
+
+function resizeBlankPage(id: string, width: number, height: number): void {
+  resizeBlank(id, width, height)
 }
 
 function requestClear(): void {
@@ -474,6 +494,7 @@ async function handleExport(): Promise<void> {
         :is-importing="isImporting"
         :progress="progress"
         :cleared-count="clearedCount"
+        :active-id="activeImageId"
         @pick="openFilePicker"
         @add="handleAdd"
         @remove="removeImage"
@@ -481,6 +502,7 @@ async function handleExport(): Promise<void> {
         @clear="requestClear"
         @restore="restoreLastCleared"
         @focus="focusQueueImage"
+        @blank="insertBlankPage"
       />
 
       <section class="preview-panel" aria-label="拼接预览与设置">
@@ -519,6 +541,8 @@ async function handleExport(): Promise<void> {
           :thumb-fit="settings.thumbnailFit"
           @pick="openFilePicker"
           @add="handleAdd"
+          @active-change="activeImageId = $event"
+          @resize-blank="resizeBlankPage"
         />
 
         <StitchControls

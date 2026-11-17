@@ -1,6 +1,15 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { GripVertical, ImagePlus, Loader2, Plus, RotateCcw, Trash2, UploadCloud } from 'lucide-vue-next'
+import {
+  FilePlus2,
+  GripVertical,
+  ImagePlus,
+  Loader2,
+  Plus,
+  RotateCcw,
+  Trash2,
+  UploadCloud,
+} from 'lucide-vue-next'
 import { useFileDrop } from '../composables/useFileDrop'
 import { SUPPORTED_FORMAT_LABEL, formatDimensions, formatFileSize } from '../core/image'
 import type { ImportProgress, StitchImage } from '../core/types'
@@ -10,6 +19,7 @@ const props = defineProps<{
   isImporting: boolean
   progress: ImportProgress
   clearedCount: number
+  activeId?: string | null
 }>()
 
 const emit = defineEmits<{
@@ -20,6 +30,7 @@ const emit = defineEmits<{
   clear: []
   restore: []
   focus: [index: number]
+  blank: []
 }>()
 
 const draggingIndex = ref<number | null>(null)
@@ -204,6 +215,7 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
           :key="image.id"
           class="queue-card"
           :class="{
+            'is-active': image.id === activeId,
             'is-dragging': draggingIndex === index,
             'drop-before': dropTarget?.index === index && dropTarget.position === 'before',
             'drop-after': dropTarget?.index === index && dropTarget.position === 'after',
@@ -225,8 +237,12 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
             <GripVertical :size="14" :stroke-width="1.8" />
           </span>
 
-          <span class="queue-thumb">
-            <img :src="image.url" :alt="image.name" draggable="false" />
+          <span class="queue-thumb" :class="{ 'queue-thumb--blank': image.kind === 'blank' }">
+            <span v-if="image.kind === 'blank'" class="queue-blank-art" aria-hidden="true">
+              <FilePlus2 :size="20" :stroke-width="1.6" />
+              <span>空白</span>
+            </span>
+            <img v-else :src="image.url" :alt="image.name" draggable="false" />
             <span class="queue-index">{{ String(index + 1).padStart(2, '0') }}</span>
           </span>
 
@@ -235,7 +251,7 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
             <span class="queue-meta tnum">
               {{ formatDimensions(image.width, image.height) }}
               <span aria-hidden="true">·</span>
-              {{ formatFileSize(image.size) }}
+              {{ image.kind === 'blank' ? '空白页' : formatFileSize(image.size) }}
             </span>
           </span>
 
@@ -266,17 +282,29 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
     </div>
 
     <div class="queue-footer">
-      <button
-        class="queue-add-button"
-        type="button"
-        :disabled="isImporting"
-        @click="openFilePicker"
-      >
-        <Loader2 v-if="isImporting" class="spin" :size="16" />
-        <Plus v-else :size="16" :stroke-width="2" />
-        <span>{{ isImporting ? progressLabel : '添加图片' }}</span>
-        <span v-if="!isImporting" class="queue-add-hint">拖入也可</span>
-      </button>
+      <div class="queue-add-actions">
+        <button
+          class="queue-add-button"
+          type="button"
+          :disabled="isImporting"
+          @click="openFilePicker"
+        >
+          <Loader2 v-if="isImporting" class="spin" :size="16" />
+          <Plus v-else :size="16" :stroke-width="2" />
+          <span>{{ isImporting ? progressLabel : '添加图片' }}</span>
+          <span v-if="!isImporting" class="queue-add-hint">拖入也可</span>
+        </button>
+        <button
+          class="queue-blank-button"
+          type="button"
+          :disabled="isImporting"
+          :title="isImporting ? '读取图片时不能添加空白页' : '在当前选中图片后插入空白页'"
+          @click="emit('blank')"
+        >
+          <FilePlus2 :size="15" :stroke-width="1.9" />
+          <span>空白页</span>
+        </button>
+      </div>
 
       <p v-if="images.length > 1" class="queue-tip">
         拖动卡片调整顺序，或选中后按 <kbd>Alt</kbd> + <kbd>↑</kbd> / <kbd>↓</kbd>
@@ -471,6 +499,11 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
   background: var(--surface-raised);
 }
 
+.queue-card.is-active {
+  border-color: var(--accent-line-strong);
+  background: var(--surface-accent);
+}
+
 .queue-card:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
@@ -541,6 +574,23 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
   width: 100%;
   height: 100%;
   object-fit: contain;
+}
+
+.queue-thumb--blank {
+  background: var(--surface);
+}
+
+.queue-blank-art {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  color: var(--text-faint);
+  font-size: 8px;
+  letter-spacing: 0.02em;
 }
 
 .queue-index {
@@ -640,11 +690,17 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
   background: linear-gradient(180deg, var(--surface), var(--surface-raised));
 }
 
+.queue-add-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .queue-add-button {
   position: relative;
   display: flex;
-  width: 100%;
+  min-width: 0;
   height: 38px;
+  flex: 1;
   align-items: center;
   justify-content: center;
   gap: 7px;
@@ -658,6 +714,37 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
     border-color 0.15s var(--ease),
     background-color 0.15s var(--ease),
     color 0.15s var(--ease);
+}
+
+.queue-blank-button {
+  display: flex;
+  height: 38px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 10px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 9px;
+  background: var(--surface-subtle);
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  transition:
+    border-color 0.15s var(--ease),
+    background-color 0.15s var(--ease),
+    color 0.15s var(--ease);
+}
+
+.queue-blank-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.queue-blank-button:disabled {
+  opacity: 0.45;
 }
 
 .queue-add-button:hover:not(:disabled) {

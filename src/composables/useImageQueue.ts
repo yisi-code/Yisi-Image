@@ -1,5 +1,10 @@
 import { computed, onBeforeUnmount, ref } from 'vue'
-import { decodeImageFile, isSupportedImage, releaseImage } from '../core/image'
+import {
+  createBlankPage,
+  decodeImageFile,
+  isSupportedImage,
+  releaseImage,
+} from '../core/image'
 import type { ImportProgress, ImportReport, StitchImage } from '../core/types'
 
 type Outcome =
@@ -15,6 +20,7 @@ export function useImageQueue() {
   const progress = ref<ImportProgress>({ done: 0, total: 0 })
   const clearedImages = ref<StitchImage[]>([])
   const clearedCount = computed(() => clearedImages.value.length)
+  let blankSequence = 0
   let disposed = false
 
   async function addFiles(files: readonly File[]): Promise<ImportReport> {
@@ -97,6 +103,25 @@ export function useImageQueue() {
     images.value = images.value.filter((image) => image.id !== id)
   }
 
+  function addBlankAt(index = images.value.length): number {
+    blankSequence += 1
+    const target = Math.max(0, Math.min(index, images.value.length))
+    const blank = createBlankPage(`空白页 ${blankSequence}`)
+    const next = [...images.value]
+    next.splice(target, 0, blank)
+    images.value = next
+    return target
+  }
+
+  function resizeBlank(id: string, width: number, height: number): void {
+    const target = images.value.find((image) => image.id === id && image.kind === 'blank')
+    if (!target) {
+      return
+    }
+    target.width = Math.max(40, Math.min(16_384, Math.round(width)))
+    target.height = Math.max(40, Math.min(16_384, Math.round(height)))
+  }
+
   function moveImage(from: number, to: number): void {
     const lastIndex = images.value.length - 1
     if (from === to || from < 0 || to < 0 || from > lastIndex || to > lastIndex) {
@@ -150,6 +175,8 @@ export function useImageQueue() {
     progress,
     clearedCount,
     addFiles,
+    addBlankAt,
+    resizeBlank,
     removeImage,
     moveImage,
     clearImages,

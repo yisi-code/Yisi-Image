@@ -1,14 +1,29 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
+  Check,
+  Eraser,
+  FilePlus2,
   ImagePlus,
   Loader2,
   Maximize2,
   Minus,
+  MousePointer2,
+  Paintbrush,
   Plus,
+  Redo2,
+  Type,
+  Undo2,
   UploadCloud,
+  Wand2,
+  X,
 } from 'lucide-vue-next'
 import { useFileDrop } from '../composables/useFileDrop'
+import {
+  cloneAnnotations,
+  createAnnotationId,
+  eraseAnnotationsAt,
+} from '../core/annotations'
 import { formatDimensions } from '../core/image'
 import {
   clampPreviewOffset,
@@ -24,7 +39,15 @@ import type {
   ThumbnailOrientation,
   ThumbnailSize,
 } from '../core/settings'
-import type { ImportProgress, StitchImage, StitchLayout } from '../core/types'
+import type {
+  AnnotationPoint,
+  AnnotationTool,
+  ImportProgress,
+  StitchAnnotation,
+  StitchImage,
+  StitchLayout,
+  StrokeAnnotation,
+} from '../core/types'
 
 const props = defineProps<{
   images: StitchImage[]
@@ -39,6 +62,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   pick: []
   add: [files: File[]]
+  'active-change': [id: string | null]
+  'resize-blank': [id: string, width: number, height: number]
 }>()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
@@ -49,6 +74,34 @@ const offset = ref({ x: 0, y: 0 })
 const isPanning = ref(false)
 const activeImageId = ref<string | null>(null)
 const thumbnailRailRef = ref<HTMLElement | null>(null)
+const textInputRef = ref<HTMLInputElement | null>(null)
+const annotationTool = ref<AnnotationTool>('select')
+const annotationColor = ref('#d92d20')
+const annotationWidth = ref(6)
+const isDrawing = ref(false)
+const textDraft = ref<{
+  imageId: string
+  x: number
+  y: number
+  screenX: number
+  screenY: number
+  value: string
+} | null>(null)
+const undoStack = ref<HistoryEntry[]>([])
+const redoStack = ref<HistoryEntry[]>([])
+let drawingImage: StitchImage | null = null
+let drawingItem: StitchLayout['items'][number] | null = null
+let drawingStroke: StrokeAnnotation | null = null
+let drawingBefore: StitchAnnotation[] | null = null
+let drawingPointerId: number | null = null
+let resizeState: {
+  pointerId: number
+  startX: number
+  startY: number
+  startWidth: number
+  startHeight: number
+  scale: number
+} | null = null
 let renderFrame = 0
 let panState: {
   pointerId: number
@@ -58,8 +111,15 @@ let panState: {
   originY: number
 } | null = null
 
+interface HistoryEntry {
+  imageId: string
+  before: StitchAnnotation[]
+  after: StitchAnnotation[]
+}
+
 const MIN_ZOOM = 0.5
 const PREVIEW_MAX_DPR = 2
+const MAX_HISTORY = 50
 const displaySize = ref({ width: 0, height: 0 })
 
 const { isFileDragging, dropHandlers } = useFileDrop((files) => emit('add', files))
@@ -87,6 +147,439 @@ const previewLabel = computed(
     `拼接效果预览，共 ${props.images.length} 张图片，输出尺寸 ${formatDimensions(props.layout.width, props.layout.height)} 像素`,
 )
 
+const activeImage = computed(
+  () => props.images.find((image) => image.id === activeImageId.value) ?? null,
+)
+const activeItem = computed(
+  () => props.layout.items.find((item) => item.id === activeImageId.value) ?? null,
+)
+const activeBlank = computed(() =>
+  activeImage.value?.kind === 'blank' ? activeImage.value : null,
+)
+const canUndo = computed(() => undoStack.value.length > 0)
+const canRedo = computed(() => redoStack.value.length > 0)
+
+const imageToScreen = computed(() => {
+  if (displaySize.value.width <= 0 || props.layout.width <= 0) {
+    return 1
+  }
+  return (displaySize.value.width / props.layout.width) * zoom.value
+})
+
+const blankSelectionStyle = computed<Record<string, string> | null>(() => {
+  const image = activeBlank.value
+  const item = activeItem.value
+  const viewport = viewportRef.value
+  if (!image || !item || !viewport) {
+    return null
+  }
+  const scale = imageToScreen.value
+  const contentWidth = displaySize.value.width * zoom.value
+  const contentHeight = displaySize.value.height * zoom.value
+  const left = (viewport.clientWidth - contentWidth) / 2 + offset.value.x + item.x * scale
+  const top = (viewport.clientHeight - contentHeight) / 2 + offset.value.y + item.y * scale
+  return {
+    left: `${left}px`,
+    top: `${top}px`,
+    width: `${item.width * scale}px`,
+    height: `${item.height * scale}px`,
+  }
+})
+
+const textEditorStyle = computed<Record<string, string> | null>(() => {
+  const draft = textDraft.value
+  const viewport = viewportRef.value
+  if (!draft || !viewport) {
+    return null
+  }
+  return {
+    left: `${Math.max(8, Math.min(viewport.clientWidth - 236, draft.screenX))}px`,
+    top: `${Math.max(8, Math.min(viewport.clientHeight - 50, draft.screenY))}px`,
+  }
+})
+
+const blankSizeSummary = computed(() =>
+  activeBlank.value
+    ? formatDimensions(activeBlank.value.width, activeBlank.value.height)
+    : '',
+)
+
+function findImage(id: string): StitchImage | null {
+  return props.images.find((image) => image.id === id) ?? null
+}
+
+function pointForItem(
+  event: PointerEvent | MouseEvent,
+  item: StitchLayout['items'][number],
+): AnnotationPoint | null {
+  const viewport = viewportRef.value
+  if (!viewport || displaySize.value.width <= 0 || props.layout.width <= 0) {
+    return null
+  }
+  const rect = viewport.getBoundingClientRect()
+  const scale = imageToScreen.value
+  const contentWidth = displaySize.value.width * zoom.value
+  const contentHeight = displaySize.value.height * zoom.value
+  const left = (viewport.clientWidth - contentWidth) / 2 + offset.value.x
+  const top = (viewport.clientHeight - contentHeight) / 2 + offset.value.y
+  const localX = (event.clientX - rect.left - left) / scale
+  const localY = (event.clientY - rect.top - top) / scale
+  return {
+    x: Math.max(0, Math.min(item.width, localX - item.x)),
+    y: Math.max(0, Math.min(item.height, localY - item.y)),
+  }
+}
+
+function imageAtEvent(event: PointerEvent | MouseEvent): {
+  image: StitchImage
+  item: StitchLayout['items'][number]
+  point: AnnotationPoint
+  screenX: number
+  screenY: number
+} | null {
+  const viewport = viewportRef.value
+  if (!viewport || displaySize.value.width <= 0 || props.layout.width <= 0) {
+    return null
+  }
+  const rect = viewport.getBoundingClientRect()
+  const scale = imageToScreen.value
+  const contentWidth = displaySize.value.width * zoom.value
+  const contentHeight = displaySize.value.height * zoom.value
+  const left = (viewport.clientWidth - contentWidth) / 2 + offset.value.x
+  const top = (viewport.clientHeight - contentHeight) / 2 + offset.value.y
+  const layoutX = (event.clientX - rect.left - left) / scale
+  const layoutY = (event.clientY - rect.top - top) / scale
+
+  for (let index = props.layout.items.length - 1; index >= 0; index -= 1) {
+    const item = props.layout.items[index]
+    if (
+      layoutX >= item.x &&
+      layoutX <= item.x + item.width &&
+      layoutY >= item.y &&
+      layoutY <= item.y + item.height
+    ) {
+      const image = findImage(item.id)
+      if (!image) {
+        continue
+      }
+      return {
+        image,
+        item,
+        point: {
+          x: Math.max(0, Math.min(item.width, layoutX - item.x)),
+          y: Math.max(0, Math.min(item.height, layoutY - item.y)),
+        },
+        screenX: event.clientX - rect.left,
+        screenY: event.clientY - rect.top,
+      }
+    }
+  }
+  return null
+}
+
+function resetHistory(): void {
+  undoStack.value = []
+  redoStack.value = []
+}
+
+function commitHistory(
+  imageId: string,
+  before: StitchAnnotation[],
+  after: StitchAnnotation[],
+): void {
+  if (JSON.stringify(before) === JSON.stringify(after)) {
+    return
+  }
+  undoStack.value.push({
+    imageId,
+    before: cloneAnnotations(before),
+    after: cloneAnnotations(after),
+  })
+  if (undoStack.value.length > MAX_HISTORY) {
+    undoStack.value.shift()
+  }
+  redoStack.value = []
+}
+
+function undo(): void {
+  while (undoStack.value.length > 0) {
+    const entry = undoStack.value.pop()
+    if (!entry) {
+      return
+    }
+    const image = findImage(entry.imageId)
+    if (!image) {
+      continue
+    }
+    image.annotations = cloneAnnotations(entry.before)
+    redoStack.value.push(entry)
+    scheduleRender()
+    return
+  }
+}
+
+function redo(): void {
+  while (redoStack.value.length > 0) {
+    const entry = redoStack.value.pop()
+    if (!entry) {
+      return
+    }
+    const image = findImage(entry.imageId)
+    if (!image) {
+      continue
+    }
+    image.annotations = cloneAnnotations(entry.after)
+    undoStack.value.push(entry)
+    scheduleRender()
+    return
+  }
+}
+
+function setTool(tool: AnnotationTool): void {
+  if (isDrawing.value) {
+    finishDrawing()
+  }
+  textDraft.value = null
+  annotationTool.value = tool
+  viewportRef.value?.focus()
+}
+
+function openTextEditor(event: PointerEvent): void {
+  const hit = imageAtEvent(event)
+  if (!hit) {
+    return
+  }
+  activeImageId.value = hit.image.id
+  textDraft.value = {
+    imageId: hit.image.id,
+    x: hit.point.x,
+    y: hit.point.y,
+    screenX: hit.screenX,
+    screenY: hit.screenY,
+    value: '',
+  }
+  void nextTick(() => textInputRef.value?.focus())
+}
+
+function cancelText(): void {
+  textDraft.value = null
+}
+
+function annotationScale(): number {
+  if (!viewportRef.value || props.layout.width <= 0 || displaySize.value.width <= 0) {
+    return 1
+  }
+  return (displaySize.value.width / props.layout.width) * zoom.value
+}
+
+function commitText(): void {
+  const draft = textDraft.value
+  if (!draft) {
+    return
+  }
+  const text = draft.value.trim()
+  const image = findImage(draft.imageId)
+  if (!text || !image) {
+    textDraft.value = null
+    return
+  }
+  const scale = annotationScale()
+  const fontSize = Math.max(16, Math.round(24 / scale))
+  const before = cloneAnnotations(image.annotations)
+  image.annotations = [
+    ...image.annotations,
+    {
+      id: createAnnotationId(),
+      type: 'text',
+      x: draft.x,
+      y: draft.y,
+      text,
+      fontSize,
+      color: annotationColor.value,
+      width: text.length * fontSize * 0.62,
+    },
+  ]
+  commitHistory(image.id, before, image.annotations)
+  textDraft.value = null
+  scheduleRender()
+}
+
+function beginDrawing(event: PointerEvent): void {
+  event.preventDefault()
+  if (annotationTool.value === 'text') {
+    openTextEditor(event)
+    return
+  }
+
+  const hit = imageAtEvent(event)
+  if (!hit) {
+    return
+  }
+  const viewport = viewportRef.value
+  if (!viewport) {
+    return
+  }
+
+  event.preventDefault()
+  activeImageId.value = hit.image.id
+  drawingImage = hit.image
+  drawingItem = hit.item
+  drawingPointerId = event.pointerId
+  drawingBefore = cloneAnnotations(hit.image.annotations)
+  isDrawing.value = true
+  viewport.setPointerCapture(event.pointerId)
+
+  if (annotationTool.value === 'eraser') {
+    applyEraser(hit.point)
+    scheduleRender()
+    return
+  }
+
+  const scale = annotationScale()
+  const width =
+    annotationTool.value === 'heal'
+      ? Math.max(8, Math.round((annotationWidth.value * 2.5) / scale))
+      : Math.max(1, Math.round(annotationWidth.value / scale))
+  const stroke: StrokeAnnotation = {
+    id: createAnnotationId(),
+    type: annotationTool.value === 'heal' ? 'heal' : 'brush',
+    points: [hit.point],
+    color: annotationColor.value,
+    width,
+  }
+  hit.image.annotations = [...hit.image.annotations, stroke]
+  drawingStroke = stroke
+  scheduleRender()
+}
+
+function applyEraser(point: AnnotationPoint): void {
+  if (!drawingImage) {
+    return
+  }
+  const next = eraseAnnotationsAt(
+    drawingImage.annotations,
+    point,
+    Math.max(8, Math.round((annotationWidth.value * 1.5 + 4) / annotationScale())),
+  )
+  if (next.length !== drawingImage.annotations.length) {
+    drawingImage.annotations = next
+  }
+}
+
+function appendDrawing(event: PointerEvent): void {
+  if (!drawingImage || !drawingItem) {
+    return
+  }
+  const point = pointForItem(event, drawingItem)
+  if (!point) {
+    return
+  }
+  if (annotationTool.value === 'eraser') {
+    applyEraser(point)
+    scheduleRender()
+    return
+  }
+  if (!drawingStroke) {
+    return
+  }
+  const last = drawingStroke.points[drawingStroke.points.length - 1]
+  if (Math.hypot(point.x - last.x, point.y - last.y) < 1.5) {
+    return
+  }
+  drawingStroke.points.push(point)
+  scheduleRender()
+}
+
+function finishDrawing(): void {
+  const viewport = viewportRef.value
+  if (viewport && drawingPointerId !== null && viewport.hasPointerCapture(drawingPointerId)) {
+    viewport.releasePointerCapture(drawingPointerId)
+  }
+  if (drawingImage && drawingBefore) {
+    commitHistory(drawingImage.id, drawingBefore, drawingImage.annotations)
+  }
+  isDrawing.value = false
+  drawingImage = null
+  drawingItem = null
+  drawingStroke = null
+  drawingBefore = null
+  drawingPointerId = null
+  scheduleRender()
+}
+
+function updateBlankSize(axis: 'width' | 'height', event: Event): void {
+  const image = activeBlank.value
+  if (!image) {
+    return
+  }
+  const input = event.target as HTMLInputElement
+  const value = Number(input.value)
+  if (!Number.isFinite(value)) {
+    input.value = String(axis === 'width' ? image.width : image.height)
+    return
+  }
+  const width = axis === 'width' ? value : image.width
+  const height = axis === 'height' ? value : image.height
+  emit('resize-blank', image.id, width, height)
+}
+
+function applyBlankPreset(width: number, height: number): void {
+  const image = activeBlank.value
+  if (image) {
+    emit('resize-blank', image.id, width, height)
+  }
+}
+
+function startBlankResize(event: PointerEvent): void {
+  const image = activeBlank.value
+  if (!image || props.isImporting) {
+    return
+  }
+  event.preventDefault()
+  event.stopPropagation()
+  const target = event.currentTarget
+  if (!(target instanceof HTMLElement)) {
+    return
+  }
+  target.setPointerCapture(event.pointerId)
+  resizeState = {
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    startWidth: image.width,
+    startHeight: image.height,
+    scale: imageToScreen.value,
+  }
+}
+
+function moveBlankResize(event: PointerEvent): void {
+  if (!resizeState || resizeState.pointerId !== event.pointerId) {
+    return
+  }
+  const image = activeBlank.value
+  if (!image) {
+    return
+  }
+  const scale = Math.max(0.001, resizeState.scale)
+  emit(
+    'resize-blank',
+    image.id,
+    resizeState.startWidth + (event.clientX - resizeState.startX) / scale,
+    resizeState.startHeight + (event.clientY - resizeState.startY) / scale,
+  )
+}
+
+function endBlankResize(event: PointerEvent): void {
+  if (!resizeState || resizeState.pointerId !== event.pointerId) {
+    return
+  }
+  const target = event.currentTarget
+  if (target instanceof HTMLElement && target.hasPointerCapture(event.pointerId)) {
+    target.releasePointerCapture(event.pointerId)
+  }
+  resizeState = null
+}
+
 function resetView(): void {
   zoom.value = 1
   offset.value = { x: 0, y: 0 }
@@ -98,6 +591,7 @@ function updateActiveImage(): void {
   const viewport = viewportRef.value
   if (!viewport || !props.layout.items.length || displaySize.value.width <= 0) {
     activeImageId.value = null
+    emit('active-change', null)
     return
   }
 
@@ -121,6 +615,7 @@ function updateActiveImage(): void {
     }
   }
   activeImageId.value = closest.id
+  emit('active-change', activeImageId.value)
 }
 
 function focusImage(index: number): void {
@@ -264,7 +759,7 @@ function zoomBy(factor: number): void {
 }
 
 function onWheel(event: WheelEvent): void {
-  if (props.images.length === 0) {
+  if (props.images.length === 0 || isDrawing.value) {
     return
   }
   event.preventDefault()
@@ -274,7 +769,14 @@ function onWheel(event: WheelEvent): void {
 }
 
 function onPointerDown(event: PointerEvent): void {
-  if (zoom.value <= 1 || event.button !== 0) {
+  if (event.button !== 0) {
+    return
+  }
+  if (annotationTool.value !== 'select') {
+    beginDrawing(event)
+    return
+  }
+  if (zoom.value <= 1) {
     return
   }
   const target = event.currentTarget
@@ -295,6 +797,10 @@ function onPointerDown(event: PointerEvent): void {
 }
 
 function onPointerMove(event: PointerEvent): void {
+  if (isDrawing.value && event.pointerId === drawingPointerId) {
+    appendDrawing(event)
+    return
+  }
   if (!panState || event.pointerId !== panState.pointerId) {
     return
   }
@@ -308,6 +814,10 @@ function onPointerMove(event: PointerEvent): void {
 }
 
 function onPointerUp(event: PointerEvent): void {
+  if (isDrawing.value && event.pointerId === drawingPointerId) {
+    finishDrawing()
+    return
+  }
   if (!panState || event.pointerId !== panState.pointerId) {
     return
   }
@@ -321,6 +831,19 @@ function onPointerUp(event: PointerEvent): void {
 }
 
 function onViewportKeydown(event: KeyboardEvent): void {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
+    event.preventDefault()
+    if (event.shiftKey) {
+      redo()
+    } else {
+      undo()
+    }
+    return
+  }
+  if (event.key === 'Escape') {
+    textDraft.value = null
+    return
+  }
   if (event.key === '+' || event.key === '=') {
     event.preventDefault()
     zoomBy(1.25)
@@ -406,7 +929,13 @@ function scheduleRender(): void {
 
 watch(() => props.layout, scheduleRender, { flush: 'post' })
 watch(zoom, scheduleRender, { flush: 'post' })
-watch(activeImageId, (id) => void scrollActiveThumbnail(id))
+watch(activeImageId, (id) => {
+  emit('active-change', id)
+  if (!id) {
+    textDraft.value = null
+  }
+  void scrollActiveThumbnail(id)
+})
 watch(
   [resolvedThumbOrientation, () => props.thumbSize],
   () => {
@@ -428,6 +957,13 @@ watch(
     // 删掉其中一张、排序、追加都不重置视图；只有从空到有、清空或整组替换才回到适应窗口。
     if ((!hadImages && hasImages) || (hadImages && !hasImages) || replaced) {
       resetView()
+      resetHistory()
+    } else if (nextIds.length < previousImageIds.length) {
+      // 被删除的图片可能还被历史记录引用，删图时清空标注历史，避免撤销作用到已移除对象。
+      resetHistory()
+    }
+    if (!hasImages) {
+      textDraft.value = null
     }
     previousImageIds = [...nextIds]
     scheduleRender()
@@ -473,7 +1009,10 @@ defineExpose({ focusImage })
           :aria-current="image.id === activeImageId ? 'true' : undefined"
           @click="focusImage(index)"
         >
-          <img :src="image.url" alt="" draggable="false" />
+          <span v-if="image.kind === 'blank'" class="preview-thumbnail__blank" aria-hidden="true">
+            <FilePlus2 :size="17" :stroke-width="1.6" />
+          </span>
+          <img v-else :src="image.url" alt="" draggable="false" />
           <span class="preview-thumbnail__index tnum">{{ index + 1 }}</span>
         </button>
       </nav>
@@ -485,6 +1024,8 @@ defineExpose({ focusImage })
           'stage-viewport--thumb-vertical': resolvedThumbOrientation === 'vertical',
           'is-panning': isPanning,
           'is-zoomed': zoom > 1,
+          'is-annotating': annotationTool !== 'select',
+          'is-drawing': isDrawing,
         }"
         role="region"
         tabindex="0"
@@ -503,6 +1044,188 @@ defineExpose({ focusImage })
           role="img"
           :aria-label="previewLabel"
         />
+
+        <div
+          v-if="activeBlank && blankSelectionStyle"
+          class="blank-selection"
+          :style="blankSelectionStyle"
+          aria-hidden="true"
+        >
+          <span class="blank-selection-label">空白页</span>
+          <button
+            class="blank-resize-handle"
+            type="button"
+            title="拖动调整空白页大小"
+            aria-label="拖动调整空白页大小"
+            @pointerdown="startBlankResize"
+            @pointermove="moveBlankResize"
+            @pointerup="endBlankResize"
+            @pointercancel="endBlankResize"
+          />
+        </div>
+
+        <div
+          class="annotation-toolbar"
+          role="toolbar"
+          aria-label="标注工具"
+          @pointerdown.stop
+          @click.stop
+          @wheel.stop
+        >
+          <button
+            class="annotation-tool"
+            :class="{ 'is-active': annotationTool === 'select' }"
+            type="button"
+            :aria-pressed="annotationTool === 'select'"
+            title="选择与平移"
+            @click="setTool('select')"
+          >
+            <MousePointer2 :size="14" :stroke-width="1.9" />
+          </button>
+          <button
+            class="annotation-tool"
+            :class="{ 'is-active': annotationTool === 'text' }"
+            type="button"
+            :aria-pressed="annotationTool === 'text'"
+            title="添加文字"
+            @click="setTool('text')"
+          >
+            <Type :size="14" :stroke-width="1.9" />
+          </button>
+          <button
+            class="annotation-tool"
+            :class="{ 'is-active': annotationTool === 'brush' }"
+            type="button"
+            :aria-pressed="annotationTool === 'brush'"
+            title="画笔"
+            @click="setTool('brush')"
+          >
+            <Paintbrush :size="14" :stroke-width="1.9" />
+          </button>
+          <button
+            class="annotation-tool"
+            :class="{ 'is-active': annotationTool === 'eraser' }"
+            type="button"
+            :aria-pressed="annotationTool === 'eraser'"
+            title="橡皮擦（只擦标注，不改原图）"
+            @click="setTool('eraser')"
+          >
+            <Eraser :size="14" :stroke-width="1.9" />
+          </button>
+          <button
+            class="annotation-tool"
+            :class="{ 'is-active': annotationTool === 'heal' }"
+            type="button"
+            :aria-pressed="annotationTool === 'heal'"
+            title="局部修瑕（柔化小污点）"
+            @click="setTool('heal')"
+          >
+            <Wand2 :size="14" :stroke-width="1.9" />
+          </button>
+          <span class="annotation-separator" aria-hidden="true" />
+          <label class="annotation-color" title="标注颜色">
+            <input v-model="annotationColor" type="color" aria-label="标注颜色" />
+          </label>
+          <label class="annotation-size" title="笔触粗细">
+            <input
+              v-model.number="annotationWidth"
+              type="range"
+              min="2"
+              max="30"
+              step="1"
+              aria-label="笔触粗细"
+            />
+          </label>
+          <span class="annotation-separator" aria-hidden="true" />
+          <button
+            class="annotation-tool"
+            type="button"
+            :disabled="!canUndo"
+            title="撤销标注（Ctrl+Z）"
+            aria-label="撤销标注"
+            @click="undo"
+          >
+            <Undo2 :size="14" :stroke-width="1.9" />
+          </button>
+          <button
+            class="annotation-tool"
+            type="button"
+            :disabled="!canRedo"
+            title="重做标注（Ctrl+Shift+Z）"
+            aria-label="重做标注"
+            @click="redo"
+          >
+            <Redo2 :size="14" :stroke-width="1.9" />
+          </button>
+        </div>
+
+        <div
+          v-if="activeBlank"
+          class="blank-size-panel"
+          @pointerdown.stop
+          @click.stop
+          @wheel.stop
+        >
+          <div class="blank-size-head">
+            <strong>空白页</strong>
+            <span class="tnum">{{ blankSizeSummary }}</span>
+          </div>
+          <div class="blank-size-fields">
+            <label>
+              <span>宽</span>
+              <input
+                type="number"
+                min="40"
+                max="16384"
+                step="10"
+                :value="activeBlank.width"
+                @change="updateBlankSize('width', $event)"
+              />
+            </label>
+            <label>
+              <span>高</span>
+              <input
+                type="number"
+                min="40"
+                max="16384"
+                step="10"
+                :value="activeBlank.height"
+                @change="updateBlankSize('height', $event)"
+              />
+            </label>
+          </div>
+          <div class="blank-size-presets">
+            <button type="button" @click="applyBlankPreset(800, 800)">1:1</button>
+            <button type="button" @click="applyBlankPreset(1200, 800)">3:2</button>
+            <button type="button" @click="applyBlankPreset(1920, 1080)">16:9</button>
+          </div>
+          <span class="blank-size-hint">也可拖动右下角调整</span>
+        </div>
+
+        <div
+          v-if="textDraft"
+          class="text-editor"
+          :style="textEditorStyle"
+          @pointerdown.stop
+          @click.stop
+        >
+          <input
+            ref="textInputRef"
+            v-model="textDraft.value"
+            type="text"
+            maxlength="120"
+            placeholder="输入文字后回车"
+            aria-label="标注文字"
+            @keydown.enter.prevent="commitText"
+            @keydown.esc.prevent="cancelText"
+          />
+          <button type="button" title="确认文字" aria-label="确认文字" @click="commitText">
+            <Check :size="14" :stroke-width="2" />
+          </button>
+          <button type="button" title="取消文字" aria-label="取消文字" @click="cancelText">
+            <X :size="14" :stroke-width="2" />
+          </button>
+        </div>
       </div>
     </div>
 
@@ -733,6 +1456,16 @@ defineExpose({ focusImage })
   object-fit: var(--thumb-fit);
 }
 
+.preview-thumbnail__blank {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-subtle);
+  color: var(--text-faint);
+}
+
 .preview-thumbnail__index {
   position: absolute;
   bottom: 3px;
@@ -768,6 +1501,11 @@ defineExpose({ focusImage })
   cursor: grabbing;
 }
 
+.stage-viewport.is-annotating,
+.stage-viewport.is-drawing {
+  cursor: crosshair;
+}
+
 .stage-viewport:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -780,6 +1518,284 @@ defineExpose({ focusImage })
   border-radius: 8px;
   background: transparent;
   cursor: inherit;
+}
+
+.annotation-toolbar {
+  position: absolute;
+  z-index: 4;
+  top: 10px;
+  left: 10px;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 3px 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: var(--shadow-xs);
+  backdrop-filter: blur(8px);
+}
+
+.annotation-tool {
+  display: inline-flex;
+  width: 27px;
+  height: 27px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  color: var(--text-muted);
+  transition:
+    background-color 0.15s var(--ease),
+    color 0.15s var(--ease);
+}
+
+.annotation-tool:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text-strong);
+}
+
+.annotation-tool.is-active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.annotation-tool:disabled {
+  opacity: 0.3;
+}
+
+.annotation-separator {
+  width: 1px;
+  height: 16px;
+  margin: 0 3px;
+  background: var(--border);
+}
+
+.annotation-color {
+  display: inline-flex;
+  width: 27px;
+  height: 27px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.annotation-color:hover {
+  background: var(--surface-hover);
+}
+
+.annotation-color input {
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  background: none;
+  cursor: pointer;
+}
+
+.annotation-color input::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+
+.annotation-color input::-webkit-color-swatch {
+  border: 0;
+  border-radius: 50%;
+}
+
+.annotation-size {
+  display: inline-flex;
+  width: 66px;
+  height: 27px;
+  align-items: center;
+  padding: 0 4px;
+  cursor: pointer;
+}
+
+.annotation-size input {
+  width: 100%;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.blank-selection {
+  position: absolute;
+  z-index: 3;
+  border: 1.5px dashed var(--accent);
+  background: transparent;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.72) inset;
+  pointer-events: none;
+}
+
+.blank-selection-label {
+  position: absolute;
+  top: -19px;
+  left: -1px;
+  padding: 2px 6px;
+  border-radius: 4px 4px 0 0;
+  background: var(--accent);
+  color: var(--surface);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.blank-resize-handle {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 15px;
+  height: 15px;
+  border: 2px solid var(--accent);
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: var(--shadow-xs);
+  cursor: nwse-resize;
+  pointer-events: auto;
+  transform: translate(50%, 50%);
+}
+
+.blank-resize-handle:hover {
+  background: var(--accent-soft);
+}
+
+.blank-size-panel {
+  position: absolute;
+  z-index: 4;
+  right: 10px;
+  bottom: 10px;
+  display: flex;
+  width: 214px;
+  flex-direction: column;
+  gap: 7px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.95);
+  box-shadow: var(--shadow-xs);
+  backdrop-filter: blur(8px);
+}
+
+.blank-size-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.blank-size-head strong {
+  color: var(--text-strong);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.blank-size-head span {
+  color: var(--text-faint);
+  font-size: 9.5px;
+}
+
+.blank-size-fields {
+  display: flex;
+  gap: 7px;
+}
+
+.blank-size-fields label {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-faint);
+  font-size: 9px;
+}
+
+.blank-size-fields input {
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text-strong);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.blank-size-fields input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.blank-size-presets {
+  display: flex;
+  gap: 4px;
+}
+
+.blank-size-presets button {
+  height: 22px;
+  flex: 1;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface-subtle);
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
+.blank-size-presets button:hover {
+  border-color: var(--accent-line-strong);
+  color: var(--accent);
+}
+
+.blank-size-hint {
+  color: var(--text-faint);
+  font-size: 9px;
+  line-height: 1.4;
+}
+
+.text-editor {
+  position: absolute;
+  z-index: 5;
+  display: flex;
+  width: 228px;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid var(--accent-line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow-float);
+}
+
+.text-editor input {
+  min-width: 0;
+  height: 28px;
+  flex: 1;
+  padding: 0 7px;
+  border: 0;
+  background: transparent;
+  color: var(--text-strong);
+  font-size: 12px;
+}
+
+.text-editor input:focus {
+  outline: none;
+}
+
+.text-editor button {
+  display: inline-flex;
+  width: 26px;
+  height: 26px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  color: var(--text-muted);
+}
+
+.text-editor button:hover {
+  background: var(--surface-hover);
+  color: var(--text-strong);
 }
 
 .zoom-toolbar {
@@ -1072,6 +2088,41 @@ defineExpose({ focusImage })
     right: 16px;
     bottom: 16px;
     width: calc(var(--thumb-w) + 14px);
+  }
+
+  .annotation-toolbar {
+    top: 8px;
+    left: 8px;
+    padding: 2px 3px;
+  }
+
+  .annotation-tool {
+    width: 25px;
+    height: 25px;
+  }
+
+  .annotation-color {
+    width: 25px;
+    height: 25px;
+  }
+
+  .annotation-size {
+    display: none;
+  }
+
+  .blank-size-panel {
+    right: 8px;
+    bottom: 8px;
+    width: 190px;
+    padding: 8px;
+  }
+
+  .text-editor {
+    width: 200px;
+  }
+
+  .blank-selection-label {
+    font-size: 8px;
   }
 
   .zoom-toolbar {

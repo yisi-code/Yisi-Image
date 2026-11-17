@@ -5,6 +5,7 @@ import {
   Columns3,
   Download,
   ExternalLink,
+  FilePlus2,
   FolderDown,
   Github,
   GitBranch,
@@ -14,6 +15,7 @@ import {
   Mail,
   MessageCircle,
   MessageSquare,
+  PenLine,
   RefreshCw,
   Settings2,
   ShieldCheck,
@@ -89,6 +91,16 @@ const features = [
     detail: '50% 起，单张可占满视口；缩略图定位',
   },
   {
+    icon: PenLine,
+    title: '预览标注',
+    detail: '文字、画笔、橡皮擦与局部修瑕，可撤销重做',
+  },
+  {
+    icon: FilePlus2,
+    title: '空白页',
+    detail: '插入白底页，输入尺寸或拖手柄调整',
+  },
+  {
     icon: Settings2,
     title: '缩略图设置',
     detail: '方向、大小、显示方式可调，设置保存在本机',
@@ -162,7 +174,7 @@ defineExpose({ focusTitle })
           <span class="about-version">v{{ APP_VERSION }}</span>
         </div>
         <p class="about-intro">
-          一个把多张图片拼成一张图的本地小工具。纵向、横向、间距和顺序都能随手调整，
+          一个在本地完成多图拼接、轻量标注和空白页排版的工具。纵向、横向、间距和顺序都能随手调整，
           预览缩放后逐张查看细节，导出时再选择保存位置。图片不离开这台电脑。
         </p>
       </div>
@@ -326,7 +338,8 @@ defineExpose({ focusTitle })
           <li>
             单边超过 16,384 px 或总面积超过 1 亿像素时禁止导出；超过 6,000 万像素会提示可能较慢。
           </li>
-          <li>GIF 只使用第一帧；视频、裁剪、滤镜和文字水印不在本工具范围。</li>
+          <li>GIF 只使用第一帧；视频、独立裁剪和滤镜不在本工具范围。</li>
+          <li>局部修瑕是模糊附近画面，不是内容感知移除；标注提交后暂不支持再次选中或拖动。</li>
           <li>只保留最近一次清空的快照；刷新或关闭页面会释放，超大图片请留意内存。</li>
           <li>
             免安装 EXE 未签名，首次运行可能触发 SmartScreen；需要 Windows 自带的 .NET Framework 4.8。
