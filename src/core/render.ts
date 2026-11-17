@@ -1,8 +1,20 @@
+import { getPreviewFit } from './preview'
+import type { PreviewOffset } from './preview'
 import type { StitchImage, StitchLayout } from './types'
 
 export interface RenderOptions {
   scale?: number
   background?: string | null
+}
+
+export interface ViewportRenderOptions {
+  viewportWidth: number
+  viewportHeight: number
+  fitScale?: number
+  zoom: number
+  offset: PreviewOffset
+  dpr?: number
+  background?: string
 }
 
 export function renderStitch(
@@ -47,6 +59,87 @@ export function renderStitch(
   }
 
   context.setTransform(1, 0, 0, 1, 0, 0)
+  return target
+}
+
+/**
+ * 只绘制预览视口内可见的那一块拼接图。
+ *
+ * 全尺寸画布在图片很多、缩放很大时会被浏览器的单边/面积上限压回低分辨率；
+ * 这里让画布始终等于视口大小，再按缩放和平移换算可见区域，因此图片再多也能保持清晰。
+ */
+export function renderStitchView(
+  target: HTMLCanvasElement,
+  layout: StitchLayout,
+  images: readonly StitchImage[],
+  options: ViewportRenderOptions,
+): HTMLCanvasElement {
+  if (layout.width <= 0 || layout.height <= 0) {
+    target.width = 1
+    target.height = 1
+    return target
+  }
+
+  const viewportWidth = Math.max(1, options.viewportWidth)
+  const viewportHeight = Math.max(1, options.viewportHeight)
+  const fit =
+    options.fitScale === undefined
+      ? getPreviewFit(layout, viewportWidth, viewportHeight).scale
+      : options.fitScale
+  const zoom = Math.max(0.01, options.zoom)
+  const contentWidth = Math.max(1, layout.width * fit * zoom)
+  const contentHeight = Math.max(1, layout.height * fit * zoom)
+  const left = (viewportWidth - contentWidth) / 2 + options.offset.x
+  const top = (viewportHeight - contentHeight) / 2 + options.offset.y
+
+  const dpr = Math.max(1, options.dpr ?? 1)
+  const backingScale = Math.max(
+    0.01,
+    Math.min(
+      dpr,
+      4096 / Math.max(viewportWidth, viewportHeight),
+      Math.sqrt(16_000_000 / (viewportWidth * viewportHeight)),
+    ),
+  )
+  target.width = Math.max(1, Math.round(viewportWidth * backingScale))
+  target.height = Math.max(1, Math.round(viewportHeight * backingScale))
+
+  const context = target.getContext('2d')
+  if (!context) {
+    throw new Error('当前浏览器不支持 Canvas 2D')
+  }
+
+  context.setTransform(backingScale, 0, 0, backingScale, 0, 0)
+  context.clearRect(0, 0, viewportWidth, viewportHeight)
+
+  // 图片没有铺满视口时给白色画布加一层轻阴影；放大到边缘超出视口时不再计算阴影。
+  const contentOverflows = contentWidth > viewportWidth + 40 || contentHeight > viewportHeight + 40
+  context.save()
+  if (!contentOverflows) {
+    context.shadowColor = 'rgba(19, 32, 28, 0.18)'
+    context.shadowBlur = 28
+    context.shadowOffsetY = 10
+  }
+  context.fillStyle = options.background ?? '#ffffff'
+  context.fillRect(left, top, contentWidth, contentHeight)
+  context.restore()
+
+  context.save()
+  context.translate(left, top)
+  context.scale(contentWidth / layout.width, contentHeight / layout.height)
+  context.imageSmoothingEnabled = true
+  context.imageSmoothingQuality = 'high'
+
+  const imageById = new Map(images.map((image) => [image.id, image]))
+  for (const item of layout.items) {
+    const image = imageById.get(item.id)
+    if (!image) {
+      continue
+    }
+    context.drawImage(image.element, item.x, item.y, item.width, item.height)
+  }
+  context.restore()
+
   return target
 }
 

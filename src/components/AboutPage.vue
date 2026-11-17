@@ -81,7 +81,7 @@ const features = [
   {
     icon: ZoomIn,
     title: '缩放查看',
-    detail: '50%–400%，滚轮缩放、拖动平移',
+    detail: '50% 起，单张可占满视口；缩略图定位',
   },
   {
     icon: FolderDown,

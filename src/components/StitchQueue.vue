@@ -19,6 +19,7 @@ const emit = defineEmits<{
   reorder: [from: number, to: number]
   clear: []
   restore: []
+  focus: [index: number]
 }>()
 
 const draggingIndex = ref<number | null>(null)
@@ -123,7 +124,20 @@ function resetDrag(): void {
   dropTarget.value = null
 }
 
+function onCardClick(event: MouseEvent, index: number): void {
+  if (event.target instanceof HTMLElement && event.target.closest('.queue-remove')) {
+    return
+  }
+  emit('focus', index)
+}
+
 function onCardKeydown(event: KeyboardEvent, index: number): void {
+  if ((event.key === 'Enter' || event.key === ' ') && !event.altKey) {
+    event.preventDefault()
+    emit('focus', index)
+    return
+  }
+
   if (!event.altKey) {
     return
   }
@@ -196,8 +210,10 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
           }"
           :draggable="!isImporting && images.length > 1"
           tabindex="0"
-          :aria-label="`第 ${index + 1} 张，${image.name}，${formatDimensions(image.width, image.height)} 像素。按 Alt 加上下方向键调整顺序`"
+          :aria-label="`第 ${index + 1} 张，${image.name}，${formatDimensions(image.width, image.height)} 像素。点击定位并放大到预览，按 Alt 加上下方向键调整顺序`"
           aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
+          title="点击定位并放大到预览中的这张图片"
+          @click="onCardClick($event, index)"
           @dragstart="onDragStart($event, index)"
           @dragend="resetDrag"
           @dragover="onDragOver($event, index)"
@@ -442,7 +458,7 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--surface);
-  cursor: grab;
+  cursor: pointer;
   transition:
     border-color 0.15s var(--ease),
     background-color 0.15s var(--ease),
@@ -492,6 +508,7 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
   align-items: center;
   justify-content: center;
   color: var(--icon-ghost);
+  cursor: grab;
 }
 
 .queue-card:hover .drag-handle {

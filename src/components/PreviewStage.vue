@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   ImagePlus,
   Loader2,
@@ -10,7 +10,14 @@ import {
 } from 'lucide-vue-next'
 import { useFileDrop } from '../composables/useFileDrop'
 import { formatDimensions } from '../core/image'
-import { renderStitch } from '../core/render'
+import {
+  clampPreviewOffset,
+  getFocusOffset,
+  getImageFillZoom,
+  getMaxPreviewZoom,
+  getPreviewFit,
+} from '../core/preview'
+import { renderStitchView } from '../core/render'
 import type { ImportProgress, StitchImage, StitchLayout } from '../core/types'
 
 const props = defineProps<{
@@ -27,9 +34,12 @@ const emit = defineEmits<{
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 const viewportRef = ref<HTMLDivElement | null>(null)
+const thumbnailRailRef = ref<HTMLElement | null>(null)
 const zoom = ref(1)
+const maxZoom = ref(4)
 const offset = ref({ x: 0, y: 0 })
 const isPanning = ref(false)
+const activeImageId = ref<string | null>(null)
 let renderFrame = 0
 let panState: {
   pointerId: number
@@ -40,25 +50,13 @@ let panState: {
 } | null = null
 
 const MIN_ZOOM = 0.5
-const MAX_ZOOM = 4
-const PREVIEW_MAX_SIDE = 4096
-const PREVIEW_MAX_PIXELS = 16_000_000
 const PREVIEW_MAX_DPR = 2
 const displaySize = ref({ width: 0, height: 0 })
 
 const { isFileDragging, dropHandlers } = useFileDrop((files) => emit('add', files))
 
 const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`)
-
-const canvasTransform = computed(
-  () => `translate3d(${offset.value.x}px, ${offset.value.y}px, 0)`,
-)
-
-const canvasStyle = computed(() => ({
-  width: `${Math.max(1, displaySize.value.width * zoom.value)}px`,
-  height: `${Math.max(1, displaySize.value.height * zoom.value)}px`,
-  transform: canvasTransform.value,
-}))
+const maxZoomPercent = computed(() => `${Math.round(maxZoom.value * 100)}%`)
 
 const previewLabel = computed(
   () =>
@@ -72,29 +70,97 @@ function resetView(): void {
   panState = null
 }
 
-function clampOffset(next: { x: number; y: number }) {
-  const viewport = viewportRef.value
-  const canvas = canvasRef.value
-  if (!viewport || !canvas) {
-    return next
+async function scrollActiveThumbnail(id: string | null): Promise<void> {
+  await nextTick()
+  const rail = thumbnailRailRef.value
+  if (!rail || !id) {
+    return
+  }
+  const button = Array.from(rail.querySelectorAll<HTMLElement>('[data-image-id]')).find(
+    (element) => element.dataset.imageId === id,
+  )
+  if (!button) {
+    return
   }
 
-  const canvasWidth = displaySize.value.width
-    ? displaySize.value.width * zoom.value
-    : canvas.clientWidth
-  const canvasHeight = displaySize.value.height
-    ? displaySize.value.height * zoom.value
-    : canvas.clientHeight
-  const maxX = Math.max(0, (canvasWidth - viewport.clientWidth) / 2)
-  const maxY = Math.max(0, (canvasHeight - viewport.clientHeight) / 2)
-  return {
-    x: Math.min(maxX, Math.max(-maxX, next.x)),
-    y: Math.min(maxY, Math.max(-maxY, next.y)),
+  const top = button.offsetTop
+  const bottom = top + button.offsetHeight
+  if (top < rail.scrollTop + 6) {
+    rail.scrollTop = Math.max(0, top - 6)
+  } else if (bottom > rail.scrollTop + rail.clientHeight - 6) {
+    rail.scrollTop = bottom - rail.clientHeight + 6
   }
 }
 
+function updateActiveImage(): void {
+  const viewport = viewportRef.value
+  if (!viewport || !props.layout.items.length || displaySize.value.width <= 0) {
+    activeImageId.value = null
+    return
+  }
+
+  const scale = (displaySize.value.width / props.layout.width) * zoom.value
+  const contentWidth = props.layout.width * scale
+  const contentHeight = props.layout.height * scale
+  const left = (viewport.clientWidth - contentWidth) / 2 + offset.value.x
+  const top = (viewport.clientHeight - contentHeight) / 2 + offset.value.y
+  const centerX = (viewport.clientWidth / 2 - left) / scale
+  const centerY = (viewport.clientHeight / 2 - top) / scale
+
+  let closest = props.layout.items[0]
+  let closestDistance = Number.POSITIVE_INFINITY
+  for (const item of props.layout.items) {
+    const dx = item.x + item.width / 2 - centerX
+    const dy = item.y + item.height / 2 - centerY
+    const distance = dx * dx + dy * dy
+    if (distance < closestDistance) {
+      closest = item
+      closestDistance = distance
+    }
+  }
+  activeImageId.value = closest.id
+}
+
+function focusImage(index: number): void {
+  const viewport = viewportRef.value
+  const item = props.layout.items[index]
+  if (!viewport || !item || displaySize.value.width <= 0) {
+    return
+  }
+
+  const fitScale = displaySize.value.width / props.layout.width
+  const fillZoom = getImageFillZoom(
+    item,
+    viewport.clientWidth,
+    viewport.clientHeight,
+    fitScale,
+  )
+  const nextZoom = Math.min(maxZoom.value, Math.max(zoom.value, fillZoom))
+  zoom.value = nextZoom
+  offset.value = clampOffset(
+    getFocusOffset(item, props.layout, fitScale, nextZoom),
+  )
+  activeImageId.value = item.id
+  scheduleRender()
+}
+
+function clampOffset(next: { x: number; y: number }) {
+  const viewport = viewportRef.value
+  if (!viewport) {
+    return next
+  }
+
+  return clampPreviewOffset(
+    next,
+    displaySize.value.width * zoom.value,
+    displaySize.value.height * zoom.value,
+    viewport.clientWidth,
+    viewport.clientHeight,
+  )
+}
+
 function applyZoom(nextZoom: number, anchorX?: number, anchorY?: number): void {
-  const next = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, nextZoom))
+  const next = Math.min(maxZoom.value, Math.max(MIN_ZOOM, nextZoom))
   if (Math.abs(next - zoom.value) < 0.001) {
     return
   }
@@ -176,6 +242,8 @@ function onPointerMove(event: PointerEvent): void {
     x: panState.originX + event.clientX - panState.startX,
     y: panState.originY + event.clientY - panState.startY,
   })
+  scheduleRender()
+  updateActiveImage()
 }
 
 function onPointerUp(event: PointerEvent): void {
@@ -221,13 +289,13 @@ function onViewportKeydown(event: KeyboardEvent): void {
 
   event.preventDefault()
   offset.value = clampOffset(next)
+  scheduleRender()
+  updateActiveImage()
 }
 
 function handleResize(): void {
   if (zoom.value <= 1) {
-    resetView()
-  } else {
-    offset.value = clampOffset(offset.value)
+    offset.value = { x: 0, y: 0 }
   }
   scheduleRender()
 }
@@ -239,38 +307,35 @@ function renderPreview(): void {
     return
   }
 
-  const availableWidth = Math.max(1, viewport.clientWidth)
-  const availableHeight = Math.max(1, viewport.clientHeight)
-  const fitScale = Math.min(
-    1,
-    availableWidth / props.layout.width,
-    availableHeight / props.layout.height,
-  )
-  const baseWidth = Math.max(1, props.layout.width * fitScale)
-  const baseHeight = Math.max(1, props.layout.height * fitScale)
-  displaySize.value = { width: baseWidth, height: baseHeight }
-
-  const visualWidth = baseWidth * zoom.value
-  const visualHeight = baseHeight * zoom.value
-  const dpr = Math.min(window.devicePixelRatio || 1, PREVIEW_MAX_DPR)
-  // 按屏幕实际显示像素重绘，避免先缩小画布再用 CSS 放大导致发虚。
-  const scaleForDisplay = Math.min(
-    (visualWidth * dpr) / props.layout.width,
-    (visualHeight * dpr) / props.layout.height,
-  )
-  const scaleForSide = PREVIEW_MAX_SIDE / Math.max(props.layout.width, props.layout.height)
-  const scaleForPixels = Math.sqrt(
-    PREVIEW_MAX_PIXELS / (props.layout.width * props.layout.height),
-  )
-  const renderScale = Math.max(
-    0.01,
-    Math.min(1, scaleForDisplay, scaleForSide, scaleForPixels),
-  )
-
-  renderStitch(canvas, props.layout, props.images, { scale: renderScale })
-  if (zoom.value > 1) {
-    offset.value = clampOffset(offset.value)
+  const viewportWidth = Math.max(1, viewport.clientWidth)
+  const viewportHeight = Math.max(1, viewport.clientHeight)
+  const fit = getPreviewFit(props.layout, viewportWidth, viewportHeight)
+  if (fit.scale <= 0) {
+    return
   }
+
+  displaySize.value = { width: fit.width, height: fit.height }
+  maxZoom.value = getMaxPreviewZoom(props.layout, viewportWidth, viewportHeight)
+
+  if (zoom.value > maxZoom.value) {
+    zoom.value = maxZoom.value
+  }
+  if (zoom.value > 1) {
+    const clamped = clampOffset(offset.value)
+    if (clamped.x !== offset.value.x || clamped.y !== offset.value.y) {
+      offset.value = clamped
+    }
+  }
+
+  renderStitchView(canvas, props.layout, props.images, {
+    viewportWidth,
+    viewportHeight,
+    fitScale: fit.scale,
+    zoom: zoom.value,
+    offset: offset.value,
+    dpr: Math.min(window.devicePixelRatio || 1, PREVIEW_MAX_DPR),
+  })
+  updateActiveImage()
 }
 
 function scheduleRender(): void {
@@ -280,11 +345,30 @@ function scheduleRender(): void {
 
 watch(() => props.layout, scheduleRender, { flush: 'post' })
 watch(zoom, scheduleRender, { flush: 'post' })
+
+let previousImageIds: string[] = []
 watch(
-  () => props.images.map((image) => image.id).join('|'),
-  () => resetView(),
+  () => props.images.map((image) => image.id),
+  (nextIds) => {
+    const hadImages = previousImageIds.length > 0
+    const hasImages = nextIds.length > 0
+    const previousIds = new Set(previousImageIds)
+    const replaced = hadImages && hasImages && !nextIds.some((id) => previousIds.has(id))
+
+    // 删掉其中一张、排序、追加都不重置视图；只有从空到有、清空或整组替换才回到适应窗口。
+    if ((!hadImages && hasImages) || (hadImages && !hasImages) || replaced) {
+      resetView()
+    }
+    previousImageIds = [...nextIds]
+    scheduleRender()
+  },
   { flush: 'post' },
 )
+
+watch(activeImageId, (id) => {
+  void scrollActiveThumbnail(id)
+})
+
 onMounted(() => {
   scheduleRender()
   window.addEventListener('resize', handleResize)
@@ -293,6 +377,8 @@ onBeforeUnmount(() => {
   window.cancelAnimationFrame(renderFrame)
   window.removeEventListener('resize', handleResize)
 })
+
+defineExpose({ focusImage })
 </script>
 
 <template>
@@ -301,29 +387,50 @@ onBeforeUnmount(() => {
     :class="{ 'is-file-dragging': isFileDragging }"
     v-on="dropHandlers"
   >
-    <div
-      v-if="images.length > 0"
-      ref="viewportRef"
-      class="stage-viewport"
-      :class="{ 'is-panning': isPanning, 'is-zoomed': zoom > 1 }"
-      role="region"
-      tabindex="0"
-      aria-label="预览视口，滚轮缩放，放大后可拖动查看，按 0 恢复适应窗口"
-      @wheel="onWheel"
-      @pointerdown="onPointerDown"
-      @pointermove="onPointerMove"
-      @pointerup="onPointerUp"
-      @pointercancel="onPointerUp"
-      @dblclick="resetView"
-      @keydown="onViewportKeydown"
-    >
-      <canvas
-        ref="canvasRef"
-        class="preview-canvas"
-        role="img"
-        :aria-label="previewLabel"
-        :style="canvasStyle"
-      />
+    <div v-if="images.length > 0" class="preview-workbench">
+      <div
+        ref="viewportRef"
+        class="stage-viewport"
+        :class="{ 'is-panning': isPanning, 'is-zoomed': zoom > 1 }"
+        role="region"
+        tabindex="0"
+        aria-label="预览视口，滚轮缩放，放大后可拖动查看，按 0 恢复适应窗口"
+        @wheel="onWheel"
+        @pointerdown="onPointerDown"
+        @pointermove="onPointerMove"
+        @pointerup="onPointerUp"
+        @pointercancel="onPointerUp"
+        @dblclick="resetView"
+        @keydown="onViewportKeydown"
+      >
+        <canvas
+          ref="canvasRef"
+          class="preview-canvas"
+          role="img"
+          :aria-label="previewLabel"
+        />
+      </div>
+
+      <nav
+        ref="thumbnailRailRef"
+        class="preview-thumbnails"
+        aria-label="图片缩略图导航"
+      >
+        <button
+          v-for="(image, index) in images"
+          :key="image.id"
+          class="preview-thumbnail"
+          :class="{ 'is-active': image.id === activeImageId }"
+          type="button"
+          :data-image-id="image.id"
+          :aria-label="`定位并放大到第 ${index + 1} 张：${image.name}`"
+          :aria-current="image.id === activeImageId ? 'true' : undefined"
+          @click="focusImage(index)"
+        >
+          <img :src="image.url" alt="" draggable="false" />
+          <span class="preview-thumbnail__index tnum">{{ index + 1 }}</span>
+        </button>
+      </nav>
     </div>
 
     <div v-else-if="isImporting" class="stage-loading" role="status">
@@ -380,9 +487,9 @@ onBeforeUnmount(() => {
       <button
         class="zoom-button"
         type="button"
-        :disabled="zoom >= MAX_ZOOM - 0.001"
-        aria-label="放大预览"
-        title="放大预览"
+        :disabled="zoom >= maxZoom - 0.001"
+        :aria-label="`放大预览，最大 ${maxZoomPercent}`"
+        :title="`放大预览（最大 ${maxZoomPercent}）`"
         @click="zoomBy(1.25)"
       >
         <Plus :size="14" :stroke-width="2" />
@@ -433,9 +540,14 @@ onBeforeUnmount(() => {
   background-size: 16px 16px;
 }
 
+.preview-workbench {
+  position: absolute;
+  inset: 0;
+}
+
 .stage-viewport {
   position: absolute;
-  inset: 24px;
+  inset: 24px 102px 24px 24px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -443,6 +555,74 @@ onBeforeUnmount(() => {
   border-radius: 8px;
   cursor: zoom-in;
   touch-action: none;
+}
+
+.preview-thumbnails {
+  position: absolute;
+  z-index: 2;
+  top: 14px;
+  right: 10px;
+  bottom: 54px;
+  display: flex;
+  width: 74px;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 2px;
+  scrollbar-width: thin;
+}
+
+.preview-thumbnail {
+  position: relative;
+  display: block;
+  width: 70px;
+  height: 50px;
+  flex: 0 0 auto;
+  overflow: hidden;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: 0 0 0 1px var(--border);
+  cursor: pointer;
+  transition:
+    border-color 0.15s var(--ease),
+    box-shadow 0.15s var(--ease);
+}
+
+.preview-thumbnail img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.preview-thumbnail__index {
+  position: absolute;
+  bottom: 3px;
+  left: 4px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: rgba(19, 32, 28, 0.72);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.preview-thumbnail:hover {
+  border-color: var(--accent-line-strong);
+}
+
+.preview-thumbnail.is-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.preview-thumbnail:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .stage-viewport.is-zoomed {
@@ -460,21 +640,11 @@ onBeforeUnmount(() => {
 
 .preview-canvas {
   display: block;
-  width: auto;
-  height: auto;
-  border-radius: 2px;
-  background: var(--surface);
+  width: 100%;
+  height: 100%;
+  border-radius: 8px;
+  background: transparent;
   cursor: inherit;
-  transform-origin: center center;
-  transition: transform 0.12s var(--ease);
-  will-change: transform;
-  box-shadow:
-    0 0 0 1px rgba(19, 32, 28, 0.05),
-    0 18px 44px -24px rgba(19, 32, 28, 0.34);
-}
-
-.stage-viewport.is-panning .preview-canvas {
-  transition: none;
 }
 
 .zoom-toolbar {
@@ -679,7 +849,7 @@ onBeforeUnmount(() => {
 .stage-busy {
   position: absolute;
   top: 12px;
-  right: 12px;
+  right: 98px;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -739,12 +909,27 @@ onBeforeUnmount(() => {
   }
 
   .stage-viewport {
-    inset: 16px;
+    inset: 16px 86px 16px 16px;
+  }
+
+  .preview-thumbnails {
+    right: 6px;
+    bottom: 50px;
+    width: 68px;
+  }
+
+  .preview-thumbnail {
+    width: 62px;
+    height: 44px;
   }
 
   .zoom-toolbar {
     bottom: 11px;
     left: 11px;
+  }
+
+  .stage-busy {
+    right: 82px;
   }
 
   .zoom-hint {

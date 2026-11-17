@@ -54,7 +54,8 @@ const toneIcons = {
 .toast-region {
   position: fixed;
   z-index: 60;
-  right: 22px;
+  /* 让开右侧缩略图轨，提示不能压住缩略图与当前项高亮。 */
+  right: 128px;
   /* 避开底部拼接控制条，避免提示遮住间距输入与导出说明。 */
   bottom: 108px;
   width: min(360px, calc(100vw - 32px));

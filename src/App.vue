@@ -49,7 +49,12 @@ const activeView = ref<'workspace' | 'about'>('workspace')
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const aboutButtonRef = ref<HTMLButtonElement | null>(null)
 const aboutPageRef = ref<{ focusTitle: () => void } | null>(null)
+const previewStageRef = ref<{ focusImage: (index: number) => void } | null>(null)
 const canChooseSaveLocation = getSavePicker() !== null
+
+function focusQueueImage(index: number): void {
+  previewStageRef.value?.focusImage(index)
+}
 
 const {
   images,
@@ -407,6 +412,7 @@ async function handleExport(): Promise<void> {
         @reorder="moveImage"
         @clear="requestClear"
         @restore="restoreLastCleared"
+        @focus="focusQueueImage"
       />
 
       <section class="preview-panel" aria-label="拼接预览与设置">
@@ -435,6 +441,7 @@ async function handleExport(): Promise<void> {
         </header>
 
         <PreviewStage
+          ref="previewStageRef"
           :images="images"
           :layout="layout"
           :is-importing="isImporting"
