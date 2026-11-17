@@ -1,0 +1,10 @@
+node_modules/
+dist/
+dist-ssr/
+.vite/
+release/
+launcher/WebAssets.zip
+*.local
+*.log
+.DS_Store
+Thumbs.db
