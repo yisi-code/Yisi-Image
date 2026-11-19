@@ -264,6 +264,35 @@ p {
   font-variant-numeric: tabular-nums;
 }
 
+/* v-tooltip 指令共用的悬浮提示，挂在 body 下，不受预览区 overflow 裁剪。 */
+.app-tooltip {
+  position: fixed;
+  z-index: 1000;
+  top: 0;
+  left: 0;
+  width: max-content;
+  max-width: 260px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: var(--text-strong);
+  color: var(--surface);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.45;
+  box-shadow: var(--shadow-float);
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity 0.12s var(--ease),
+    visibility 0.12s;
+}
+
+.app-tooltip.is-visible {
+  opacity: 1;
+  visibility: visible;
+}
+
 .spin {
   animation: ui-spin 0.9s linear infinite;
 }

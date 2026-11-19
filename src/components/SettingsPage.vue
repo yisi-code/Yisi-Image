@@ -5,12 +5,18 @@ import {
   ArrowUpDown,
   Crop,
   Expand,
+  FileCog,
+  FolderInput,
+  FolderOpen,
+  Loader2,
   Maximize2,
   RefreshCw,
   RotateCcw,
   Settings2,
-  SlidersHorizontal,
+  Undo2,
 } from 'lucide-vue-next'
+import type { ConfigDirStatus, SettingsStorage } from '../composables/useSettings'
+import type { ConfigLocation } from '../core/configApi'
 import {
   THUMBNAIL_FIT_OPTIONS,
   THUMBNAIL_ORIENTATION_OPTIONS,
@@ -27,11 +33,19 @@ import type { StitchDirection } from '../core/types'
 const props = defineProps<{
   settings: ToolSettings
   stitchDirection: StitchDirection
+  storage: SettingsStorage
+  configLocation: ConfigLocation | null
+  saveError: string
+  isMovingDir: boolean
+  dirStatus: ConfigDirStatus | null
 }>()
 
 const emit = defineEmits<{
   update: [patch: Partial<ToolSettings>]
   reset: []
+  'change-dir': []
+  'reset-dir': []
+  'open-dir': []
 }>()
 
 const titleRef = ref<HTMLElement | null>(null)
@@ -67,6 +81,30 @@ const currentSummary = computed(() => {
   return `${orientation} · ${size}号 · ${fit}`
 })
 
+const isFileStorage = computed(
+  () => props.storage === 'file' && props.configLocation !== null,
+)
+
+const configSummary = computed(() => {
+  if (!isFileStorage.value) {
+    return '浏览器本地存储'
+  }
+  return props.configLocation?.isDefault ? '程序所在目录' : '自定义目录'
+})
+
+/** 配置区域只显示一条状态：目录操作的进度或结果优先，其次是保存失败。 */
+const configStatus = computed<ConfigDirStatus | null>(
+  () => {
+    if (props.dirStatus) {
+      return props.dirStatus
+    }
+    if (props.saveError) {
+      return { tone: 'error', text: `配置未能保存：${props.saveError}` }
+    }
+    return null
+  },
+)
+
 function focusTitle(): void {
   titleRef.value?.focus()
 }
@@ -97,7 +135,10 @@ defineExpose({ focusTitle })
           <h2 id="settings-title" ref="titleRef" tabindex="-1">设置</h2>
           <span class="settings-pill">仅本机</span>
         </div>
-        <p>
+        <p v-if="isFileStorage">
+          调整预览缩略图的方向、大小和图片显示方式。设置会自动保存到配置文件（默认在程序所在目录），不影响导出的原图。
+        </p>
+        <p v-else>
           调整预览缩略图的方向、大小和图片显示方式。设置会自动保存在当前浏览器，不影响导出的原图。
         </p>
       </div>
@@ -194,20 +235,90 @@ defineExpose({ focusTitle })
       </div>
     </section>
 
-    <section class="settings-card settings-card--more" aria-labelledby="more-settings-title">
-      <div class="settings-more">
-        <span class="settings-more__mark" aria-hidden="true">
-          <SlidersHorizontal :size="19" :stroke-width="1.7" />
-        </span>
+    <section class="settings-card" aria-labelledby="config-settings-title">
+      <header class="settings-card__head">
         <div>
-          <h3 id="more-settings-title">更多设置</h3>
-          <p>后续会在这里加入导出、界面等可调选项，当前版本先保留缩略图相关设置。</p>
+          <h3 id="config-settings-title">配置文件</h3>
+          <p>缩略图设置、拼接间距和预览工具栏的位置与收起状态都保存在这里。</p>
+        </div>
+        <span class="settings-summary">{{ configSummary }}</span>
+      </header>
+
+      <div class="setting-block setting-block--last">
+        <div class="setting-label">
+          <h4>存储目录</h4>
+          <p>默认放在程序所在目录，随程序一起拷走即可沿用；更改后会把配置文件移动到新目录。</p>
+        </div>
+
+        <div v-if="isFileStorage && configLocation" class="config-location">
+          <div class="config-path">
+            <FileCog :size="15" :stroke-width="1.8" aria-hidden="true" />
+            <span class="config-path__text">{{ configLocation.file }}</span>
+          </div>
+          <div class="config-actions">
+            <button
+              class="button button-secondary"
+              type="button"
+              :disabled="isMovingDir"
+              @click="emit('change-dir')"
+            >
+              <Loader2 v-if="isMovingDir" class="spin" :size="14" :stroke-width="1.9" />
+              <FolderInput v-else :size="14" :stroke-width="1.9" />
+              更改目录…
+            </button>
+            <button
+              class="button button-secondary"
+              type="button"
+              :disabled="isMovingDir"
+              @click="emit('open-dir')"
+            >
+              <FolderOpen :size="14" :stroke-width="1.9" />
+              打开目录
+            </button>
+            <button
+              v-if="!configLocation.isDefault"
+              class="button button-secondary"
+              type="button"
+              :disabled="isMovingDir"
+              @click="emit('reset-dir')"
+            >
+              <Undo2 :size="14" :stroke-width="1.9" />
+              移回程序目录
+            </button>
+          </div>
+          <p
+            v-if="configStatus"
+            class="config-status"
+            :class="`config-status--${configStatus.tone}`"
+            role="status"
+          >
+            {{ configStatus.text }}
+          </p>
+        </div>
+
+        <div v-else class="config-location">
+          <p class="config-note">
+            当前以浏览器页面运行，设置保存在浏览器本地存储。使用免安装 EXE 时才会写入配置文件，并可在这里更改目录。
+          </p>
+          <p
+            v-if="configStatus"
+            class="config-status"
+            :class="`config-status--${configStatus.tone}`"
+            role="status"
+          >
+            {{ configStatus.text }}
+          </p>
         </div>
       </div>
     </section>
 
     <footer class="settings-footer">
-      <p>设置自动保存在本机浏览器；换浏览器或清除站点数据后会恢复默认。</p>
+      <p v-if="isFileStorage">
+        设置自动保存到配置文件。恢复默认会同时重置拼接间距和工具栏位置，不改变配置目录。
+      </p>
+      <p v-else>
+        设置自动保存在本机浏览器，换浏览器或清除站点数据后会恢复默认。恢复默认会同时重置拼接间距和工具栏位置。
+      </p>
       <button class="button button-secondary" type="button" @click="emit('reset')">
         <RotateCcw :size="14" :stroke-width="1.9" />
         恢复默认设置
@@ -318,8 +429,7 @@ defineExpose({ focusTitle })
 }
 
 .settings-card__head p,
-.setting-label p,
-.settings-more p {
+.setting-label p {
   margin: 5px 0 0;
   color: var(--text-muted);
   font-size: 11.5px;
@@ -524,31 +634,66 @@ defineExpose({ focusTitle })
   color: var(--accent-ink);
 }
 
-.settings-card--more {
-  padding: 18px 22px;
-}
-
-.settings-more {
+.config-location {
   display: flex;
-  align-items: flex-start;
-  gap: 12px;
+  min-width: 0;
+  flex-direction: column;
+  gap: 10px;
 }
 
-.settings-more__mark {
-  display: inline-flex;
-  width: 34px;
-  height: 34px;
-  flex: 0 0 34px;
-  align-items: center;
-  justify-content: center;
+.config-path {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
   border: 1px solid var(--border);
-  border-radius: 9px;
+  border-radius: var(--radius-sm);
   background: var(--surface-subtle);
+  color: var(--text);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.config-path > svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  color: var(--accent-ink);
+}
+
+.config-path__text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.config-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.config-note,
+.config-status {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.config-note {
   color: var(--text-muted);
 }
 
-.settings-more h3 {
-  font-size: 13px;
+.config-status--info {
+  color: var(--text-muted);
+}
+
+.config-status--success {
+  color: var(--success);
+}
+
+.config-status--error {
+  color: var(--danger);
 }
 
 .settings-footer {

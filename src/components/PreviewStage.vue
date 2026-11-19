@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import type { Component } from 'vue'
 import {
   Check,
   Eraser,
@@ -17,7 +18,9 @@ import {
   UploadCloud,
   Wand2,
   X,
+  ZoomIn,
 } from 'lucide-vue-next'
+import FloatingToolbar from './FloatingToolbar.vue'
 import { useFileDrop } from '../composables/useFileDrop'
 import {
   cloneAnnotations,
@@ -38,7 +41,10 @@ import type {
   ThumbnailFit,
   ThumbnailOrientation,
   ThumbnailSize,
+  ToolbarKey,
+  ToolbarState,
 } from '../core/settings'
+import { vTooltip } from '../directives/tooltip'
 import type {
   AnnotationPoint,
   AnnotationTool,
@@ -57,6 +63,8 @@ const props = defineProps<{
   thumbOrientation: ThumbnailOrientation
   thumbSize: ThumbnailSize
   thumbFit: ThumbnailFit
+  annotationToolbar: ToolbarState
+  zoomToolbar: ToolbarState
 }>()
 
 const emit = defineEmits<{
@@ -64,6 +72,7 @@ const emit = defineEmits<{
   add: [files: File[]]
   'active-change': [id: string | null]
   'resize-blank': [id: string, width: number, height: number]
+  'update-toolbar': [key: ToolbarKey, state: ToolbarState]
 }>()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
@@ -117,6 +126,23 @@ interface HistoryEntry {
   after: StitchAnnotation[]
 }
 
+interface AnnotationToolOption {
+  value: AnnotationTool
+  /** 无障碍名称 */
+  name: string
+  /** 悬浮提示 */
+  tip: string
+  icon: Component
+}
+
+const ANNOTATION_TOOLS: AnnotationToolOption[] = [
+  { value: 'select', name: '选择与平移', tip: '选择与平移', icon: MousePointer2 },
+  { value: 'text', name: '添加文字', tip: '添加文字', icon: Type },
+  { value: 'brush', name: '画笔', tip: '画笔', icon: Paintbrush },
+  { value: 'eraser', name: '橡皮擦', tip: '橡皮擦（只擦标注，不改原图）', icon: Eraser },
+  { value: 'heal', name: '局部修瑕', tip: '局部修瑕（柔化小污点）', icon: Wand2 },
+]
+
 const MIN_ZOOM = 0.5
 const PREVIEW_MAX_DPR = 2
 const MAX_HISTORY = 50
@@ -126,6 +152,11 @@ const { isFileDragging, dropHandlers } = useFileDrop((files) => emit('add', file
 
 const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`)
 const maxZoomPercent = computed(() => `${Math.round(maxZoom.value * 100)}%`)
+const activeToolOption = computed(
+  () =>
+    ANNOTATION_TOOLS.find((tool) => tool.value === annotationTool.value) ??
+    ANNOTATION_TOOLS[0],
+)
 
 const resolvedThumbOrientation = computed<'horizontal' | 'vertical'>(() =>
   props.thumbOrientation === 'auto'
@@ -1053,9 +1084,9 @@ defineExpose({ focusImage })
         >
           <span class="blank-selection-label">空白页</span>
           <button
+            v-tooltip="'拖动调整空白页大小'"
             class="blank-resize-handle"
             type="button"
-            title="拖动调整空白页大小"
             aria-label="拖动调整空白页大小"
             @pointerdown="startBlankResize"
             @pointermove="moveBlankResize"
@@ -1064,69 +1095,30 @@ defineExpose({ focusImage })
           />
         </div>
 
-        <div
+        <FloatingToolbar
           class="annotation-toolbar"
-          role="toolbar"
-          aria-label="标注工具"
-          @pointerdown.stop
-          @click.stop
-          @wheel.stop
+          label="标注工具栏"
+          :state="annotationToolbar"
+          @update:state="emit('update-toolbar', 'annotationToolbar', $event)"
         >
           <button
+            v-for="tool in ANNOTATION_TOOLS"
+            :key="tool.value"
+            v-tooltip="tool.tip"
             class="annotation-tool"
-            :class="{ 'is-active': annotationTool === 'select' }"
+            :class="{ 'is-active': annotationTool === tool.value }"
             type="button"
-            :aria-pressed="annotationTool === 'select'"
-            title="选择与平移"
-            @click="setTool('select')"
+            :aria-label="tool.name"
+            :aria-pressed="annotationTool === tool.value"
+            @click="setTool(tool.value)"
           >
-            <MousePointer2 :size="14" :stroke-width="1.9" />
-          </button>
-          <button
-            class="annotation-tool"
-            :class="{ 'is-active': annotationTool === 'text' }"
-            type="button"
-            :aria-pressed="annotationTool === 'text'"
-            title="添加文字"
-            @click="setTool('text')"
-          >
-            <Type :size="14" :stroke-width="1.9" />
-          </button>
-          <button
-            class="annotation-tool"
-            :class="{ 'is-active': annotationTool === 'brush' }"
-            type="button"
-            :aria-pressed="annotationTool === 'brush'"
-            title="画笔"
-            @click="setTool('brush')"
-          >
-            <Paintbrush :size="14" :stroke-width="1.9" />
-          </button>
-          <button
-            class="annotation-tool"
-            :class="{ 'is-active': annotationTool === 'eraser' }"
-            type="button"
-            :aria-pressed="annotationTool === 'eraser'"
-            title="橡皮擦（只擦标注，不改原图）"
-            @click="setTool('eraser')"
-          >
-            <Eraser :size="14" :stroke-width="1.9" />
-          </button>
-          <button
-            class="annotation-tool"
-            :class="{ 'is-active': annotationTool === 'heal' }"
-            type="button"
-            :aria-pressed="annotationTool === 'heal'"
-            title="局部修瑕（柔化小污点）"
-            @click="setTool('heal')"
-          >
-            <Wand2 :size="14" :stroke-width="1.9" />
+            <component :is="tool.icon" :size="14" :stroke-width="1.9" />
           </button>
           <span class="annotation-separator" aria-hidden="true" />
-          <label class="annotation-color" title="标注颜色">
+          <label v-tooltip="'标注颜色'" class="annotation-color">
             <input v-model="annotationColor" type="color" aria-label="标注颜色" />
           </label>
-          <label class="annotation-size" title="笔触粗细">
+          <label v-tooltip="`笔触粗细 ${annotationWidth}`" class="annotation-size">
             <input
               v-model.number="annotationWidth"
               type="range"
@@ -1138,26 +1130,31 @@ defineExpose({ focusImage })
           </label>
           <span class="annotation-separator" aria-hidden="true" />
           <button
+            v-tooltip="'撤销标注（Ctrl+Z）'"
             class="annotation-tool"
             type="button"
             :disabled="!canUndo"
-            title="撤销标注（Ctrl+Z）"
             aria-label="撤销标注"
             @click="undo"
           >
             <Undo2 :size="14" :stroke-width="1.9" />
           </button>
           <button
+            v-tooltip="'重做标注（Ctrl+Shift+Z）'"
             class="annotation-tool"
             type="button"
             :disabled="!canRedo"
-            title="重做标注（Ctrl+Shift+Z）"
             aria-label="重做标注"
             @click="redo"
           >
             <Redo2 :size="14" :stroke-width="1.9" />
           </button>
-        </div>
+
+          <template #collapsed>
+            <component :is="activeToolOption.icon" :size="14" :stroke-width="1.9" />
+            <span>标注</span>
+          </template>
+        </FloatingToolbar>
 
         <div
           v-if="activeBlank"
@@ -1219,10 +1216,10 @@ defineExpose({ focusImage })
             @keydown.enter.prevent="commitText"
             @keydown.esc.prevent="cancelText"
           />
-          <button type="button" title="确认文字" aria-label="确认文字" @click="commitText">
+          <button v-tooltip="'确认文字'" type="button" aria-label="确认文字" @click="commitText">
             <Check :size="14" :stroke-width="2" />
           </button>
-          <button type="button" title="取消文字" aria-label="取消文字" @click="cancelText">
+          <button v-tooltip="'取消文字'" type="button" aria-label="取消文字" @click="cancelText">
             <X :size="14" :stroke-width="2" />
           </button>
         </div>
@@ -1260,48 +1257,59 @@ defineExpose({ focusImage })
       </span>
     </div>
 
-    <div v-if="images.length > 0" class="zoom-toolbar" role="toolbar" aria-label="预览缩放">
+    <FloatingToolbar
+      v-if="images.length > 0"
+      class="zoom-toolbar"
+      label="缩放栏"
+      :state="zoomToolbar"
+      @update:state="emit('update-toolbar', 'zoomToolbar', $event)"
+    >
       <button
+        v-tooltip="'缩小预览'"
         class="zoom-button"
         type="button"
         :disabled="zoom <= MIN_ZOOM + 0.001"
         aria-label="缩小预览"
-        title="缩小预览"
         @click="zoomBy(0.8)"
       >
         <Minus :size="14" :stroke-width="2" />
       </button>
       <button
+        v-tooltip="'恢复到适应窗口'"
         class="zoom-value tnum"
         type="button"
         :aria-label="`当前缩放 ${zoomPercent}，点击恢复适应窗口`"
-        title="恢复到适应窗口"
         @click="resetView"
       >
         {{ zoomPercent }}
       </button>
       <button
+        v-tooltip="`放大预览（最大 ${maxZoomPercent}）`"
         class="zoom-button"
         type="button"
         :disabled="zoom >= maxZoom - 0.001"
         :aria-label="`放大预览，最大 ${maxZoomPercent}`"
-        :title="`放大预览（最大 ${maxZoomPercent}）`"
         @click="zoomBy(1.25)"
       >
         <Plus :size="14" :stroke-width="2" />
       </button>
       <span class="zoom-separator" aria-hidden="true" />
       <button
+        v-tooltip="'恢复适应窗口'"
         class="zoom-fit"
         type="button"
-        title="恢复适应窗口"
         @click="resetView"
       >
         <Maximize2 :size="13" :stroke-width="1.9" />
         <span>适应</span>
       </button>
       <span class="zoom-hint" aria-hidden="true">滚轮缩放 · 拖动查看</span>
-    </div>
+
+      <template #collapsed>
+        <ZoomIn :size="13" :stroke-width="1.9" />
+        <span class="tnum">{{ zoomPercent }}</span>
+      </template>
+    </FloatingToolbar>
 
     <div
       v-if="isImporting && images.length > 0"
@@ -1520,20 +1528,11 @@ defineExpose({ focusImage })
   cursor: inherit;
 }
 
+/* 外观与拖动由 FloatingToolbar 负责，这里只给未拖动过时的默认位置。 */
 .annotation-toolbar {
-  position: absolute;
   z-index: 4;
   top: 10px;
   left: 10px;
-  display: flex;
-  align-items: center;
-  gap: 1px;
-  padding: 3px 4px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.94);
-  box-shadow: var(--shadow-xs);
-  backdrop-filter: blur(8px);
 }
 
 .annotation-tool {
@@ -1799,19 +1798,9 @@ defineExpose({ focusImage })
 }
 
 .zoom-toolbar {
-  position: absolute;
   z-index: 3;
   bottom: 15px;
   left: 15px;
-  display: flex;
-  align-items: center;
-  gap: 1px;
-  padding: 4px;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: rgba(255, 255, 255, 0.92);
-  box-shadow: var(--shadow-xs);
-  backdrop-filter: blur(8px);
 }
 
 .zoom-button,
@@ -2093,7 +2082,6 @@ defineExpose({ focusImage })
   .annotation-toolbar {
     top: 8px;
     left: 8px;
-    padding: 2px 3px;
   }
 
   .annotation-tool {

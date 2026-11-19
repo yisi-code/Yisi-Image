@@ -23,11 +23,11 @@ import {
   UserRound,
   ZoomIn,
 } from 'lucide-vue-next'
-import { APP_VERSION } from '../core/appInfo'
+import { APP_VERSION, IS_DESKTOP_APP } from '../core/appInfo'
 import { getSavePicker } from '../core/save'
 
 const titleRef = ref<HTMLHeadingElement | null>(null)
-const isDesktopApp = window.location.port === '47831'
+const isDesktopApp = IS_DESKTOP_APP
 const updateState = ref<'idle' | 'checking' | 'started' | 'error'>('idle')
 const updateMessage = ref('')
 
@@ -93,7 +93,7 @@ const features = [
   {
     icon: PenLine,
     title: '预览标注',
-    detail: '文字、画笔、橡皮擦与局部修瑕，可撤销重做',
+    detail: '文字、画笔、橡皮擦与局部修瑕；工具栏可拖动、收起',
   },
   {
     icon: FilePlus2,
@@ -103,7 +103,7 @@ const features = [
   {
     icon: Settings2,
     title: '缩略图设置',
-    detail: '方向、大小、显示方式可调，设置保存在本机',
+    detail: '方向、大小、显示方式可调，连同间距存入配置文件',
   },
   {
     icon: FolderDown,

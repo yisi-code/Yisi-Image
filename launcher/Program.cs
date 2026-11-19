@@ -9,14 +9,15 @@ using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
 using System.Threading;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 [assembly: AssemblyTitle("Yisi 图像工具")]
 [assembly: AssemblyDescription("本地多图拼接工具")]
 [assembly: AssemblyProduct("Yisi 图像工具")]
 [assembly: AssemblyCompany("Yisi")]
-[assembly: AssemblyVersion("0.8.0.0")]
-[assembly: AssemblyFileVersion("0.8.0.0")]
+[assembly: AssemblyVersion("0.9.0.0")]
+[assembly: AssemblyFileVersion("0.9.0.0")]
 
 namespace Yisi.ImageTool
 {
@@ -226,6 +227,7 @@ namespace Yisi.ImageTool
         private readonly ToolStripMenuItem updateItem;
         private readonly System.Windows.Forms.Timer updateTimer;
         private bool isCheckingUpdate;
+        private bool isPickingFolder;
         private bool isCleanedUp;
 
         public TrayContext(bool openBrowser, bool autoUpdate)
@@ -252,6 +254,9 @@ namespace Yisi.ImageTool
             {
                 uiContext.Post(delegate { CheckForUpdates(true); }, null);
             };
+
+            // 设置页「更改目录」：HTTP 线程在这里等待用户在系统窗口里选完目录。
+            server.PickFolderRequested = PickFolderOnUiThread;
 
             ToolStripMenuItem exitItem = new ToolStripMenuItem("退出");
             exitItem.Click += delegate { ExitApplication(); };
@@ -309,6 +314,42 @@ namespace Yisi.ImageTool
             }
 
             return (Icon)SystemIcons.Application.Clone();
+        }
+
+        private string PickFolderOnUiThread(string initialDirectory)
+        {
+            string selected = null;
+            Exception failure = null;
+            uiContext.Send(delegate
+            {
+                if (isPickingFolder)
+                {
+                    failure = new ConfigException("选择目录窗口已经打开，请先完成或取消");
+                    return;
+                }
+
+                isPickingFolder = true;
+                try
+                {
+                    selected = FolderPicker.Pick("选择配置文件存放目录", initialDirectory);
+                }
+                catch (Exception ex)
+                {
+                    failure = ex;
+                }
+                finally
+                {
+                    isPickingFolder = false;
+                }
+            }, null);
+
+            if (failure != null)
+            {
+                throw failure is ConfigException
+                    ? failure
+                    : new ConfigException("无法打开选择目录窗口：" + failure.Message, failure);
+            }
+            return selected;
         }
 
         private void CheckForUpdates(bool manual)
@@ -449,6 +490,12 @@ namespace Yisi.ImageTool
         /// </summary>
         internal Action CheckUpdateRequested { get; set; }
 
+        /// <summary>
+        /// 设置页请求选择配置目录时调用，参数是当前目录；返回选中的目录，取消时返回 null。
+        /// 由托盘上下文转到 UI 线程弹出系统窗口。
+        /// </summary>
+        internal Func<string, string> PickFolderRequested { get; set; }
+
         public StaticServer(string url)
         {
             Uri uri = new Uri(url);
@@ -530,13 +577,13 @@ namespace Yisi.ImageTool
                     client.ReceiveTimeout = 5000;
                     using (NetworkStream stream = client.GetStream())
                     {
-                        string request = ReadRequest(stream);
-                        if (string.IsNullOrEmpty(request))
+                        HttpRequestData request = ReadRequest(stream);
+                        if (request == null)
                         {
                             return;
                         }
 
-                        string[] lines = request.Split(new string[] { "\r\n" }, StringSplitOptions.None);
+                        string[] lines = request.Head.Split(new string[] { "\r\n" }, StringSplitOptions.None);
                         string[] parts = lines[0].Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
                         if (parts.Length < 2)
                         {
@@ -575,7 +622,7 @@ namespace Yisi.ImageTool
                         if (path == "/api/update/check")
                         {
                             if (method != "POST" ||
-                                request.IndexOf(
+                                request.Head.IndexOf(
                                     "X-Yisi-Update: 1",
                                     StringComparison.OrdinalIgnoreCase) < 0)
                             {
@@ -607,6 +654,13 @@ namespace Yisi.ImageTool
                                 "application/json; charset=utf-8",
                                 Encoding.UTF8.GetBytes("{\"ok\":true}"),
                                 false);
+                            return;
+                        }
+
+                        if (path == "/api/config" ||
+                            path.StartsWith("/api/config/", StringComparison.Ordinal))
+                        {
+                            HandleConfigRequest(stream, method, path, request);
                             return;
                         }
 
@@ -673,10 +727,185 @@ namespace Yisi.ImageTool
             }
         }
 
-        private static string ReadRequest(NetworkStream stream)
+        /// <summary>
+        /// /api/config 系列：读写配置文件、选择与移动配置目录、打开所在目录。
+        /// 只接受带 X-Yisi-Config 头、Host/Origin 为本机地址的请求：跨站页面带自定义头会先发预检，
+        /// 本服务不响应预检；校验 Host 可挡住 DNS 重绑定。
+        /// </summary>
+        private void HandleConfigRequest(
+            NetworkStream stream,
+            string method,
+            string path,
+            HttpRequestData request)
+        {
+            string status = "200 OK";
+            string json;
+            try
+            {
+                if (!IsTrustedConfigRequest(request.Head))
+                {
+                    status = "403 Forbidden";
+                    json = ErrorJson("Forbidden");
+                }
+                else if (path == "/api/config" && method == "GET")
+                {
+                    json = ConfigStore.BuildSnapshotJson();
+                }
+                else if (method != "POST")
+                {
+                    status = "405 Method Not Allowed";
+                    json = ErrorJson("Method Not Allowed");
+                }
+                else if (request.IsBodyTooLarge)
+                {
+                    status = "413 Payload Too Large";
+                    json = ErrorJson("设置内容过大");
+                }
+                else if (path == "/api/config")
+                {
+                    ConfigStore.WriteSettingsJson(Encoding.UTF8.GetString(request.Body));
+                    json = "{\"ok\":true}";
+                }
+                else if (path == "/api/config/pick-dir")
+                {
+                    Func<string, string> picker = PickFolderRequested;
+                    if (picker == null)
+                    {
+                        status = "503 Service Unavailable";
+                        json = ErrorJson("选择目录功能不可用");
+                    }
+                    else
+                    {
+                        string selected = picker(ConfigStore.CurrentDirectory());
+                        json = selected == null
+                            ? "{\"ok\":true,\"canceled\":true}"
+                            : "{\"ok\":true,\"dir\":" + new JavaScriptSerializer().Serialize(selected) + "}";
+                    }
+                }
+                else if (path == "/api/config/location")
+                {
+                    bool moved = ConfigStore.MoveTo(ReadDirectoryField(request.Body));
+                    json = "{\"ok\":true,\"moved\":" + (moved ? "true" : "false") +
+                        ",\"location\":" + ConfigStore.DescribeJson() + "}";
+                }
+                else if (path == "/api/config/open-dir")
+                {
+                    ConfigStore.OpenInExplorer();
+                    json = "{\"ok\":true}";
+                }
+                else
+                {
+                    status = "404 Not Found";
+                    json = ErrorJson("Not Found");
+                }
+            }
+            catch (Exception ex)
+            {
+                status = "500 Internal Server Error";
+                json = ErrorJson(ex.Message);
+            }
+
+            WriteResponse(
+                stream,
+                status,
+                "application/json; charset=utf-8",
+                Encoding.UTF8.GetBytes(json),
+                false);
+        }
+
+        private static bool IsTrustedConfigRequest(string head)
+        {
+            if (GetHeader(head, "X-Yisi-Config") != "1")
+            {
+                return false;
+            }
+
+            string host = GetHeader(head, "Host");
+            if (!IsLocalAuthority(host))
+            {
+                return false;
+            }
+
+            string origin = GetHeader(head, "Origin");
+            return origin == null ||
+                string.Equals(origin, "http://" + host, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsLocalAuthority(string host)
+        {
+            return string.Equals(host, "127.0.0.1:47831", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(host, "localhost:47831", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string GetHeader(string head, string name)
+        {
+            string[] lines = head.Split(new string[] { "\r\n" }, StringSplitOptions.None);
+            for (int index = 1; index < lines.Length; index++)
+            {
+                int colon = lines[index].IndexOf(':');
+                if (colon <= 0)
+                {
+                    continue;
+                }
+                if (string.Equals(lines[index].Substring(0, colon).Trim(), name, StringComparison.OrdinalIgnoreCase))
+                {
+                    return lines[index].Substring(colon + 1).Trim();
+                }
+            }
+            return null;
+        }
+
+        /// <summary>解析 {"dir": "D:\\..."}；dir 为 null 表示移回程序所在目录。</summary>
+        private static string ReadDirectoryField(byte[] body)
+        {
+            Dictionary<string, object> parsed = null;
+            try
+            {
+                parsed = new JavaScriptSerializer().DeserializeObject(Encoding.UTF8.GetString(body))
+                    as Dictionary<string, object>;
+            }
+            catch
+            {
+                // 下面统一报格式错误。
+            }
+            if (parsed == null)
+            {
+                throw new ConfigException("请求格式无效");
+            }
+
+            object value;
+            if (!parsed.TryGetValue("dir", out value) || value == null)
+            {
+                return null;
+            }
+            string dir = value as string;
+            if (dir == null)
+            {
+                throw new ConfigException("请求格式无效");
+            }
+            return dir;
+        }
+
+        private static string ErrorJson(string message)
+        {
+            return "{\"ok\":false,\"error\":" + new JavaScriptSerializer().Serialize(message ?? string.Empty) + "}";
+        }
+
+        private sealed class HttpRequestData
+        {
+            internal string Head;
+            internal byte[] Body;
+            internal bool IsBodyTooLarge;
+        }
+
+        /// <summary>
+        /// 读请求头（上限 8 KB）与按 Content-Length 的请求体（上限 64 KB，超过只标记不读取）。
+        /// </summary>
+        private static HttpRequestData ReadRequest(NetworkStream stream)
         {
             byte[] buffer = new byte[8192];
             int count = 0;
+            int headerEnd = -1;
 
             while (count < buffer.Length)
             {
@@ -687,14 +916,68 @@ namespace Yisi.ImageTool
                 }
 
                 count += read;
-                string text = Encoding.ASCII.GetString(buffer, 0, count);
-                if (text.IndexOf("\r\n\r\n", StringComparison.Ordinal) >= 0)
+                headerEnd = IndexOfHeaderEnd(buffer, count);
+                if (headerEnd >= 0)
                 {
-                    return text;
+                    break;
                 }
             }
 
-            return null;
+            if (headerEnd < 0)
+            {
+                return null;
+            }
+
+            HttpRequestData request = new HttpRequestData();
+            request.Head = Encoding.ASCII.GetString(buffer, 0, headerEnd);
+            request.Body = new byte[0];
+
+            int contentLength;
+            string lengthText = GetHeader(request.Head, "Content-Length");
+            if (lengthText == null ||
+                !int.TryParse(lengthText, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out contentLength) ||
+                contentLength <= 0)
+            {
+                return request;
+            }
+            if (contentLength > ConfigStore.MaxSettingsBytes)
+            {
+                request.IsBodyTooLarge = true;
+                return request;
+            }
+
+            byte[] body = new byte[contentLength];
+            int bodyStart = headerEnd + 4;
+            int filled = Math.Min(contentLength, count - bodyStart);
+            if (filled > 0)
+            {
+                Buffer.BlockCopy(buffer, bodyStart, body, 0, filled);
+            }
+            while (filled < contentLength)
+            {
+                int read = stream.Read(body, filled, contentLength - filled);
+                if (read <= 0)
+                {
+                    return null;
+                }
+                filled += read;
+            }
+
+            request.Body = body;
+            return request;
+        }
+
+        private static int IndexOfHeaderEnd(byte[] buffer, int count)
+        {
+            for (int index = 0; index + 3 < count; index++)
+            {
+                if (buffer[index] == 13 && buffer[index + 1] == 10 &&
+                    buffer[index + 2] == 13 && buffer[index + 3] == 10)
+                {
+                    return index;
+                }
+            }
+            return -1;
         }
 
         private static void WriteResponse(

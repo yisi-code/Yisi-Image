@@ -18,6 +18,8 @@ import StitchControls from './components/StitchControls.vue'
 import StitchQueue from './components/StitchQueue.vue'
 import ToastStack from './components/ToastStack.vue'
 import { useImageQueue } from './composables/useImageQueue'
+import { useSettings } from './composables/useSettings'
+import type { InitialSettings } from './composables/useSettings'
 import { useToasts } from './composables/useToasts'
 import {
   DEFAULT_EXPORT_FORMAT,
@@ -29,7 +31,7 @@ import {
 } from './core/exportFormats'
 import type { ExportFormat } from './core/exportFormats'
 import { IMAGE_ACCEPT, SUPPORTED_FORMAT_LABEL, formatDimensions } from './core/image'
-import { DEFAULT_GAP, calculateStitchLayout, inspectOutputSize } from './core/layout'
+import { calculateStitchLayout, inspectOutputSize } from './core/layout'
 import { UnsupportedExportFormatError, canvasToBlob, renderStitch } from './core/render'
 import {
   downloadBlob,
@@ -38,24 +40,41 @@ import {
   writeBlobToHandle,
 } from './core/save'
 import type { SaveFileHandle } from './core/save'
-import {
-  DEFAULT_SETTINGS,
-  THUMBNAIL_SIZE_PX,
-  loadSettings,
-  saveSettings,
-} from './core/settings'
-import type { ToolSettings } from './core/settings'
+import { THUMBNAIL_SIZE_PX } from './core/settings'
 import type { StitchDirection } from './core/types'
 
+const props = defineProps<{
+  /** main.ts 在挂载前读好的设置，避免先按默认值渲染再跳变 */
+  initialSettings: InitialSettings
+}>()
+
+const {
+  settings,
+  storage: settingsStorage,
+  location: configLocation,
+  saveError: settingsSaveError,
+  isMovingDir: isMovingConfigDir,
+  dirStatus: configDirStatus,
+  update: updateSettings,
+  updateToolbar,
+  reset: resetSettings,
+  changeDir: changeConfigDir,
+  resetDir: resetConfigDir,
+  openDir: openConfigDir,
+} = useSettings(props.initialSettings)
+
 const direction = ref<StitchDirection>('vertical')
-const gap = ref(DEFAULT_GAP)
+/** 间距随设置一起保存到配置文件；底部滑块与数字框通过它读写。 */
+const gap = computed({
+  get: () => settings.value.gap,
+  set: (value: number) => updateSettings({ gap: value }),
+})
 const exportFormat = ref<ExportFormat>(DEFAULT_EXPORT_FORMAT)
 const supportedFormats = getSupportedExportFormats()
 const activeFormat = computed(() => getExportFormat(exportFormat.value))
 const isExporting = ref(false)
 const isClearDialogOpen = ref(false)
 const activeView = ref<'workspace' | 'about' | 'settings'>('workspace')
-const settings = ref<ToolSettings>(loadSettings())
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const aboutButtonRef = ref<HTMLButtonElement | null>(null)
 const settingsButtonRef = ref<HTMLButtonElement | null>(null)
@@ -75,8 +94,6 @@ const toastRightOffset = computed(() =>
     : 22,
 )
 
-watch(settings, (value) => saveSettings(value))
-
 function focusQueueImage(index: number): void {
   previewStageRef.value?.focusImage(index)
 }
@@ -95,6 +112,21 @@ const {
   restoreCleared,
 } = useImageQueue()
 const { toasts, push, dismiss, dismissAll } = useToasts()
+
+// 配置写不进去时提示一次；之后连续失败不重复弹，恢复正常后再失败才会再提示。
+watch(
+  settingsSaveError,
+  (message, previous) => {
+    if (message && !previous) {
+      push({
+        tone: 'error',
+        title: '设置未能保存',
+        message: `${message}。可在「设置」里更换配置目录。`,
+      })
+    }
+  },
+  { immediate: true },
+)
 
 const activeIndex = computed(() =>
   images.value.findIndex((image) => image.id === activeImageId.value),
@@ -196,14 +228,6 @@ async function closeSettings(): Promise<void> {
   activeView.value = 'workspace'
   await nextTick()
   settingsButtonRef.value?.focus()
-}
-
-function updateSettings(patch: Partial<ToolSettings>): void {
-  settings.value = { ...settings.value, ...patch }
-}
-
-function resetSettings(): void {
-  settings.value = { ...DEFAULT_SETTINGS }
 }
 
 function openFilePicker(): void {
@@ -539,10 +563,13 @@ async function handleExport(): Promise<void> {
           :thumb-orientation="settings.thumbnailOrientation"
           :thumb-size="settings.thumbnailSize"
           :thumb-fit="settings.thumbnailFit"
+          :annotation-toolbar="settings.annotationToolbar"
+          :zoom-toolbar="settings.zoomToolbar"
           @pick="openFilePicker"
           @add="handleAdd"
           @active-change="activeImageId = $event"
           @resize-blank="resizeBlankPage"
+          @update-toolbar="updateToolbar"
         />
 
         <StitchControls
@@ -564,8 +591,16 @@ async function handleExport(): Promise<void> {
         ref="settingsPageRef"
         :settings="settings"
         :stitch-direction="direction"
+        :storage="settingsStorage"
+        :config-location="configLocation"
+        :save-error="settingsSaveError"
+        :is-moving-dir="isMovingConfigDir"
+        :dir-status="configDirStatus"
         @update="updateSettings"
         @reset="resetSettings"
+        @change-dir="changeConfigDir"
+        @reset-dir="resetConfigDir"
+        @open-dir="openConfigDir"
       />
     </main>
 
