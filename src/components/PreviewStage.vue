@@ -3,6 +3,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { Component } from 'vue'
 import {
   Check,
+  ChevronsRight,
+  ChevronsUp,
   Eraser,
   FilePlus2,
   ImagePlus,
@@ -18,7 +20,6 @@ import {
   UploadCloud,
   Wand2,
   X,
-  ZoomIn,
 } from 'lucide-vue-next'
 import FloatingToolbar from './FloatingToolbar.vue'
 import { useFileDrop } from '../composables/useFileDrop'
@@ -34,6 +35,7 @@ import {
   getImageFillZoom,
   getMaxPreviewZoom,
   getPreviewFit,
+  keepScaleAfterResize,
 } from '../core/preview'
 import { renderStitchView } from '../core/render'
 import { THUMBNAIL_SIZE_PX } from '../core/settings'
@@ -41,8 +43,8 @@ import type {
   ThumbnailFit,
   ThumbnailOrientation,
   ThumbnailSize,
-  ToolbarKey,
-  ToolbarState,
+  PanelKey,
+  PanelState,
 } from '../core/settings'
 import { vTooltip } from '../directives/tooltip'
 import type {
@@ -63,8 +65,10 @@ const props = defineProps<{
   thumbOrientation: ThumbnailOrientation
   thumbSize: ThumbnailSize
   thumbFit: ThumbnailFit
-  annotationToolbar: ToolbarState
-  zoomToolbar: ToolbarState
+  annotationToolbar: PanelState
+  zoomToolbar: PanelState
+  blankPanel: PanelState
+  thumbnailPanel: PanelState
 }>()
 
 const emit = defineEmits<{
@@ -72,7 +76,7 @@ const emit = defineEmits<{
   add: [files: File[]]
   'active-change': [id: string | null]
   'resize-blank': [id: string, width: number, height: number]
-  'update-toolbar': [key: ToolbarKey, state: ToolbarState]
+  'update-panel': [key: PanelKey, state: PanelState]
 }>()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
@@ -87,6 +91,8 @@ const textInputRef = ref<HTMLInputElement | null>(null)
 const annotationTool = ref<AnnotationTool>('select')
 const annotationColor = ref('#d92d20')
 const annotationWidth = ref(6)
+/** 正在按住粗细滑块：显示实际粗细的预览圆点。 */
+const isAdjustingWidth = ref(false)
 const isDrawing = ref(false)
 const textDraft = ref<{
   imageId: string
@@ -111,6 +117,17 @@ let resizeState: {
   startHeight: number
   scale: number
 } | null = null
+/** requestBlankResize 记下的「改尺寸之前」状态，下一帧绘制时消费。 */
+let pendingScaleKeep: {
+  scale: number
+  offset: { x: number; y: number }
+  size: { width: number; height: number }
+} | null = null
+/**
+ * 空白页改尺寸后它的中心会移动；在用户自己平移、缩放、适应或改选图片之前，
+ * 绘制时不按视口中心重选当前图片，否则拖到一半或输入宽度后空白页被取消选中、手柄和面板消失。
+ */
+let isHoldingActiveImage = false
 let renderFrame = 0
 let panState: {
   pointerId: number
@@ -144,6 +161,11 @@ const ANNOTATION_TOOLS: AnnotationToolOption[] = [
 ]
 
 const MIN_ZOOM = 0.5
+/** 笔触粗细（屏幕像素）：画笔在屏幕上的粗细就是这个值，按当前缩放换算成图片像素。 */
+const MIN_BRUSH_WIDTH = 2
+const MAX_BRUSH_WIDTH = 30
+/** 视口铺满整个点状画布；「适应窗口」时四周仍留出这圈边距。 */
+const FIT_PADDING = 24
 const PREVIEW_MAX_DPR = 2
 const MAX_HISTORY = 50
 const displaySize = ref({ width: 0, height: 0 })
@@ -152,11 +174,6 @@ const { isFileDragging, dropHandlers } = useFileDrop((files) => emit('add', file
 
 const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`)
 const maxZoomPercent = computed(() => `${Math.round(maxZoom.value * 100)}%`)
-const activeToolOption = computed(
-  () =>
-    ANNOTATION_TOOLS.find((tool) => tool.value === annotationTool.value) ??
-    ANNOTATION_TOOLS[0],
-)
 
 const resolvedThumbOrientation = computed<'horizontal' | 'vertical'>(() =>
   props.thumbOrientation === 'auto'
@@ -366,6 +383,34 @@ function redo(): void {
   }
 }
 
+function startWidthAdjust(): void {
+  isAdjustingWidth.value = true
+  const stop = () => {
+    isAdjustingWidth.value = false
+    window.removeEventListener('pointerup', stop)
+    window.removeEventListener('pointercancel', stop)
+  }
+  window.addEventListener('pointerup', stop)
+  window.addEventListener('pointercancel', stop)
+}
+
+/** 输入过程中只接受范围内的数，避免输入「1」准备打「15」时被立即改成 2。 */
+function onWidthInput(event: Event): void {
+  const value = Number((event.target as HTMLInputElement).value)
+  if (Number.isFinite(value) && value >= MIN_BRUSH_WIDTH && value <= MAX_BRUSH_WIDTH) {
+    annotationWidth.value = Math.round(value)
+  }
+}
+
+function commitWidthInput(event: Event): void {
+  const input = event.target as HTMLInputElement
+  const value = Number(input.value)
+  if (Number.isFinite(value) && input.value.trim() !== '') {
+    annotationWidth.value = Math.min(MAX_BRUSH_WIDTH, Math.max(MIN_BRUSH_WIDTH, Math.round(value)))
+  }
+  input.value = String(annotationWidth.value)
+}
+
 function setTool(tool: AnnotationTool): void {
   if (isDrawing.value) {
     finishDrawing()
@@ -538,6 +583,23 @@ function finishDrawing(): void {
   scheduleRender()
 }
 
+/**
+ * 改空白页尺寸的唯一入口：先记下改之前的屏幕比例与平移，
+ * 下一帧绘制时按 keepScaleAfterResize 调整，其他图片在屏幕上保持原大小、原位置。
+ * 同一帧内多次改尺寸只记第一次，保证按「改之前」计算。
+ */
+function requestBlankResize(id: string, width: number, height: number): void {
+  isHoldingActiveImage = true
+  if (!pendingScaleKeep && displaySize.value.width > 0) {
+    pendingScaleKeep = {
+      scale: imageToScreen.value,
+      offset: { ...offset.value },
+      size: { width: props.layout.width, height: props.layout.height },
+    }
+  }
+  emit('resize-blank', id, width, height)
+}
+
 function updateBlankSize(axis: 'width' | 'height', event: Event): void {
   const image = activeBlank.value
   if (!image) {
@@ -551,13 +613,13 @@ function updateBlankSize(axis: 'width' | 'height', event: Event): void {
   }
   const width = axis === 'width' ? value : image.width
   const height = axis === 'height' ? value : image.height
-  emit('resize-blank', image.id, width, height)
+  requestBlankResize(image.id, width, height)
 }
 
 function applyBlankPreset(width: number, height: number): void {
   const image = activeBlank.value
   if (image) {
-    emit('resize-blank', image.id, width, height)
+    requestBlankResize(image.id, width, height)
   }
 }
 
@@ -592,11 +654,14 @@ function moveBlankResize(event: PointerEvent): void {
     return
   }
   const scale = Math.max(0.001, resizeState.scale)
-  emit(
-    'resize-blank',
+  // 图片在交叉方向上居中，空白页会向两侧同时变宽（高）；按 2 倍换算，手柄才跟得上指针。
+  const crossFactor = 2
+  const widthFactor = props.layout.direction === 'vertical' ? crossFactor : 1
+  const heightFactor = props.layout.direction === 'horizontal' ? crossFactor : 1
+  requestBlankResize(
     image.id,
-    resizeState.startWidth + (event.clientX - resizeState.startX) / scale,
-    resizeState.startHeight + (event.clientY - resizeState.startY) / scale,
+    resizeState.startWidth + ((event.clientX - resizeState.startX) * widthFactor) / scale,
+    resizeState.startHeight + ((event.clientY - resizeState.startY) * heightFactor) / scale,
   )
 }
 
@@ -611,7 +676,12 @@ function endBlankResize(event: PointerEvent): void {
   resizeState = null
 }
 
+function collapsePanel(key: PanelKey): void {
+  emit('update-panel', key, { ...props[key], collapsed: true })
+}
+
 function resetView(): void {
+  isHoldingActiveImage = false
   zoom.value = 1
   offset.value = { x: 0, y: 0 }
   isPanning.value = false
@@ -650,6 +720,7 @@ function updateActiveImage(): void {
 }
 
 function focusImage(index: number): void {
+  isHoldingActiveImage = false
   const viewport = viewportRef.value
   const item = props.layout.items[index]
   if (!viewport || !item || displaySize.value.width <= 0) {
@@ -659,8 +730,8 @@ function focusImage(index: number): void {
   const fitScale = displaySize.value.width / props.layout.width
   const fillZoom = getImageFillZoom(
     item,
-    viewport.clientWidth,
-    viewport.clientHeight,
+    viewport.clientWidth - FIT_PADDING * 2,
+    viewport.clientHeight - FIT_PADDING * 2,
     fitScale,
   )
   const nextZoom = Math.min(maxZoom.value, Math.max(zoom.value, fillZoom))
@@ -747,6 +818,7 @@ function clampOffset(next: { x: number; y: number }) {
 }
 
 function applyZoom(nextZoom: number, anchorX?: number, anchorY?: number): void {
+  isHoldingActiveImage = false
   const next = Math.min(maxZoom.value, Math.max(MIN_ZOOM, nextZoom))
   if (Math.abs(next - zoom.value) < 0.001) {
     return
@@ -817,6 +889,7 @@ function onPointerDown(event: PointerEvent): void {
 
   event.preventDefault()
   target.setPointerCapture(event.pointerId)
+  isHoldingActiveImage = false
   panState = {
     pointerId: event.pointerId,
     startX: event.clientX,
@@ -861,7 +934,19 @@ function onPointerUp(event: PointerEvent): void {
   isPanning.value = false
 }
 
+function isEditableTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    (target.isContentEditable || target.matches('input, textarea, select'))
+  )
+}
+
 function onViewportKeydown(event: KeyboardEvent): void {
+  // 视口里的输入框（文字标注、空白页宽高、笔触粗细、滑块）按键交给输入框自己：
+  // 否则 0、+、- 会被当成缩放快捷键吃掉，输入 1200 只剩 12。
+  if (isEditableTarget(event.target)) {
+    return
+  }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
     event.preventDefault()
     if (event.shiftKey) {
@@ -895,6 +980,7 @@ function onViewportKeydown(event: KeyboardEvent): void {
   }
 
   const step = 36
+  isHoldingActiveImage = false
   const next = { ...offset.value }
   if (event.key === 'ArrowLeft') next.x -= step
   else if (event.key === 'ArrowRight') next.x += step
@@ -924,13 +1010,35 @@ function renderPreview(): void {
 
   const viewportWidth = Math.max(1, viewport.clientWidth)
   const viewportHeight = Math.max(1, viewport.clientHeight)
-  const fit = getPreviewFit(props.layout, viewportWidth, viewportHeight)
+  const fit = getPreviewFit(props.layout, viewportWidth, viewportHeight, FIT_PADDING)
   if (fit.scale <= 0) {
     return
   }
 
   displaySize.value = { width: fit.width, height: fit.height }
-  maxZoom.value = getMaxPreviewZoom(props.layout, viewportWidth, viewportHeight)
+  maxZoom.value = getMaxPreviewZoom(
+    props.layout,
+    viewportWidth,
+    viewportHeight,
+    undefined,
+    FIT_PADDING,
+  )
+
+  if (pendingScaleKeep) {
+    const kept = keepScaleAfterResize({
+      previousScale: pendingScaleKeep.scale,
+      fitScale: fit.scale,
+      minZoom: MIN_ZOOM,
+      maxZoom: maxZoom.value,
+      offset: pendingScaleKeep.offset,
+      direction: props.layout.direction,
+      previousSize: pendingScaleKeep.size,
+      nextSize: { width: props.layout.width, height: props.layout.height },
+    })
+    pendingScaleKeep = null
+    zoom.value = kept.zoom
+    offset.value = clampOffset(kept.offset)
+  }
 
   if (zoom.value > maxZoom.value) {
     zoom.value = maxZoom.value
@@ -950,7 +1058,9 @@ function renderPreview(): void {
     offset: offset.value,
     dpr: Math.min(window.devicePixelRatio || 1, PREVIEW_MAX_DPR),
   })
-  updateActiveImage()
+  if (!isHoldingActiveImage) {
+    updateActiveImage()
+  }
 }
 
 function scheduleRender(): void {
@@ -968,10 +1078,40 @@ watch(activeImageId, (id) => {
   void scrollActiveThumbnail(id)
 })
 watch(
-  [resolvedThumbOrientation, () => props.thumbSize],
+  [resolvedThumbOrientation, () => props.thumbSize, () => props.thumbnailPanel.collapsed],
   () => {
     scheduleRender()
     void scrollActiveThumbnail(activeImageId.value)
+  },
+  { flush: 'post' },
+)
+
+// 收起标注栏后看不到当前工具，回到「选择」，避免点一下画布就画上一笔。
+watch(
+  () => props.annotationToolbar.collapsed,
+  (collapsed) => {
+    if (!collapsed) {
+      return
+    }
+    if (isDrawing.value) {
+      finishDrawing()
+    }
+    textDraft.value = null
+    annotationTool.value = 'select'
+  },
+)
+
+// 视口尺寸除了窗口缩放，还会随缩略图收起/展开、方向切换而变化，统一用 ResizeObserver 重绘。
+const viewportObserver = new ResizeObserver(() => handleResize())
+watch(
+  viewportRef,
+  (element, previous) => {
+    if (previous) {
+      viewportObserver.unobserve(previous)
+    }
+    if (element) {
+      viewportObserver.observe(element)
+    }
   },
   { flush: 'post' },
 )
@@ -1003,12 +1143,14 @@ watch(
 )
 
 onMounted(() => {
+  if (viewportRef.value) {
+    viewportObserver.observe(viewportRef.value)
+  }
   scheduleRender()
-  window.addEventListener('resize', handleResize)
 })
 onBeforeUnmount(() => {
   window.cancelAnimationFrame(renderFrame)
-  window.removeEventListener('resize', handleResize)
+  viewportObserver.disconnect()
 })
 
 defineExpose({ focusImage })
@@ -1016,12 +1158,26 @@ defineExpose({ focusImage })
 
 <template>
   <div
-    class="preview-stage"
-    :class="{ 'is-file-dragging': isFileDragging }"
+    class="preview-area"
+    :class="`preview-area--${resolvedThumbOrientation}`"
     :style="thumbStyle"
     v-on="dropHandlers"
   >
-    <div v-if="images.length > 0" class="preview-workbench">
+    <aside
+      v-if="images.length > 0 && !thumbnailPanel.collapsed"
+      class="thumb-panel"
+      aria-label="图片缩略图"
+    >
+      <button
+        v-tooltip="'收起缩略图（可在预览标题栏重新显示）'"
+        class="thumb-panel__collapse"
+        type="button"
+        aria-label="收起缩略图（可在预览标题栏重新显示）"
+        @click="collapsePanel('thumbnailPanel')"
+      >
+        <ChevronsUp v-if="resolvedThumbOrientation === 'horizontal'" :size="14" :stroke-width="1.9" />
+        <ChevronsRight v-else :size="14" :stroke-width="1.9" />
+      </button>
       <nav
         ref="thumbnailRailRef"
         class="preview-thumbnails"
@@ -1047,12 +1203,14 @@ defineExpose({ focusImage })
           <span class="preview-thumbnail__index tnum">{{ index + 1 }}</span>
         </button>
       </nav>
+    </aside>
 
+    <div class="preview-stage" :class="{ 'is-file-dragging': isFileDragging }">
       <div
+        v-if="images.length > 0"
         ref="viewportRef"
         class="stage-viewport"
         :class="{
-          'stage-viewport--thumb-vertical': resolvedThumbOrientation === 'vertical',
           'is-panning': isPanning,
           'is-zoomed': zoom > 1,
           'is-annotating': annotationTool !== 'select',
@@ -1096,10 +1254,11 @@ defineExpose({ focusImage })
         </div>
 
         <FloatingToolbar
+          v-if="!annotationToolbar.collapsed"
           class="annotation-toolbar"
           label="标注工具栏"
           :state="annotationToolbar"
-          @update:state="emit('update-toolbar', 'annotationToolbar', $event)"
+          @update:state="emit('update-panel', 'annotationToolbar', $event)"
         >
           <button
             v-for="tool in ANNOTATION_TOOLS"
@@ -1118,16 +1277,45 @@ defineExpose({ focusImage })
           <label v-tooltip="'标注颜色'" class="annotation-color">
             <input v-model="annotationColor" type="color" aria-label="标注颜色" />
           </label>
-          <label v-tooltip="`笔触粗细 ${annotationWidth}`" class="annotation-size">
+          <label v-tooltip="'笔触粗细'" class="annotation-size">
             <input
               v-model.number="annotationWidth"
               type="range"
-              min="2"
-              max="30"
+              :min="MIN_BRUSH_WIDTH"
+              :max="MAX_BRUSH_WIDTH"
               step="1"
               aria-label="笔触粗细"
+              @pointerdown="startWidthAdjust"
             />
+            <span
+              v-if="isAdjustingWidth"
+              class="annotation-size-preview"
+              :class="{ 'is-above': annotationToolbar.position?.y === 'bottom' }"
+              aria-hidden="true"
+            >
+              <span
+                class="annotation-size-dot"
+                :style="{
+                  width: `${annotationWidth}px`,
+                  height: `${annotationWidth}px`,
+                  background: annotationColor,
+                }"
+              />
+              <span class="tnum">{{ annotationWidth }} px</span>
+            </span>
           </label>
+          <input
+            v-tooltip="`笔触粗细，可输入 ${MIN_BRUSH_WIDTH}–${MAX_BRUSH_WIDTH}`"
+            class="annotation-size-input tnum"
+            type="number"
+            :min="MIN_BRUSH_WIDTH"
+            :max="MAX_BRUSH_WIDTH"
+            step="1"
+            :value="annotationWidth"
+            aria-label="笔触粗细（像素）"
+            @input="onWidthInput"
+            @change="commitWidthInput"
+          />
           <span class="annotation-separator" aria-hidden="true" />
           <button
             v-tooltip="'撤销标注（Ctrl+Z）'"
@@ -1149,23 +1337,28 @@ defineExpose({ focusImage })
           >
             <Redo2 :size="14" :stroke-width="1.9" />
           </button>
-
-          <template #collapsed>
-            <component :is="activeToolOption.icon" :size="14" :stroke-width="1.9" />
-            <span>标注</span>
-          </template>
         </FloatingToolbar>
 
         <div
-          v-if="activeBlank"
+          v-if="activeBlank && !blankPanel.collapsed"
           class="blank-size-panel"
           @pointerdown.stop
           @click.stop
+          @dblclick.stop
           @wheel.stop
         >
           <div class="blank-size-head">
             <strong>空白页</strong>
             <span class="tnum">{{ blankSizeSummary }}</span>
+            <button
+              v-tooltip="'收起空白页面板（可在预览标题栏重新显示）'"
+              class="blank-size-collapse"
+              type="button"
+              aria-label="收起空白页面板（可在预览标题栏重新显示）"
+              @click="collapsePanel('blankPanel')"
+            >
+              <ChevronsRight :size="14" :stroke-width="1.9" />
+            </button>
           </div>
           <div class="blank-size-fields">
             <label>
@@ -1224,127 +1417,135 @@ defineExpose({ focusImage })
           </button>
         </div>
       </div>
-    </div>
 
-    <div v-else-if="isImporting" class="stage-loading" role="status">
-      <span class="loading-mark">
-        <Loader2 class="spin" :size="24" :stroke-width="1.8" />
-      </span>
-      <p>正在读取图片</p>
-      <span class="loading-count tnum">{{ progress.done }} / {{ progress.total }}</span>
-    </div>
+      <div v-else-if="isImporting" class="stage-loading" role="status">
+        <span class="loading-mark">
+          <Loader2 class="spin" :size="24" :stroke-width="1.8" />
+        </span>
+        <p>正在读取图片</p>
+        <span class="loading-count tnum">{{ progress.done }} / {{ progress.total }}</span>
+      </div>
 
-    <div v-else class="stage-empty">
-      <div class="empty-art" aria-hidden="true">
-        <span class="empty-sheet empty-sheet--back" />
-        <span class="empty-sheet empty-sheet--mid" />
-        <span class="empty-sheet empty-sheet--front">
-          <ImagePlus :size="27" :stroke-width="1.6" />
+      <div v-else class="stage-empty">
+        <div class="empty-art" aria-hidden="true">
+          <span class="empty-sheet empty-sheet--back" />
+          <span class="empty-sheet empty-sheet--mid" />
+          <span class="empty-sheet empty-sheet--front">
+            <ImagePlus :size="27" :stroke-width="1.6" />
+          </span>
+        </div>
+
+        <h2>添加图片，开始拼接</h2>
+        <p>把多张图片放进队列，纵向或横向拼成一张。可以拖动调整顺序，间距也能随时修改。</p>
+
+        <button class="button button-primary empty-action" type="button" @click="emit('pick')">
+          <ImagePlus :size="16" :stroke-width="1.9" />
+          <span>选择图片</span>
+        </button>
+
+        <span class="empty-drop-hint">
+          <UploadCloud :size="13" :stroke-width="1.8" />
+          也可以把图片拖到这里
         </span>
       </div>
 
-      <h2>添加图片，开始拼接</h2>
-      <p>把多张图片放进队列，纵向或横向拼成一张。可以拖动调整顺序，间距也能随时修改。</p>
-
-      <button class="button button-primary empty-action" type="button" @click="emit('pick')">
-        <ImagePlus :size="16" :stroke-width="1.9" />
-        <span>选择图片</span>
-      </button>
-
-      <span class="empty-drop-hint">
-        <UploadCloud :size="13" :stroke-width="1.8" />
-        也可以把图片拖到这里
-      </span>
-    </div>
-
-    <FloatingToolbar
-      v-if="images.length > 0"
-      class="zoom-toolbar"
-      label="缩放栏"
-      :state="zoomToolbar"
-      @update:state="emit('update-toolbar', 'zoomToolbar', $event)"
-    >
-      <button
-        v-tooltip="'缩小预览'"
-        class="zoom-button"
-        type="button"
-        :disabled="zoom <= MIN_ZOOM + 0.001"
-        aria-label="缩小预览"
-        @click="zoomBy(0.8)"
+      <FloatingToolbar
+        v-if="images.length > 0 && !zoomToolbar.collapsed"
+        class="zoom-toolbar"
+        label="缩放栏"
+        :state="zoomToolbar"
+        @update:state="emit('update-panel', 'zoomToolbar', $event)"
       >
-        <Minus :size="14" :stroke-width="2" />
-      </button>
-      <button
-        v-tooltip="'恢复到适应窗口'"
-        class="zoom-value tnum"
-        type="button"
-        :aria-label="`当前缩放 ${zoomPercent}，点击恢复适应窗口`"
-        @click="resetView"
-      >
-        {{ zoomPercent }}
-      </button>
-      <button
-        v-tooltip="`放大预览（最大 ${maxZoomPercent}）`"
-        class="zoom-button"
-        type="button"
-        :disabled="zoom >= maxZoom - 0.001"
-        :aria-label="`放大预览，最大 ${maxZoomPercent}`"
-        @click="zoomBy(1.25)"
-      >
-        <Plus :size="14" :stroke-width="2" />
-      </button>
-      <span class="zoom-separator" aria-hidden="true" />
-      <button
-        v-tooltip="'恢复适应窗口'"
-        class="zoom-fit"
-        type="button"
-        @click="resetView"
-      >
-        <Maximize2 :size="13" :stroke-width="1.9" />
-        <span>适应</span>
-      </button>
-      <span class="zoom-hint" aria-hidden="true">滚轮缩放 · 拖动查看</span>
+        <button
+          v-tooltip="'缩小预览'"
+          class="zoom-button"
+          type="button"
+          :disabled="zoom <= MIN_ZOOM + 0.001"
+          aria-label="缩小预览"
+          @click="zoomBy(0.8)"
+        >
+          <Minus :size="14" :stroke-width="2" />
+        </button>
+        <button
+          v-tooltip="'恢复到适应窗口'"
+          class="zoom-value tnum"
+          type="button"
+          :aria-label="`当前缩放 ${zoomPercent}，点击恢复适应窗口`"
+          @click="resetView"
+        >
+          {{ zoomPercent }}
+        </button>
+        <button
+          v-tooltip="`放大预览（最大 ${maxZoomPercent}）`"
+          class="zoom-button"
+          type="button"
+          :disabled="zoom >= maxZoom - 0.001"
+          :aria-label="`放大预览，最大 ${maxZoomPercent}`"
+          @click="zoomBy(1.25)"
+        >
+          <Plus :size="14" :stroke-width="2" />
+        </button>
+        <span class="zoom-separator" aria-hidden="true" />
+        <button
+          v-tooltip="'恢复适应窗口'"
+          class="zoom-fit"
+          type="button"
+          @click="resetView"
+        >
+          <Maximize2 :size="13" :stroke-width="1.9" />
+          <span>适应</span>
+        </button>
+        <span class="zoom-hint" aria-hidden="true">滚轮缩放 · 拖动查看</span>
+      </FloatingToolbar>
 
-      <template #collapsed>
-        <ZoomIn :size="13" :stroke-width="1.9" />
-        <span class="tnum">{{ zoomPercent }}</span>
-      </template>
-    </FloatingToolbar>
+      <div v-if="isImporting && images.length > 0" class="stage-busy" role="status">
+        <Loader2 class="spin" :size="13" :stroke-width="2" />
+        <span class="tnum">正在添加 {{ progress.done }}/{{ progress.total }}</span>
+      </div>
 
-    <div
-      v-if="isImporting && images.length > 0"
-      class="stage-busy"
-      :class="{ 'stage-busy--beside-rail': resolvedThumbOrientation === 'vertical' }"
-      role="status"
-    >
-      <Loader2 class="spin" :size="13" :stroke-width="2" />
-      <span class="tnum">正在添加 {{ progress.done }}/{{ progress.total }}</span>
-    </div>
-
-    <div v-if="isFileDragging" class="stage-drop-overlay" aria-hidden="true">
-      <span class="stage-drop-icon">
-        <UploadCloud :size="24" :stroke-width="1.7" />
-      </span>
-      <strong>松开以添加图片</strong>
-      <span>支持一次拖入多张</span>
+      <div v-if="isFileDragging" class="stage-drop-overlay" aria-hidden="true">
+        <span class="stage-drop-icon">
+          <UploadCloud :size="24" :stroke-width="1.7" />
+        </span>
+        <strong>松开以添加图片</strong>
+        <span>支持一次拖入多张</span>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-.preview-stage {
+/* 预览区：缩略图面板在点状画布之外，横向排列时在上方，纵向排列时在右侧。 */
+.preview-area {
   --thumb-w: 92px;
   --thumb-h: 56px;
   --thumb-fit: contain;
 
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  gap: 8px;
+  margin: 12px;
+}
+
+.preview-area--horizontal {
+  flex-direction: column;
+}
+
+.preview-area--vertical {
+  flex-direction: row;
+}
+
+.preview-stage {
   position: relative;
   display: flex;
+  min-width: 0;
   min-height: 0;
   flex: 1;
   align-items: center;
   justify-content: center;
   overflow: hidden;
-  margin: 12px;
   padding: 24px;
   border: 1px solid var(--border-subtle);
   border-radius: 13px;
@@ -1353,30 +1554,60 @@ defineExpose({ focusImage })
   background-size: 16px 16px;
 }
 
-.preview-workbench {
-  position: absolute;
-  inset: 0;
-}
-
+/* 视口铺满整个点状画布，内容放大、平移、空白页变宽时都能画到画布边缘。 */
 .stage-viewport {
   position: absolute;
-  inset: calc(var(--thumb-h) + 36px) 24px 24px;
+  inset: 0;
   display: flex;
   align-items: center;
   justify-content: center;
   overflow: hidden;
-  border-radius: 8px;
+  border-radius: 12px;
   cursor: zoom-in;
   touch-action: none;
 }
 
-.stage-viewport--thumb-vertical {
-  inset: 24px calc(var(--thumb-w) + 42px) 24px 24px;
+.thumb-panel {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+}
+
+.preview-area--horizontal .thumb-panel {
+  flex-direction: row;
+}
+
+.preview-area--vertical .thumb-panel {
+  order: 2;
+  flex-direction: column;
+}
+
+.thumb-panel__collapse {
+  display: inline-flex;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text-muted);
+  transition:
+    background-color 0.15s var(--ease),
+    color 0.15s var(--ease);
+}
+
+.thumb-panel__collapse:hover {
+  background: var(--surface-hover);
+  color: var(--text-strong);
 }
 
 .preview-thumbnails {
-  position: absolute;
-  z-index: 2;
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: flex-start;
@@ -1406,10 +1637,9 @@ defineExpose({ focusImage })
 }
 
 .preview-thumbnails--horizontal {
-  top: 14px;
-  right: 24px;
-  left: 24px;
-  height: calc(var(--thumb-h) + 14px);
+  min-width: 0;
+  height: calc(var(--thumb-h) + 12px);
+  flex: 1;
   flex-direction: row;
   overflow-x: auto;
   overflow-y: hidden;
@@ -1418,10 +1648,9 @@ defineExpose({ focusImage })
 }
 
 .preview-thumbnails--vertical {
-  top: 24px;
-  right: 24px;
-  bottom: 24px;
-  width: calc(var(--thumb-w) + 14px);
+  min-height: 0;
+  width: calc(var(--thumb-w) + 12px);
+  flex: 1;
   flex-direction: column;
   overflow-x: hidden;
   overflow-y: auto;
@@ -1603,6 +1832,7 @@ defineExpose({ focusImage })
 }
 
 .annotation-size {
+  position: relative;
   display: inline-flex;
   width: 66px;
   height: 27px;
@@ -1615,6 +1845,65 @@ defineExpose({ focusImage })
   width: 100%;
   accent-color: var(--accent);
   cursor: pointer;
+}
+
+/* 按住滑块时的粗细预览：圆点直径就是画笔在屏幕上的实际粗细。 */
+.annotation-size-preview {
+  position: absolute;
+  z-index: 2;
+  top: calc(100% + 8px);
+  left: 50%;
+  display: inline-flex;
+  min-height: 42px;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-strong);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  box-shadow: var(--shadow-float);
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.annotation-size-preview.is-above {
+  top: auto;
+  bottom: calc(100% + 8px);
+}
+
+.annotation-size-dot {
+  flex: 0 0 auto;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(19, 32, 28, 0.14);
+}
+
+.annotation-size-input {
+  width: 32px;
+  height: 22px;
+  margin: 0 2px 0 0;
+  padding: 0 3px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text-strong);
+  font-size: 10.5px;
+  text-align: center;
+  appearance: textfield;
+}
+
+.annotation-size-input::-webkit-inner-spin-button,
+.annotation-size-input::-webkit-outer-spin-button {
+  margin: 0;
+  appearance: none;
+}
+
+.annotation-size-input:focus {
+  border-color: var(--accent);
+  outline: none;
 }
 
 .blank-selection {
@@ -1678,8 +1967,7 @@ defineExpose({ focusImage })
 
 .blank-size-head {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
+  align-items: center;
   gap: 8px;
 }
 
@@ -1690,8 +1978,27 @@ defineExpose({ focusImage })
 }
 
 .blank-size-head span {
+  flex: 1;
   color: var(--text-faint);
   font-size: 9.5px;
+  text-align: right;
+}
+
+.blank-size-collapse {
+  display: inline-flex;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  margin-right: -4px;
+  border-radius: 5px;
+  color: var(--text-muted);
+}
+
+.blank-size-collapse:hover {
+  background: var(--surface-hover);
+  color: var(--text-strong);
 }
 
 .blank-size-fields {
@@ -2004,10 +2311,6 @@ defineExpose({ focusImage })
   backdrop-filter: blur(4px);
 }
 
-.stage-busy--beside-rail {
-  right: calc(var(--thumb-w) + 42px);
-}
-
 .stage-drop-overlay {
   position: absolute;
   z-index: 4;
@@ -2048,35 +2351,16 @@ defineExpose({ focusImage })
 }
 
 @media (max-width: 700px) {
-  .preview-stage {
+  .preview-area {
     margin: 10px;
+  }
+
+  .preview-stage {
     padding: 16px;
-  }
-
-  .stage-viewport {
-    inset: calc(var(--thumb-h) + 28px) 16px 16px;
-  }
-
-  .stage-viewport--thumb-vertical {
-    inset: 16px calc(var(--thumb-w) + 34px) 16px 16px;
   }
 
   .preview-thumbnails {
     gap: 4px;
-  }
-
-  .preview-thumbnails--horizontal {
-    top: 10px;
-    right: 16px;
-    left: 16px;
-    height: calc(var(--thumb-h) + 14px);
-  }
-
-  .preview-thumbnails--vertical {
-    top: 16px;
-    right: 16px;
-    bottom: 16px;
-    width: calc(var(--thumb-w) + 14px);
   }
 
   .annotation-toolbar {
@@ -2121,10 +2405,6 @@ defineExpose({ focusImage })
   .stage-busy {
     right: 16px;
     bottom: 46px;
-  }
-
-  .stage-busy--beside-rail {
-    right: calc(var(--thumb-w) + 38px);
   }
 
   .zoom-hint {

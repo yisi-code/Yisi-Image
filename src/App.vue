@@ -1,14 +1,19 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
+import type { Component } from 'vue'
 import {
   AlertTriangle,
   ArrowLeft,
   Download,
+  FilePlus2,
+  Images,
   Info,
   Layers3,
   Loader2,
+  PenLine,
   Settings,
   ShieldCheck,
+  ZoomIn,
 } from 'lucide-vue-next'
 import AboutPage from './components/AboutPage.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
@@ -41,7 +46,9 @@ import {
 } from './core/save'
 import type { SaveFileHandle } from './core/save'
 import { THUMBNAIL_SIZE_PX } from './core/settings'
+import type { PanelKey, PanelState } from './core/settings'
 import type { StitchDirection } from './core/types'
+import { vTooltip } from './directives/tooltip'
 
 const props = defineProps<{
   /** main.ts 在挂载前读好的设置，避免先按默认值渲染再跳变 */
@@ -56,7 +63,7 @@ const {
   isMovingDir: isMovingConfigDir,
   dirStatus: configDirStatus,
   update: updateSettings,
-  updateToolbar,
+  updatePanel,
   reset: resetSettings,
   changeDir: changeConfigDir,
   resetDir: resetConfigDir,
@@ -88,8 +95,9 @@ const resolvedThumbOrientation = computed(() =>
     ? direction.value
     : settings.value.thumbnailOrientation,
 )
+// 纵向排列且缩略图展开时，右下角提示要给右侧缩略图面板让位。
 const toastRightOffset = computed(() =>
-  resolvedThumbOrientation.value === 'vertical'
+  resolvedThumbOrientation.value === 'vertical' && !settings.value.thumbnailPanel.collapsed
     ? THUMBNAIL_SIZE_PX[settings.value.thumbnailSize].width + 80
     : 22,
 )
@@ -131,6 +139,54 @@ watch(
 const activeIndex = computed(() =>
   images.value.findIndex((image) => image.id === activeImageId.value),
 )
+
+interface PanelToggle {
+  key: PanelKey
+  /** 完整名称，用于提示与无障碍名称 */
+  name: string
+  /** 标题栏上显示的短名 */
+  label: string
+  icon: Component
+}
+
+/** 预览标题栏的「显示」开关：面板收起后从画布隐去，只能从这里恢复。空白页开关只在队列里有空白页时出现。 */
+const panelToggles = computed<PanelToggle[]>(() => [
+  { key: 'annotationToolbar', name: '标注工具栏', label: '标注', icon: PenLine },
+  { key: 'zoomToolbar', name: '缩放栏', label: '缩放', icon: ZoomIn },
+  ...(images.value.some((image) => image.kind === 'blank')
+    ? [{ key: 'blankPanel' as const, name: '空白页面板', label: '空白页', icon: FilePlus2 }]
+    : []),
+  { key: 'thumbnailPanel', name: '缩略图', label: '缩略图', icon: Images },
+])
+const panelToggleRefs = new Map<PanelKey, HTMLButtonElement>()
+
+function setPanelToggleRef(key: PanelKey, element: unknown): void {
+  if (element instanceof HTMLButtonElement) {
+    panelToggleRefs.set(key, element)
+  } else {
+    panelToggleRefs.delete(key)
+  }
+}
+
+function isPanelVisible(key: PanelKey): boolean {
+  return !settings.value[key].collapsed
+}
+
+function togglePanel(key: PanelKey): void {
+  updatePanel(key, { ...settings.value[key], collapsed: !settings.value[key].collapsed })
+}
+
+/** 画布里的收起按钮会随面板一起卸载；焦点丢失时交给标题栏对应的开关，键盘用户还能接着操作。 */
+async function onPanelUpdate(key: PanelKey, state: PanelState): Promise<void> {
+  updatePanel(key, state)
+  if (!state.collapsed) {
+    return
+  }
+  await nextTick()
+  if (!document.activeElement || document.activeElement === document.body) {
+    panelToggleRefs.get(key)?.focus()
+  }
+}
 
 const layout = computed(() =>
   calculateStitchLayout(images.value, direction.value, gap.value),
@@ -537,6 +593,29 @@ async function handleExport(): Promise<void> {
               {{ images.length }} 张 · {{ formatDimensions(layout.width, layout.height) }} px
             </span>
           </div>
+          <div
+            v-if="images.length > 0"
+            class="panel-toggles"
+            role="group"
+            aria-label="显示或隐藏预览面板"
+          >
+            <span class="panel-toggles__label" aria-hidden="true">显示</span>
+            <button
+              v-for="panel in panelToggles"
+              :key="panel.key"
+              :ref="(element) => setPanelToggleRef(panel.key, element)"
+              v-tooltip="`${isPanelVisible(panel.key) ? '隐藏' : '显示'}${panel.name}`"
+              class="panel-toggle"
+              :class="{ 'is-on': isPanelVisible(panel.key) }"
+              type="button"
+              :aria-label="panel.name"
+              :aria-pressed="isPanelVisible(panel.key)"
+              @click="togglePanel(panel.key)"
+            >
+              <component :is="panel.icon" :size="13" :stroke-width="1.9" />
+              <span class="panel-toggle__label">{{ panel.label }}</span>
+            </button>
+          </div>
           <span
             class="status-chip"
             :class="`status-chip--${statusTone}`"
@@ -565,11 +644,13 @@ async function handleExport(): Promise<void> {
           :thumb-fit="settings.thumbnailFit"
           :annotation-toolbar="settings.annotationToolbar"
           :zoom-toolbar="settings.zoomToolbar"
+          :blank-panel="settings.blankPanel"
+          :thumbnail-panel="settings.thumbnailPanel"
           @pick="openFilePicker"
           @add="handleAdd"
           @active-change="activeImageId = $event"
           @resize-blank="resizeBlankPage"
-          @update-toolbar="updateToolbar"
+          @update-panel="onPanelUpdate"
         />
 
         <StitchControls
@@ -821,6 +902,54 @@ async function handleExport(): Promise<void> {
   white-space: nowrap;
 }
 
+/* 外观与底部「拼接方向」分段控件一致，开关之间相互独立（多选）。 */
+.panel-toggles {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  padding: 2px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 9px;
+  background: var(--surface-inset);
+}
+
+.panel-toggles__label {
+  padding: 0 5px 0 6px;
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.panel-toggle {
+  display: inline-flex;
+  height: 26px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 9px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-weight: 600;
+  transition:
+    background-color 0.15s var(--ease),
+    color 0.15s var(--ease),
+    box-shadow 0.15s var(--ease);
+}
+
+.panel-toggle:hover:not(.is-on) {
+  color: var(--text);
+}
+
+.panel-toggle.is-on {
+  border-color: var(--border);
+  background: var(--surface);
+  color: var(--text-strong);
+  box-shadow: var(--shadow-xs);
+}
+
 .status-chip {
   display: inline-flex;
   min-width: 0;
@@ -979,6 +1108,17 @@ async function handleExport(): Promise<void> {
 
   .status-chip {
     max-width: 58%;
+  }
+
+  .panel-toggles__label,
+  .panel-toggle__label {
+    display: none;
+  }
+
+  .panel-toggle {
+    width: 28px;
+    justify-content: center;
+    padding: 0;
   }
 }
 </style>

@@ -239,7 +239,7 @@ defineExpose({ focusTitle })
       <header class="settings-card__head">
         <div>
           <h3 id="config-settings-title">配置文件</h3>
-          <p>缩略图设置、拼接间距和预览工具栏的位置与收起状态都保存在这里。</p>
+          <p>缩略图设置、拼接间距，以及预览面板（标注栏、缩放栏、空白页面板、缩略图）的位置与显示状态都保存在这里。</p>
         </div>
         <span class="settings-summary">{{ configSummary }}</span>
       </header>
@@ -314,10 +314,10 @@ defineExpose({ focusTitle })
 
     <footer class="settings-footer">
       <p v-if="isFileStorage">
-        设置自动保存到配置文件。恢复默认会同时重置拼接间距和工具栏位置，不改变配置目录。
+        设置自动保存到配置文件。恢复默认会同时重置拼接间距和预览面板的位置与显示状态，不改变配置目录。
       </p>
       <p v-else>
-        设置自动保存在本机浏览器，换浏览器或清除站点数据后会恢复默认。恢复默认会同时重置拼接间距和工具栏位置。
+        设置自动保存在本机浏览器，换浏览器或清除站点数据后会恢复默认。恢复默认会同时重置拼接间距和预览面板的位置与显示状态。
       </p>
       <button class="button button-secondary" type="button" @click="emit('reset')">
         <RotateCcw :size="14" :stroke-width="1.9" />

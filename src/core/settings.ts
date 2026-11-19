@@ -6,8 +6,12 @@ export type ThumbnailOrientation = 'auto' | 'horizontal' | 'vertical'
 export type ThumbnailSize = 'small' | 'medium' | 'large'
 export type ThumbnailFit = 'contain' | 'cover' | 'fill'
 
-/** 预览区浮动工具栏的显示状态；position 为 null 表示从未拖动，使用默认位置。 */
-export interface ToolbarState {
+/**
+ * 预览区面板（标注栏、缩放栏、空白页尺寸面板、缩略图）的显示状态。
+ * collapsed 为 true 时面板从画布隐去，只能从预览标题栏的「显示」开关恢复；
+ * position 只有可拖动的工具栏使用，null 表示从未拖动、使用默认位置。
+ */
+export interface PanelState {
   collapsed: boolean
   position: FloatingPosition | null
 }
@@ -18,11 +22,13 @@ export interface ToolSettings {
   thumbnailFit: ThumbnailFit
   /** 拼接间距，与底部控制条同步。 */
   gap: number
-  annotationToolbar: ToolbarState
-  zoomToolbar: ToolbarState
+  annotationToolbar: PanelState
+  zoomToolbar: PanelState
+  blankPanel: PanelState
+  thumbnailPanel: PanelState
 }
 
-export type ToolbarKey = 'annotationToolbar' | 'zoomToolbar'
+export type PanelKey = 'annotationToolbar' | 'zoomToolbar' | 'blankPanel' | 'thumbnailPanel'
 
 export interface SettingsOption<T extends string> {
   value: T
@@ -84,7 +90,7 @@ export const THUMBNAIL_SIZE_PX: Record<
   large: { width: 112, height: 64 },
 }
 
-export const DEFAULT_TOOLBAR_STATE: Readonly<ToolbarState> = Object.freeze({
+export const DEFAULT_PANEL_STATE: Readonly<PanelState> = Object.freeze({
   collapsed: false,
   position: null,
 })
@@ -94,8 +100,10 @@ export const DEFAULT_SETTINGS: Readonly<ToolSettings> = Object.freeze({
   thumbnailSize: 'medium',
   thumbnailFit: 'contain',
   gap: DEFAULT_GAP,
-  annotationToolbar: DEFAULT_TOOLBAR_STATE,
-  zoomToolbar: DEFAULT_TOOLBAR_STATE,
+  annotationToolbar: DEFAULT_PANEL_STATE,
+  zoomToolbar: DEFAULT_PANEL_STATE,
+  blankPanel: DEFAULT_PANEL_STATE,
+  thumbnailPanel: DEFAULT_PANEL_STATE,
 })
 
 function isOrientation(value: unknown): value is ThumbnailOrientation {
@@ -114,8 +122,8 @@ function normalizeGap(value: unknown): number {
   return typeof value === 'number' ? clampGap(value) : DEFAULT_GAP
 }
 
-export function normalizeToolbarState(value: unknown): ToolbarState {
-  const parsed = (value ?? {}) as Partial<Record<keyof ToolbarState, unknown>>
+export function normalizePanelState(value: unknown): PanelState {
+  const parsed = (value ?? {}) as Partial<Record<keyof PanelState, unknown>>
   return {
     collapsed: parsed.collapsed === true,
     position: normalizeFloatingPosition(parsed.position),
@@ -136,8 +144,10 @@ export function normalizeSettings(value: unknown): ToolSettings {
       ? parsed.thumbnailFit
       : DEFAULT_SETTINGS.thumbnailFit,
     gap: normalizeGap(parsed.gap),
-    annotationToolbar: normalizeToolbarState(parsed.annotationToolbar),
-    zoomToolbar: normalizeToolbarState(parsed.zoomToolbar),
+    annotationToolbar: normalizePanelState(parsed.annotationToolbar),
+    zoomToolbar: normalizePanelState(parsed.zoomToolbar),
+    blankPanel: normalizePanelState(parsed.blankPanel),
+    thumbnailPanel: normalizePanelState(parsed.thumbnailPanel),
   }
 }
 

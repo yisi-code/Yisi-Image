@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ChevronsLeft, ChevronsRight, GripVertical } from 'lucide-vue-next'
 import {
   anchorFloatingPosition,
@@ -7,29 +7,28 @@ import {
   resolveFloatingPosition,
 } from '../core/floating'
 import type { FloatingBox } from '../core/floating'
-import type { ToolbarState } from '../core/settings'
+import type { PanelState } from '../core/settings'
 import { vTooltip } from '../directives/tooltip'
 
 /**
- * 预览区的浮动工具栏外壳：左侧拖动手柄、右侧收起按钮，收起后只留一个「显示」按钮。
+ * 预览区的浮动工具栏外壳：左侧拖动手柄、右侧收起按钮。
  * 默认位置由使用方的 class 决定（如左上、左下）；拖动后改为贴最近两条边的内联位置，
- * 在所在定位容器（offsetParent）内限制范围。工具栏内容通过默认插槽传入，收起按钮的内容用 collapsed 插槽。
+ * 在所在定位容器（offsetParent）内限制范围。工具栏内容通过默认插槽传入。
+ * 收起后整个工具栏从画布隐去（由使用方 v-if 卸载），从预览标题栏的「显示」开关恢复，不在画布里留按钮。
  */
 const props = defineProps<{
   /** 工具栏名称，如「标注工具栏」；用于 aria-label 和提示文字 */
   label: string
-  state: ToolbarState
+  state: PanelState
 }>()
 
 const emit = defineEmits<{
-  'update:state': [state: ToolbarState]
+  'update:state': [state: PanelState]
 }>()
 
 const DRAG_THRESHOLD_PX = 3
 
 const rootRef = ref<HTMLElement | null>(null)
-const expandRef = ref<HTMLButtonElement | null>(null)
-const collapseRef = ref<HTMLButtonElement | null>(null)
 const containerSize = ref({ width: 0, height: 0 })
 const barSize = ref({ width: 0, height: 0 })
 const dragBox = ref<FloatingBox | null>(null)
@@ -43,8 +42,7 @@ let dragState: {
 } | null = null
 let resizeObserver: ResizeObserver | null = null
 
-const collapseLabel = computed(() => `收起${props.label}`)
-const expandLabel = computed(() => `显示${props.label}`)
+const collapseLabel = computed(() => `收起${props.label}（可在预览标题栏重新显示）`)
 const isAnchoredRight = computed(() => props.state.position?.x === 'right')
 
 const positionStyle = computed<Record<string, string> | undefined>(() => {
@@ -172,11 +170,8 @@ function resetPosition(): void {
   }
 }
 
-async function setCollapsed(collapsed: boolean): Promise<void> {
-  emit('update:state', { ...props.state, collapsed })
-  await nextTick()
-  // 被点击的按钮已经卸载，把焦点交给替换它的按钮，键盘用户不会丢失位置。
-  ;(collapsed ? expandRef.value : collapseRef.value)?.focus()
+function collapse(): void {
+  emit('update:state', { ...props.state, collapsed: true })
 }
 
 onMounted(() => {
@@ -201,7 +196,7 @@ onBeforeUnmount(() => {
   <div
     ref="rootRef"
     class="floating-toolbar"
-    :class="{ 'is-collapsed': state.collapsed, 'is-dragging': dragBox !== null }"
+    :class="{ 'is-dragging': dragBox !== null }"
     :style="positionStyle"
     role="toolbar"
     :aria-label="label"
@@ -210,47 +205,30 @@ onBeforeUnmount(() => {
     @dblclick.stop
     @wheel.stop
   >
-    <button
-      v-if="state.collapsed"
-      ref="expandRef"
-      v-tooltip="expandLabel"
-      class="floating-toolbar__expand"
-      type="button"
-      :aria-label="expandLabel"
-      aria-expanded="false"
-      @click="setCollapsed(false)"
+    <span
+      v-tooltip="'拖动移动 · 双击复位'"
+      class="floating-toolbar__grip"
+      aria-hidden="true"
+      @pointerdown="startDrag"
+      @pointermove="moveDrag"
+      @pointerup="endDrag"
+      @pointercancel="endDrag"
+      @dblclick="resetPosition"
     >
-      <slot name="collapsed" />
+      <GripVertical :size="13" :stroke-width="1.9" />
+    </span>
+    <slot />
+    <span class="floating-toolbar__separator" aria-hidden="true" />
+    <button
+      v-tooltip="collapseLabel"
+      class="floating-toolbar__collapse"
+      type="button"
+      :aria-label="collapseLabel"
+      @click="collapse"
+    >
+      <ChevronsRight v-if="isAnchoredRight" :size="14" :stroke-width="1.9" />
+      <ChevronsLeft v-else :size="14" :stroke-width="1.9" />
     </button>
-
-    <template v-else>
-      <span
-        v-tooltip="'拖动移动 · 双击复位'"
-        class="floating-toolbar__grip"
-        aria-hidden="true"
-        @pointerdown="startDrag"
-        @pointermove="moveDrag"
-        @pointerup="endDrag"
-        @pointercancel="endDrag"
-        @dblclick="resetPosition"
-      >
-        <GripVertical :size="13" :stroke-width="1.9" />
-      </span>
-      <slot />
-      <span class="floating-toolbar__separator" aria-hidden="true" />
-      <button
-        ref="collapseRef"
-        v-tooltip="collapseLabel"
-        class="floating-toolbar__collapse"
-        type="button"
-        :aria-label="collapseLabel"
-        aria-expanded="true"
-        @click="setCollapsed(true)"
-      >
-        <ChevronsRight v-if="isAnchoredRight" :size="14" :stroke-width="1.9" />
-        <ChevronsLeft v-else :size="14" :stroke-width="1.9" />
-      </button>
-    </template>
   </div>
 </template>
 
@@ -267,10 +245,6 @@ onBeforeUnmount(() => {
   box-shadow: var(--shadow-xs);
   backdrop-filter: blur(8px);
   user-select: none;
-}
-
-.floating-toolbar.is-collapsed {
-  padding: 3px;
 }
 
 .floating-toolbar.is-dragging {
@@ -309,9 +283,9 @@ onBeforeUnmount(() => {
   background: var(--border);
 }
 
-.floating-toolbar__collapse,
-.floating-toolbar__expand {
+.floating-toolbar__collapse {
   display: inline-flex;
+  width: 26px;
   height: 26px;
   align-items: center;
   justify-content: center;
@@ -322,20 +296,7 @@ onBeforeUnmount(() => {
     color 0.15s var(--ease);
 }
 
-.floating-toolbar__collapse {
-  width: 26px;
-}
-
-.floating-toolbar__expand {
-  gap: 5px;
-  padding: 0 8px 0 7px;
-  font-size: 10.5px;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.floating-toolbar__collapse:hover,
-.floating-toolbar__expand:hover {
+.floating-toolbar__collapse:hover {
   background: var(--surface-hover);
   color: var(--text-strong);
 }

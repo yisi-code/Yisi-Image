@@ -14,7 +14,7 @@ import {
   readBrowserSettings,
   writeBrowserSettings,
 } from '../core/settings'
-import type { ToolSettings, ToolbarKey, ToolbarState } from '../core/settings'
+import type { PanelKey, PanelState, ToolSettings } from '../core/settings'
 
 /** file：EXE 启动器的配置文件；browser：浏览器 localStorage（开发模式或启动器接口不可用时）。 */
 export type SettingsStorage = 'file' | 'browser'
@@ -138,11 +138,11 @@ export function useSettings(initial: InitialSettings) {
     settings.value = { ...settings.value, ...patch }
   }
 
-  function updateToolbar(key: ToolbarKey, state: ToolbarState): void {
+  function updatePanel(key: PanelKey, state: PanelState): void {
     update({ [key]: state })
   }
 
-  /** 恢复全部默认值（缩略图、间距、工具栏位置）；配置目录不变。 */
+  /** 恢复全部默认值（缩略图、间距、面板位置与显示状态）；配置目录不变。 */
   function reset(): void {
     settings.value = normalizeSettings(null)
   }
@@ -227,7 +227,7 @@ export function useSettings(initial: InitialSettings) {
     isMovingDir,
     dirStatus,
     update,
-    updateToolbar,
+    updatePanel,
     reset,
     changeDir,
     resetDir,

@@ -19,6 +19,8 @@ const CUSTOM_SETTINGS: ToolSettings = {
     position: { x: 'right', y: 'top', dx: 20, dy: 12 },
   },
   zoomToolbar: { collapsed: false, position: null },
+  blankPanel: { collapsed: true, position: null },
+  thumbnailPanel: { collapsed: true, position: null },
 }
 
 describe('normalizeSettings', () => {
@@ -55,6 +57,8 @@ describe('normalizeSettings', () => {
         gap: '40',
         annotationToolbar: { collapsed: 'yes', position: { x: 'middle' } },
         zoomToolbar: 'hidden',
+        blankPanel: { collapsed: 1 },
+        thumbnailPanel: null,
       }),
     ).toEqual(DEFAULT_SETTINGS)
   })
