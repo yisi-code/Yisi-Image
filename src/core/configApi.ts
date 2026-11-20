@@ -35,9 +35,13 @@ export class ConfigApiError extends Error {
   }
 }
 
-interface ApiResponse {
+/** 启动器接口共有的响应字段；配置接口与 AI 模型接口（modelApi.ts）都用这一套请求函数。 */
+export interface LauncherResponse {
   ok?: boolean
   error?: string
+}
+
+interface ApiResponse extends LauncherResponse {
   settings?: unknown
   location?: ConfigLocation
   dir?: string
@@ -51,10 +55,10 @@ export interface MoveConfigResult {
   moved: boolean
 }
 
-async function request(
+export async function launcherRequest<T extends LauncherResponse>(
   path: string,
   init: RequestInit & { timeoutMs?: number } = {},
-): Promise<ApiResponse> {
+): Promise<T> {
   const { timeoutMs, ...rest } = init
   const controller = timeoutMs ? new AbortController() : null
   const timer = controller
@@ -70,21 +74,21 @@ async function request(
   } catch (error) {
     throw new ConfigApiError(
       error instanceof DOMException && error.name === 'AbortError'
-        ? '本地配置服务没有响应'
-        : '无法连接本地配置服务',
+        ? '本地服务没有响应'
+        : '无法连接本地服务',
     )
   } finally {
     window.clearTimeout(timer)
   }
 
-  let body: ApiResponse = {}
+  let body = {} as T
   try {
-    body = (await response.json()) as ApiResponse
+    body = (await response.json()) as T
   } catch {
     // 非 JSON 响应按状态码报错。
   }
   if (!response.ok || body.ok === false) {
-    throw new ConfigApiError(body.error || `本地配置服务返回 ${response.status}`)
+    throw new ConfigApiError(body.error || `本地服务返回 ${response.status}`)
   }
   return body
 }
@@ -97,12 +101,12 @@ function requireLocation(body: ApiResponse): ConfigLocation {
 }
 
 export async function fetchConfig(): Promise<ConfigSnapshot> {
-  const body = await request('/api/config', { timeoutMs: LOAD_TIMEOUT_MS })
+  const body = await launcherRequest<ApiResponse>('/api/config', { timeoutMs: LOAD_TIMEOUT_MS })
   return { settings: body.settings ?? null, location: requireLocation(body) }
 }
 
 export async function saveConfig(settings: unknown, keepalive = false): Promise<void> {
-  await request('/api/config', {
+  await launcherRequest<ApiResponse>('/api/config', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     // 启动器原样写入文件，缩进后用户打开配置文件也能看懂。
@@ -113,7 +117,7 @@ export async function saveConfig(settings: unknown, keepalive = false): Promise<
 
 /** 弹出系统「选择文件夹」窗口；用户取消时返回 null。 */
 export async function pickConfigDir(): Promise<string | null> {
-  const body = await request('/api/config/pick-dir', { method: 'POST' })
+  const body = await launcherRequest<ApiResponse>('/api/config/pick-dir', { method: 'POST' })
   if (body.canceled || !body.dir) {
     return null
   }
@@ -122,7 +126,7 @@ export async function pickConfigDir(): Promise<string | null> {
 
 /** 把配置文件移到 dir；dir 为 null 时移回 EXE 所在目录。 */
 export async function moveConfigDir(dir: string | null): Promise<MoveConfigResult> {
-  const body = await request('/api/config/location', {
+  const body = await launcherRequest<ApiResponse>('/api/config/location', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ dir }),
@@ -131,5 +135,5 @@ export async function moveConfigDir(dir: string | null): Promise<MoveConfigResul
 }
 
 export async function openConfigDir(): Promise<void> {
-  await request('/api/config/open-dir', { method: 'POST' })
+  await launcherRequest<ApiResponse>('/api/config/open-dir', { method: 'POST' })
 }

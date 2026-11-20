@@ -46,31 +46,37 @@ namespace Yisi.ImageTool
             }
         }
 
-        private static string PrimaryLocationFile
+        /// <summary>位置记录文件：主位置在 EXE 目录，EXE 目录不可写时用 %LOCALAPPDATA%\YisiImageTool。</summary>
+        private static string PrimaryLocationFile(string locationFileName)
         {
-            get { return Path.Combine(DefaultDirectory, LocationFileName); }
+            return Path.Combine(DefaultDirectory, locationFileName);
         }
 
-        private static string FallbackLocationFile
+        private static string FallbackLocationFile(string locationFileName)
         {
-            get
-            {
-                return Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "YisiImageTool",
-                    LocationFileName);
-            }
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "YisiImageTool",
+                locationFileName);
         }
 
         internal static string CurrentDirectory()
         {
+            return ReadCustomDirectory(LocationFileName) ?? DefaultDirectory;
+        }
+
+        /// <summary>
+        /// 读取某个位置记录文件里的自定义目录；没有记录时返回 null。配置目录与 AI 模型目录共用这套记录方式。
+        /// </summary>
+        internal static string ReadCustomDirectory(string locationFileName)
+        {
             // 备用位置文件只在 EXE 目录写不进去时才会生成，且主位置写成功时会删掉它，所以它存在就代表最新。
-            string custom = ReadLocationFile(FallbackLocationFile);
+            string custom = ReadLocationFile(FallbackLocationFile(locationFileName));
             if (custom == null)
             {
-                custom = ReadLocationFile(PrimaryLocationFile);
+                custom = ReadLocationFile(PrimaryLocationFile(locationFileName));
             }
-            return custom ?? DefaultDirectory;
+            return custom;
         }
 
         /// <summary>GET /api/config 的完整响应：设置原文（规范化后的 JSON 或 null）与位置信息。</summary>
@@ -172,7 +178,7 @@ namespace Yisi.ImageTool
 
                 try
                 {
-                    SaveLocation(SameDirectory(targetDir, defaultDir) ? null : targetDir);
+                    SaveCustomDirectory(LocationFileName, SameDirectory(targetDir, defaultDir) ? null : targetDir);
                 }
                 catch
                 {
@@ -272,7 +278,8 @@ namespace Yisi.ImageTool
             }
         }
 
-        private static string ValidateTarget(string target)
+        /// <summary>校验用户选的目录：必须是完整路径、不是文件、能创建；返回规范化后的路径。</summary>
+        internal static string ValidateTarget(string target)
         {
             string trimmed = target.Trim();
             bool isAbsolute =
@@ -309,19 +316,22 @@ namespace Yisi.ImageTool
             return full;
         }
 
-        private static void SaveLocation(string customDirectory)
+        /// <summary>写位置记录；customDirectory 为 null 表示恢复默认目录（删掉记录）。</summary>
+        internal static void SaveCustomDirectory(string locationFileName, string customDirectory)
         {
+            string primary = PrimaryLocationFile(locationFileName);
+            string fallbackFile = FallbackLocationFile(locationFileName);
             if (customDirectory == null)
             {
-                DeleteQuietly(PrimaryLocationFile);
-                DeleteQuietly(FallbackLocationFile);
+                DeleteQuietly(primary);
+                DeleteQuietly(fallbackFile);
                 return;
             }
 
             try
             {
-                File.WriteAllText(PrimaryLocationFile, customDirectory, new UTF8Encoding(false));
-                DeleteQuietly(FallbackLocationFile);
+                File.WriteAllText(primary, customDirectory, new UTF8Encoding(false));
+                DeleteQuietly(fallbackFile);
                 return;
             }
             catch (UnauthorizedAccessException)
@@ -335,13 +345,12 @@ namespace Yisi.ImageTool
 
             try
             {
-                string fallback = FallbackLocationFile;
-                Directory.CreateDirectory(Path.GetDirectoryName(fallback));
-                File.WriteAllText(fallback, customDirectory, new UTF8Encoding(false));
+                Directory.CreateDirectory(Path.GetDirectoryName(fallbackFile));
+                File.WriteAllText(fallbackFile, customDirectory, new UTF8Encoding(false));
             }
             catch (Exception ex)
             {
-                throw new ConfigException("无法记录新的配置目录：" + ex.Message, ex);
+                throw new ConfigException("无法记录新的目录位置：" + ex.Message, ex);
             }
         }
 
@@ -463,7 +472,7 @@ namespace Yisi.ImageTool
             }
         }
 
-        private static string NormalizeDirectory(string path)
+        internal static string NormalizeDirectory(string path)
         {
             string full = Path.GetFullPath(path);
             string root = Path.GetPathRoot(full);
@@ -474,7 +483,7 @@ namespace Yisi.ImageTool
             return full.TrimEnd('\\', '/');
         }
 
-        private static bool SameDirectory(string left, string right)
+        internal static bool SameDirectory(string left, string right)
         {
             return string.Equals(
                 NormalizeDirectory(left),

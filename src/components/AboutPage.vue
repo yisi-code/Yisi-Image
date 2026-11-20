@@ -93,7 +93,7 @@ const features = [
   {
     icon: PenLine,
     title: '预览标注',
-    detail: '文字、画笔、橡皮擦与局部修瑕；工具栏可拖动、收起',
+    detail: '文字可再改；笔触显示范围；修瑕可选经典或 AI',
   },
   {
     icon: FilePlus2,
@@ -189,7 +189,7 @@ defineExpose({ focusTitle })
         </div>
         <div class="about-fact">
           <dt>技术栈</dt>
-          <dd>Vue 3 · TypeScript · Vite</dd>
+          <dd>Vue 3 · TypeScript · Vite · onnxruntime-web</dd>
         </div>
         <div class="about-fact">
           <dt>绘制方式</dt>
@@ -321,6 +321,7 @@ defineExpose({ focusTitle })
         <ul class="about-list">
           <li>图片只在当前设备上用 Canvas 处理，不会上传到任何服务器。</li>
           <li>EXE 只监听本机 127.0.0.1:47831，不对外网开放。</li>
+          <li>只有在设置页点下载 AI 模型时才会联网下载模型文件，下完按 SHA-256 校验；AI 计算也在本机完成。</li>
           <li>队列和恢复快照只存在内存中，刷新或关闭页面即清空。</li>
           <li>电脑里的原图不会被修改或删除，导出会另存为新文件。</li>
         </ul>
@@ -339,7 +340,7 @@ defineExpose({ focusTitle })
             单边超过 16,384 px 或总面积超过 1 亿像素时禁止导出；超过 6,000 万像素会提示可能较慢。
           </li>
           <li>GIF 只使用第一帧；视频、独立裁剪和滤镜不在本工具范围。</li>
-          <li>局部修瑕是模糊附近画面，不是内容感知移除；标注提交后暂不支持再次选中或拖动。</li>
+          <li>局部修瑕按周围画面补全，被挡住的人脸、文字等独特内容无法凭空还原；AI 修瑕只在 EXE 版可用；画笔和修瑕笔画提交后不能单独移动。</li>
           <li>只保留最近一次清空的快照；刷新或关闭页面会释放，超大图片请留意内存。</li>
           <li>
             免安装 EXE 未签名，首次运行可能触发 SmartScreen；需要 Windows 自带的 .NET Framework 4.8。

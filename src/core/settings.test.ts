@@ -21,6 +21,7 @@ const CUSTOM_SETTINGS: ToolSettings = {
   zoomToolbar: { collapsed: false, position: null },
   blankPanel: { collapsed: true, position: null },
   thumbnailPanel: { collapsed: true, position: null },
+  healEngine: 'migan',
 }
 
 describe('normalizeSettings', () => {
@@ -59,6 +60,7 @@ describe('normalizeSettings', () => {
         zoomToolbar: 'hidden',
         blankPanel: { collapsed: 1 },
         thumbnailPanel: null,
+        healEngine: 'gpt',
       }),
     ).toEqual(DEFAULT_SETTINGS)
   })

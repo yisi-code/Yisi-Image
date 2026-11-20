@@ -23,6 +23,7 @@ import StitchControls from './components/StitchControls.vue'
 import StitchQueue from './components/StitchQueue.vue'
 import ToastStack from './components/ToastStack.vue'
 import { useImageQueue } from './composables/useImageQueue'
+import { useModels } from './composables/useModels'
 import { useSettings } from './composables/useSettings'
 import type { InitialSettings } from './composables/useSettings'
 import { useToasts } from './composables/useToasts'
@@ -35,6 +36,8 @@ import {
   getSupportedExportFormats,
 } from './core/exportFormats'
 import type { ExportFormat } from './core/exportFormats'
+import { IS_DESKTOP_APP } from './core/appInfo'
+import type { HealEngineChoice } from './core/healEngine'
 import { IMAGE_ACCEPT, SUPPORTED_FORMAT_LABEL, formatDimensions } from './core/image'
 import { calculateStitchLayout, inspectOutputSize } from './core/layout'
 import { UnsupportedExportFormatError, canvasToBlob, renderStitch } from './core/render'
@@ -45,7 +48,8 @@ import {
   writeBlobToHandle,
 } from './core/save'
 import type { SaveFileHandle } from './core/save'
-import { THUMBNAIL_SIZE_PX } from './core/settings'
+import { isModelBusy } from './core/modelApi'
+import { HEAL_ENGINE_OPTIONS, THUMBNAIL_SIZE_PX } from './core/settings'
 import type { PanelKey, PanelState } from './core/settings'
 import type { StitchDirection } from './core/types'
 import { vTooltip } from './directives/tooltip'
@@ -69,6 +73,31 @@ const {
   resetDir: resetConfigDir,
   openDir: openConfigDir,
 } = useSettings(props.initialSettings)
+
+const models = useModels(IS_DESKTOP_APP)
+
+/** 按设置与模型下载状态决定这次修瑕用什么；选了 AI 但模型还不能用时退回经典算法，并说明原因。 */
+const healEngineChoice = computed<HealEngineChoice>(() => {
+  const engine = settings.value.healEngine
+  if (engine === 'classic') {
+    return { kind: 'classic' }
+  }
+  const label = HEAL_ENGINE_OPTIONS.find((option) => option.value === engine)?.label ?? engine
+  if (!models.isAvailable) {
+    return { kind: 'classic', notice: `${label} 只能在免安装 EXE 版里使用，这次用经典算法` }
+  }
+  const status = models.statusOf(engine)
+  if (status?.state === 'ready') {
+    return { kind: 'ai', model: engine, label, modelUrl: status.modelUrl, runtimeUrl: status.runtimeUrl }
+  }
+  let reason = '模型还没有下载完'
+  if (!status) {
+    reason = '读不到模型状态'
+  } else if (isModelBusy(status.state) && status.total > 0) {
+    reason = `模型还在下载（${Math.floor((status.downloaded / status.total) * 100)}%）`
+  }
+  return { kind: 'classic', notice: `${label} ${reason}，这次用经典算法；可在设置里查看下载` }
+})
 
 const direction = ref<StitchDirection>('vertical')
 /** 间距随设置一起保存到配置文件；底部滑块与数字框通过它读写。 */
@@ -347,6 +376,14 @@ async function handleAdd(files: File[]): Promise<void> {
       message: `${summarize(report.failed)}。请确认文件完整后重试。`,
     })
   }
+}
+
+function onHealFailed(message: string): void {
+  push({ tone: 'error', title: '修瑕失败', message: `${message}。这次涂抹已撤回，可以缩小范围后重试。` })
+}
+
+function onHealNotice(message: string): void {
+  push({ tone: 'info', title: '修瑕', message })
 }
 
 function insertBlankPage(): void {
@@ -646,11 +683,14 @@ async function handleExport(): Promise<void> {
           :zoom-toolbar="settings.zoomToolbar"
           :blank-panel="settings.blankPanel"
           :thumbnail-panel="settings.thumbnailPanel"
+          :heal-engine="healEngineChoice"
           @pick="openFilePicker"
           @add="handleAdd"
           @active-change="activeImageId = $event"
           @resize-blank="resizeBlankPage"
           @update-panel="onPanelUpdate"
+          @heal-failed="onHealFailed"
+          @heal-notice="onHealNotice"
         />
 
         <StitchControls
@@ -677,11 +717,22 @@ async function handleExport(): Promise<void> {
         :save-error="settingsSaveError"
         :is-moving-dir="isMovingConfigDir"
         :dir-status="configDirStatus"
+        :models-available="models.isAvailable"
+        :models="models.snapshot.value"
+        :models-load-error="models.loadError.value"
+        :models-busy="models.isBusy.value"
+        :models-status="models.actionStatus.value"
         @update="updateSettings"
         @reset="resetSettings"
         @change-dir="changeConfigDir"
         @reset-dir="resetConfigDir"
         @open-dir="openConfigDir"
+        @download-model="models.download"
+        @pause-model="models.pause"
+        @delete-model="models.remove"
+        @change-models-dir="models.changeDir"
+        @reset-models-dir="models.resetDir"
+        @open-models-dir="models.openDir"
       />
     </main>
 

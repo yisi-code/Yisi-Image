@@ -1,4 +1,5 @@
 import { drawAnnotations } from './annotations'
+import type { DrawAnnotationsOptions } from './annotations'
 import { getPreviewFit } from './preview'
 import type { PreviewOffset } from './preview'
 import type { StitchImage, StitchLayout } from './types'
@@ -16,6 +17,8 @@ export interface ViewportRenderOptions {
   offset: PreviewOffset
   dpr?: number
   background?: string
+  /** 正在编辑、由输入框代为显示的文字标注 */
+  hiddenAnnotationId?: string | null
 }
 
 function paintStitchImage(
@@ -25,6 +28,7 @@ function paintStitchImage(
   y: number,
   width: number,
   height: number,
+  annotationOptions: DrawAnnotationsOptions = {},
 ): void {
   if (image.kind === 'blank') {
     context.fillStyle = image.backgroundColor ?? '#ffffff'
@@ -36,7 +40,7 @@ function paintStitchImage(
   context.save()
   context.translate(x, y)
   context.scale(width / image.width, height / image.height)
-  drawAnnotations(context, image)
+  drawAnnotations(context, image, annotationOptions)
   context.restore()
 }
 
@@ -159,7 +163,10 @@ export function renderStitchView(
     if (!image) {
       continue
     }
-    paintStitchImage(context, image, item.x, item.y, item.width, item.height)
+    paintStitchImage(context, image, item.x, item.y, item.width, item.height, {
+      isPreview: true,
+      hiddenId: options.hiddenAnnotationId,
+    })
   }
   context.restore()
 

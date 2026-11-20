@@ -16,8 +16,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("本地多图拼接工具")]
 [assembly: AssemblyProduct("Yisi 图像工具")]
 [assembly: AssemblyCompany("Yisi")]
-[assembly: AssemblyVersion("0.10.0.0")]
-[assembly: AssemblyFileVersion("0.10.0.0")]
+[assembly: AssemblyVersion("0.11.0.0")]
+[assembly: AssemblyFileVersion("0.11.0.0")]
 
 namespace Yisi.ImageTool
 {
@@ -664,6 +664,19 @@ namespace Yisi.ImageTool
                             return;
                         }
 
+                        if (path == "/api/models" ||
+                            path.StartsWith("/api/models/", StringComparison.Ordinal))
+                        {
+                            HandleModelRequest(stream, method, path, request);
+                            return;
+                        }
+
+                        if (path.StartsWith("/models/", StringComparison.Ordinal))
+                        {
+                            HandleModelFile(stream, method, path, request);
+                            return;
+                        }
+
                         if (method == "POST")
                         {
                             WriteResponse(
@@ -813,6 +826,142 @@ namespace Yisi.ImageTool
                 false);
         }
 
+        /// <summary>
+        /// /api/models 系列：AI 修瑕模型的状态、下载 / 暂停 / 删除、选择与移动模型目录、打开目录。
+        /// 与配置接口同样只接受带 X-Yisi-Config 头的本机请求。
+        /// </summary>
+        private void HandleModelRequest(
+            NetworkStream stream,
+            string method,
+            string path,
+            HttpRequestData request)
+        {
+            string status = "200 OK";
+            string json;
+            try
+            {
+                if (!IsTrustedConfigRequest(request.Head))
+                {
+                    status = "403 Forbidden";
+                    json = ErrorJson("Forbidden");
+                }
+                else if (path == "/api/models" && method == "GET")
+                {
+                    json = ModelStore.DescribeJson();
+                }
+                else if (method != "POST")
+                {
+                    status = "405 Method Not Allowed";
+                    json = ErrorJson("Method Not Allowed");
+                }
+                else if (request.IsBodyTooLarge)
+                {
+                    status = "413 Payload Too Large";
+                    json = ErrorJson("请求内容过大");
+                }
+                else if (path == "/api/models/download")
+                {
+                    ModelStore.Download(ReadStringField(request.Body, "id"));
+                    json = ModelStore.DescribeJson();
+                }
+                else if (path == "/api/models/pause")
+                {
+                    ModelStore.Pause(ReadStringField(request.Body, "id"));
+                    json = ModelStore.DescribeJson();
+                }
+                else if (path == "/api/models/delete")
+                {
+                    ModelStore.Delete(ReadStringField(request.Body, "id"));
+                    json = ModelStore.DescribeJson();
+                }
+                else if (path == "/api/models/pick-dir")
+                {
+                    Func<string, string> picker = PickFolderRequested;
+                    if (picker == null)
+                    {
+                        status = "503 Service Unavailable";
+                        json = ErrorJson("选择目录功能不可用");
+                    }
+                    else
+                    {
+                        string selected = picker(ModelStore.CurrentDirectory());
+                        json = selected == null
+                            ? "{\"ok\":true,\"canceled\":true}"
+                            : "{\"ok\":true,\"dir\":" + new JavaScriptSerializer().Serialize(selected) + "}";
+                    }
+                }
+                else if (path == "/api/models/location")
+                {
+                    bool moved = ModelStore.MoveTo(ReadDirectoryField(request.Body));
+                    json = "{\"moved\":" + (moved ? "true" : "false") + "," + ModelStore.DescribeJson().Substring(1);
+                }
+                else if (path == "/api/models/open-dir")
+                {
+                    ModelStore.OpenInExplorer();
+                    json = "{\"ok\":true}";
+                }
+                else
+                {
+                    status = "404 Not Found";
+                    json = ErrorJson("Not Found");
+                }
+            }
+            catch (Exception ex)
+            {
+                status = "500 Internal Server Error";
+                json = ErrorJson(ex.Message);
+            }
+
+            WriteResponse(
+                stream,
+                status,
+                "application/json; charset=utf-8",
+                Encoding.UTF8.GetBytes(json),
+                false);
+        }
+
+        /// <summary>/models/文件名：把已下载完的模型或运行库原样发给页面（只认清单里的文件名）。</summary>
+        private static void HandleModelFile(
+            NetworkStream stream,
+            string method,
+            string path,
+            HttpRequestData request)
+        {
+            if ((method != "GET" && method != "HEAD") || !IsLocalAuthority(GetHeader(request.Head, "Host")))
+            {
+                WriteResponse(
+                    stream,
+                    "403 Forbidden",
+                    "text/plain; charset=utf-8",
+                    Encoding.UTF8.GetBytes("Forbidden"),
+                    false);
+                return;
+            }
+
+            string[] served = ModelStore.ResolveServedFile(path.Substring("/models/".Length));
+            if (served == null)
+            {
+                WriteResponse(
+                    stream,
+                    "404 Not Found",
+                    "text/plain; charset=utf-8",
+                    Encoding.UTF8.GetBytes("Not Found"),
+                    method == "HEAD");
+                return;
+            }
+
+            using (FileStream file = new FileStream(served[0], FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                byte[] headerBytes = Encoding.ASCII.GetBytes(BuildHeader("200 OK", served[1], file.Length));
+                stream.Write(headerBytes, 0, headerBytes.Length);
+                if (method != "HEAD")
+                {
+                    file.CopyTo(stream, 81920);
+                }
+                stream.Flush();
+            }
+        }
+
         private static bool IsTrustedConfigRequest(string head)
         {
             if (GetHeader(head, "X-Yisi-Config") != "1")
@@ -853,6 +1002,27 @@ namespace Yisi.ImageTool
                 }
             }
             return null;
+        }
+
+        /// <summary>解析 {"id": "..."} 这类只有一个字符串字段的请求体。</summary>
+        private static string ReadStringField(byte[] body, string name)
+        {
+            Dictionary<string, object> parsed = null;
+            try
+            {
+                parsed = new JavaScriptSerializer().DeserializeObject(Encoding.UTF8.GetString(body))
+                    as Dictionary<string, object>;
+            }
+            catch
+            {
+                // 下面统一报格式错误。
+            }
+            object value;
+            if (parsed == null || !parsed.TryGetValue(name, out value) || !(value is string))
+            {
+                throw new ConfigException("请求格式无效");
+            }
+            return (string)value;
         }
 
         /// <summary>解析 {"dir": "D:\\..."}；dir 为 null 表示移回程序所在目录。</summary>
@@ -987,21 +1157,32 @@ namespace Yisi.ImageTool
             byte[] body,
             bool headOnly)
         {
-            StringBuilder header = new StringBuilder();
-            header.Append("HTTP/1.1 ").Append(status).Append("\r\n");
-            header.Append("Content-Type: ").Append(contentType).Append("\r\n");
-            header.Append("Content-Length: ").Append(body.Length).Append("\r\n");
-            header.Append("Cache-Control: no-cache\r\n");
-            header.Append("X-Content-Type-Options: nosniff\r\n");
-            header.Append("Connection: close\r\n\r\n");
-
-            byte[] headerBytes = Encoding.ASCII.GetBytes(header.ToString());
+            byte[] headerBytes = Encoding.ASCII.GetBytes(BuildHeader(status, contentType, body.Length));
             stream.Write(headerBytes, 0, headerBytes.Length);
             if (!headOnly && body.Length > 0)
             {
                 stream.Write(body, 0, body.Length);
             }
             stream.Flush();
+        }
+
+        /// <summary>
+        /// 所有响应共用的头。COOP / COEP 让页面处于跨源隔离状态，AI 修瑕的 wasm 才能多线程运行；
+        /// 页面不加载任何外站资源，开启后不影响其他功能。
+        /// </summary>
+        private static string BuildHeader(string status, string contentType, long length)
+        {
+            StringBuilder header = new StringBuilder();
+            header.Append("HTTP/1.1 ").Append(status).Append("\r\n");
+            header.Append("Content-Type: ").Append(contentType).Append("\r\n");
+            header.Append("Content-Length: ").Append(length).Append("\r\n");
+            header.Append("Cache-Control: no-cache\r\n");
+            header.Append("X-Content-Type-Options: nosniff\r\n");
+            header.Append("Cross-Origin-Opener-Policy: same-origin\r\n");
+            header.Append("Cross-Origin-Embedder-Policy: require-corp\r\n");
+            header.Append("Cross-Origin-Resource-Policy: same-origin\r\n");
+            header.Append("Connection: close\r\n\r\n");
+            return header.ToString();
         }
 
         private static string GetContentType(string path)
@@ -1029,6 +1210,8 @@ namespace Yisi.ImageTool
                     return "font/woff";
                 case ".woff2":
                     return "font/woff2";
+                case ".wasm":
+                    return "application/wasm";
                 default:
                     return "application/octet-stream";
             }

@@ -7,6 +7,7 @@ import {
   ChevronsUp,
   Eraser,
   FilePlus2,
+  GripVertical,
   ImagePlus,
   Loader2,
   Maximize2,
@@ -27,7 +28,14 @@ import {
   cloneAnnotations,
   createAnnotationId,
   eraseAnnotationsAt,
+  findTextAt,
+  getToolDiameter,
+  measureText,
+  textFont,
 } from '../core/annotations'
+import { createHealPatch, prepareHealJob } from '../core/heal'
+import { runHeal } from '../core/healEngine'
+import type { HealEngineChoice } from '../core/healEngine'
 import { formatDimensions } from '../core/image'
 import {
   clampPreviewOffset,
@@ -54,7 +62,9 @@ import type {
   StitchAnnotation,
   StitchImage,
   StitchLayout,
+  HealFill,
   StrokeAnnotation,
+  TextAnnotation,
 } from '../core/types'
 
 const props = defineProps<{
@@ -69,6 +79,8 @@ const props = defineProps<{
   zoomToolbar: PanelState
   blankPanel: PanelState
   thumbnailPanel: PanelState
+  /** 这次修瑕用经典算法还是 AI 模型（由 App 按设置与模型下载状态算出） */
+  healEngine: HealEngineChoice
 }>()
 
 const emit = defineEmits<{
@@ -77,6 +89,9 @@ const emit = defineEmits<{
   'active-change': [id: string | null]
   'resize-blank': [id: string, width: number, height: number]
   'update-panel': [key: PanelKey, state: PanelState]
+  'heal-failed': [message: string]
+  /** 修瑕成功但需要告诉用户的说明，例如 AI 模型不可用、这次改用了经典算法 */
+  'heal-notice': [message: string]
 }>()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
@@ -94,14 +109,24 @@ const annotationWidth = ref(6)
 /** 正在按住粗细滑块：显示实际粗细的预览圆点。 */
 const isAdjustingWidth = ref(false)
 const isDrawing = ref(false)
-const textDraft = ref<{
+/**
+ * 正在输入或修改的文字。坐标是图片本地坐标（文字左上角），输入框按当前缩放换算到屏幕，
+ * 字号、颜色与最终效果一致；editingId 不为空表示在改已有文字，绘制时先隐藏原文字。
+ */
+interface TextDraft {
   imageId: string
+  editingId: string | null
   x: number
   y: number
-  screenX: number
-  screenY: number
+  fontSize: number
   value: string
-} | null>(null)
+}
+const textDraft = ref<TextDraft | null>(null)
+/** 修瑕正在计算：期间不接受新的涂抹与撤销重做。 */
+const isHealing = ref(false)
+const healProgress = ref(0)
+/** 画笔、橡皮擦、修瑕的范围圈位置（视口内坐标）；指针不在画布上时为空。 */
+const cursorPoint = ref<{ x: number; y: number } | null>(null)
 const undoStack = ref<HistoryEntry[]>([])
 const redoStack = ref<HistoryEntry[]>([])
 let drawingImage: StitchImage | null = null
@@ -109,6 +134,16 @@ let drawingItem: StitchLayout['items'][number] | null = null
 let drawingStroke: StrokeAnnotation | null = null
 let drawingBefore: StitchAnnotation[] | null = null
 let drawingPointerId: number | null = null
+/** 「选择」工具下按下的位置；松开时几乎没动就当作点击（用来点文字修改）。 */
+let selectPress: { pointerId: number; x: number; y: number } | null = null
+let textDragState: {
+  pointerId: number
+  startX: number
+  startY: number
+  originX: number
+  originY: number
+  scale: number
+} | null = null
 let resizeState: {
   pointerId: number
   startX: number
@@ -157,7 +192,7 @@ const ANNOTATION_TOOLS: AnnotationToolOption[] = [
   { value: 'text', name: '添加文字', tip: '添加文字', icon: Type },
   { value: 'brush', name: '画笔', tip: '画笔', icon: Paintbrush },
   { value: 'eraser', name: '橡皮擦', tip: '橡皮擦（只擦标注，不改原图）', icon: Eraser },
-  { value: 'heal', name: '局部修瑕', tip: '局部修瑕（柔化小污点）', icon: Wand2 },
+  { value: 'heal', name: '局部修瑕', tip: '局部修瑕（涂抹要去掉的物体，按周围画面补全）', icon: Wand2 },
 ]
 
 const MIN_ZOOM = 0.5
@@ -204,8 +239,33 @@ const activeItem = computed(
 const activeBlank = computed(() =>
   activeImage.value?.kind === 'blank' ? activeImage.value : null,
 )
-const canUndo = computed(() => undoStack.value.length > 0)
-const canRedo = computed(() => redoStack.value.length > 0)
+const canUndo = computed(() => undoStack.value.length > 0 && !isHealing.value)
+const canRedo = computed(() => redoStack.value.length > 0 && !isHealing.value)
+const isPaintingTool = computed(
+  () => annotationTool.value === 'brush' || annotationTool.value === 'eraser' || annotationTool.value === 'heal',
+)
+const healPercent = computed(() => `${Math.round(healProgress.value * 100)}%`)
+/** 修瑕进行中提示里的引擎名：开始时记下，计算期间设置变了也不跟着变。 */
+const healEngineLabel = ref('')
+/** 刚完成的修瑕；在下一次涂抹、撤销重做或改文字前，可一键换成另一种补法。 */
+const lastHealed = ref<{ imageId: string; annotationId: string } | null>(null)
+const HEAL_FILL_LABELS: Record<HealFill, string> = {
+  structure: '结构优先',
+  smooth: '平滑优先',
+  ai: 'AI 模型',
+}
+const healChoice = computed(() => {
+  const target = lastHealed.value
+  if (!target || isHealing.value) {
+    return null
+  }
+  const annotation = findImage(target.imageId)?.annotations.find((item) => item.id === target.annotationId)
+  if (annotation?.type !== 'heal' || !annotation.fill || !annotation.alternatePatch) {
+    return null
+  }
+  const other: HealFill = annotation.fill === 'structure' ? 'smooth' : 'structure'
+  return { current: HEAL_FILL_LABELS[annotation.fill], other: HEAL_FILL_LABELS[other] }
+})
 
 const imageToScreen = computed(() => {
   if (displaySize.value.width <= 0 || props.layout.width <= 0) {
@@ -234,15 +294,61 @@ const blankSelectionStyle = computed<Record<string, string> | null>(() => {
   }
 })
 
-const textEditorStyle = computed<Record<string, string> | null>(() => {
-  const draft = textDraft.value
+/** 图片本地坐标 → 视口内坐标。 */
+function toViewport(imageId: string, x: number, y: number): { x: number; y: number } | null {
   const viewport = viewportRef.value
-  if (!draft || !viewport) {
+  const item = props.layout.items.find((candidate) => candidate.id === imageId)
+  if (!viewport || !item) {
     return null
   }
+  const scale = imageToScreen.value
+  const contentWidth = displaySize.value.width * zoom.value
+  const contentHeight = displaySize.value.height * zoom.value
   return {
-    left: `${Math.max(8, Math.min(viewport.clientWidth - 236, draft.screenX))}px`,
-    top: `${Math.max(8, Math.min(viewport.clientHeight - 50, draft.screenY))}px`,
+    x: (viewport.clientWidth - contentWidth) / 2 + offset.value.x + (item.x + x) * scale,
+    y: (viewport.clientHeight - contentHeight) / 2 + offset.value.y + (item.y + y) * scale,
+  }
+}
+
+/** 输入框直接按最终字号、颜色画在文字位置上，输入即所见；拖动手柄在左侧，确认 / 取消在右侧。 */
+const TEXT_GRIP_WIDTH = 20
+const textEditorLayout = computed(() => {
+  const draft = textDraft.value
+  if (!draft) {
+    return null
+  }
+  const origin = toViewport(draft.imageId, draft.x, draft.y)
+  if (!origin) {
+    return null
+  }
+  const fontPx = Math.max(6, draft.fontSize * imageToScreen.value)
+  const sample = draft.value || '输入文字'
+  const width = Math.max(fontPx * 2, measureText(sample, fontPx) + fontPx * 0.4)
+  return {
+    box: { left: `${origin.x - TEXT_GRIP_WIDTH}px`, top: `${origin.y}px` },
+    input: {
+      width: `${width}px`,
+      height: `${fontPx}px`,
+      font: textFont(fontPx),
+      lineHeight: `${fontPx}px`,
+      color: annotationColor.value,
+    },
+  }
+})
+
+const toolCursorStyle = computed<Record<string, string> | null>(() => {
+  const point = cursorPoint.value
+  if (!point || !isPaintingTool.value || isHealing.value) {
+    return null
+  }
+  const scale = annotationScale()
+  const diameter = getToolDiameter(annotationTool.value, annotationWidth.value, scale) * scale
+  return {
+    left: `${point.x}px`,
+    top: `${point.y}px`,
+    width: `${diameter}px`,
+    height: `${diameter}px`,
+    '--cursor-color': annotationColor.value,
   }
 })
 
@@ -350,6 +456,10 @@ function commitHistory(
 }
 
 function undo(): void {
+  if (isHealing.value) {
+    return
+  }
+  lastHealed.value = null
   while (undoStack.value.length > 0) {
     const entry = undoStack.value.pop()
     if (!entry) {
@@ -367,6 +477,10 @@ function undo(): void {
 }
 
 function redo(): void {
+  if (isHealing.value) {
+    return
+  }
+  lastHealed.value = null
   while (redoStack.value.length > 0) {
     const entry = redoStack.value.pop()
     if (!entry) {
@@ -415,30 +529,111 @@ function setTool(tool: AnnotationTool): void {
   if (isDrawing.value) {
     finishDrawing()
   }
-  textDraft.value = null
+  commitText()
   annotationTool.value = tool
   viewportRef.value?.focus()
 }
 
+function focusTextInput(selectAll = false): void {
+  void nextTick(() => {
+    textInputRef.value?.focus()
+    if (selectAll) {
+      textInputRef.value?.select()
+    }
+  })
+}
+
+/** 打开已有文字的编辑：原文字先隐藏，输入框以同样字号、颜色出现在原位。 */
+function editExistingText(image: StitchImage, annotation: TextAnnotation): void {
+  lastHealed.value = null
+  activeImageId.value = image.id
+  isHoldingActiveImage = true
+  annotationColor.value = annotation.color
+  textDraft.value = {
+    imageId: image.id,
+    editingId: annotation.id,
+    x: annotation.x,
+    y: annotation.y,
+    fontSize: annotation.fontSize,
+    value: annotation.text,
+  }
+  focusTextInput(true)
+}
+
+/** 文字工具点击：点中已有文字就修改，否则在点击位置新建。正在输入的内容先确认，不会丢。 */
 function openTextEditor(event: PointerEvent): void {
   const hit = imageAtEvent(event)
+  commitText()
   if (!hit) {
+    return
+  }
+  const existing = findTextAt(hit.image.annotations, hit.point)
+  if (existing) {
+    editExistingText(hit.image, existing)
     return
   }
   activeImageId.value = hit.image.id
   textDraft.value = {
     imageId: hit.image.id,
+    editingId: null,
     x: hit.point.x,
     y: hit.point.y,
-    screenX: hit.screenX,
-    screenY: hit.screenY,
+    fontSize: Math.max(16, Math.round(24 / annotationScale())),
     value: '',
   }
-  void nextTick(() => textInputRef.value?.focus())
+  focusTextInput()
 }
 
 function cancelText(): void {
+  if (!textDraft.value) {
+    return
+  }
   textDraft.value = null
+  scheduleRender()
+}
+
+function startTextDrag(event: PointerEvent): void {
+  const draft = textDraft.value
+  if (!draft || event.button !== 0) {
+    return
+  }
+  event.preventDefault()
+  const handle = event.currentTarget
+  if (handle instanceof HTMLElement) {
+    handle.setPointerCapture(event.pointerId)
+  }
+  textDragState = {
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    originX: draft.x,
+    originY: draft.y,
+    scale: Math.max(0.0001, imageToScreen.value),
+  }
+}
+
+function moveTextDrag(event: PointerEvent): void {
+  const draft = textDraft.value
+  if (!draft || !textDragState || event.pointerId !== textDragState.pointerId) {
+    return
+  }
+  const item = props.layout.items.find((candidate) => candidate.id === draft.imageId)
+  const maxX = item ? item.width - 1 : Infinity
+  const maxY = item ? item.height - 1 : Infinity
+  draft.x = Math.min(maxX, Math.max(0, textDragState.originX + (event.clientX - textDragState.startX) / textDragState.scale))
+  draft.y = Math.min(maxY, Math.max(0, textDragState.originY + (event.clientY - textDragState.startY) / textDragState.scale))
+}
+
+function endTextDrag(event: PointerEvent): void {
+  if (!textDragState || event.pointerId !== textDragState.pointerId) {
+    return
+  }
+  const handle = event.currentTarget
+  if (handle instanceof HTMLElement && handle.hasPointerCapture(event.pointerId)) {
+    handle.releasePointerCapture(event.pointerId)
+  }
+  textDragState = null
+  focusTextInput()
 }
 
 function annotationScale(): number {
@@ -448,35 +643,53 @@ function annotationScale(): number {
   return (displaySize.value.width / props.layout.width) * zoom.value
 }
 
+/** 确认文字：新建就追加；修改就原位替换（保持图层顺序）；改成空就删除。都记入撤销历史。 */
 function commitText(): void {
   const draft = textDraft.value
   if (!draft) {
     return
   }
-  const text = draft.value.trim()
+  textDraft.value = null
   const image = findImage(draft.imageId)
-  if (!text || !image) {
-    textDraft.value = null
+  if (!image) {
+    scheduleRender()
     return
   }
-  const scale = annotationScale()
-  const fontSize = Math.max(16, Math.round(24 / scale))
+  const text = draft.value.trim()
+  const original = draft.editingId
+    ? image.annotations.find((annotation) => annotation.id === draft.editingId)
+    : null
+  if (
+    original?.type === 'text' &&
+    original.text === text &&
+    original.x === draft.x &&
+    original.y === draft.y &&
+    original.color === annotationColor.value &&
+    original.fontSize === draft.fontSize
+  ) {
+    // 打开后没改任何东西：只恢复显示，不记一步撤销。
+    scheduleRender()
+    return
+  }
   const before = cloneAnnotations(image.annotations)
-  image.annotations = [
-    ...image.annotations,
-    {
-      id: createAnnotationId(),
-      type: 'text',
-      x: draft.x,
-      y: draft.y,
-      text,
-      fontSize,
-      color: annotationColor.value,
-      width: text.length * fontSize * 0.62,
-    },
-  ]
+  const next: TextAnnotation = {
+    id: draft.editingId ?? createAnnotationId(),
+    type: 'text',
+    x: draft.x,
+    y: draft.y,
+    text,
+    fontSize: draft.fontSize,
+    color: annotationColor.value,
+    width: measureText(text, draft.fontSize),
+  }
+  if (draft.editingId) {
+    image.annotations = text
+      ? image.annotations.map((annotation) => (annotation.id === draft.editingId ? next : annotation))
+      : image.annotations.filter((annotation) => annotation.id !== draft.editingId)
+  } else if (text) {
+    image.annotations = [...image.annotations, next]
+  }
   commitHistory(image.id, before, image.annotations)
-  textDraft.value = null
   scheduleRender()
 }
 
@@ -486,6 +699,11 @@ function beginDrawing(event: PointerEvent): void {
     openTextEditor(event)
     return
   }
+  if (isHealing.value) {
+    return
+  }
+  lastHealed.value = null
+  commitText()
 
   const hit = imageAtEvent(event)
   if (!hit) {
@@ -511,11 +729,7 @@ function beginDrawing(event: PointerEvent): void {
     return
   }
 
-  const scale = annotationScale()
-  const width =
-    annotationTool.value === 'heal'
-      ? Math.max(8, Math.round((annotationWidth.value * 2.5) / scale))
-      : Math.max(1, Math.round(annotationWidth.value / scale))
+  const width = getToolDiameter(annotationTool.value, annotationWidth.value, annotationScale())
   const stroke: StrokeAnnotation = {
     id: createAnnotationId(),
     type: annotationTool.value === 'heal' ? 'heal' : 'brush',
@@ -535,7 +749,7 @@ function applyEraser(point: AnnotationPoint): void {
   const next = eraseAnnotationsAt(
     drawingImage.annotations,
     point,
-    Math.max(8, Math.round((annotationWidth.value * 1.5 + 4) / annotationScale())),
+    getToolDiameter('eraser', annotationWidth.value, annotationScale()) / 2,
   )
   if (next.length !== drawingImage.annotations.length) {
     drawingImage.annotations = next
@@ -571,7 +785,9 @@ function finishDrawing(): void {
   if (viewport && drawingPointerId !== null && viewport.hasPointerCapture(drawingPointerId)) {
     viewport.releasePointerCapture(drawingPointerId)
   }
-  if (drawingImage && drawingBefore) {
+  if (drawingImage && drawingBefore && drawingStroke?.type === 'heal') {
+    void runHealStroke(drawingImage, drawingStroke, drawingBefore)
+  } else if (drawingImage && drawingBefore) {
     commitHistory(drawingImage.id, drawingBefore, drawingImage.annotations)
   }
   isDrawing.value = false
@@ -580,6 +796,94 @@ function finishDrawing(): void {
   drawingStroke = null
   drawingBefore = null
   drawingPointerId = null
+  scheduleRender()
+}
+
+/**
+ * 涂抹结束后计算修瑕补丁：计算期间涂抹范围以半透明红色显示，完成后换成补丁并记入撤销历史；
+ * 失败则撤掉这次涂抹并提示。
+ */
+async function runHealStroke(
+  image: StitchImage,
+  stroke: StrokeAnnotation,
+  before: StitchAnnotation[],
+): Promise<void> {
+  const removeStroke = () => {
+    image.annotations = image.annotations.filter((annotation) => annotation.id !== stroke.id)
+  }
+  let job
+  try {
+    job = prepareHealJob(image, stroke)
+  } catch (error) {
+    removeStroke()
+    emit('heal-failed', error instanceof Error ? error.message : '无法读取图片像素')
+    scheduleRender()
+    return
+  }
+  if (!job) {
+    removeStroke()
+    scheduleRender()
+    return
+  }
+  isHealing.value = true
+  healProgress.value = 0
+  scheduleRender()
+  try {
+    const engine = props.healEngine
+    healEngineLabel.value = engine.kind === 'ai' ? engine.label : ''
+    const result = await runHeal(job, engine, (fraction) => {
+      healProgress.value = fraction
+    })
+    if (result.notice) {
+      emit('heal-notice', result.notice)
+    }
+    const patch = createHealPatch(job, result.best.rgba)
+    const alternatePatch = result.alternate ? createHealPatch(job, result.alternate.rgba) : undefined
+    if (findImage(image.id) && image.annotations.some((annotation) => annotation.id === stroke.id)) {
+      image.annotations = image.annotations.map((annotation) =>
+        annotation.id === stroke.id
+          ? {
+              ...stroke,
+              points: stroke.points.map((point) => ({ ...point })),
+              patch,
+              fill: result.best.strategy,
+              alternatePatch,
+            }
+          : annotation,
+      )
+      commitHistory(image.id, before, image.annotations)
+      lastHealed.value = { imageId: image.id, annotationId: stroke.id }
+    }
+  } catch (error) {
+    removeStroke()
+    emit('heal-failed', error instanceof Error ? error.message : '修瑕计算失败')
+  } finally {
+    isHealing.value = false
+    scheduleRender()
+  }
+}
+
+/** 把刚完成的修瑕换成另一种补法（两种结果都已算好，不用重算）；记入撤销历史。 */
+function swapHealFill(): void {
+  const target = lastHealed.value
+  if (!target || isHealing.value) {
+    return
+  }
+  const image = findImage(target.imageId)
+  const annotation = image?.annotations.find((item) => item.id === target.annotationId)
+  if (!image || annotation?.type !== 'heal' || !annotation.patch || !annotation.alternatePatch || !annotation.fill) {
+    lastHealed.value = null
+    return
+  }
+  const before = cloneAnnotations(image.annotations)
+  const swapped: StrokeAnnotation = {
+    ...annotation,
+    patch: annotation.alternatePatch,
+    alternatePatch: annotation.patch,
+    fill: annotation.fill === 'structure' ? 'smooth' : 'structure',
+  }
+  image.annotations = image.annotations.map((item) => (item.id === annotation.id ? swapped : item))
+  commitHistory(image.id, before, image.annotations)
   scheduleRender()
 }
 
@@ -879,6 +1183,7 @@ function onPointerDown(event: PointerEvent): void {
     beginDrawing(event)
     return
   }
+  selectPress = { pointerId: event.pointerId, x: event.clientX, y: event.clientY }
   if (zoom.value <= 1) {
     return
   }
@@ -900,7 +1205,22 @@ function onPointerDown(event: PointerEvent): void {
   isPanning.value = true
 }
 
+function updateToolCursor(event: PointerEvent): void {
+  const viewport = viewportRef.value
+  if (!isPaintingTool.value || !viewport || event.target !== canvasRef.value) {
+    cursorPoint.value = null
+    return
+  }
+  const rect = viewport.getBoundingClientRect()
+  cursorPoint.value = { x: event.clientX - rect.left, y: event.clientY - rect.top }
+}
+
+function hideToolCursor(): void {
+  cursorPoint.value = null
+}
+
 function onPointerMove(event: PointerEvent): void {
+  updateToolCursor(event)
   if (isDrawing.value && event.pointerId === drawingPointerId) {
     appendDrawing(event)
     return
@@ -917,10 +1237,31 @@ function onPointerMove(event: PointerEvent): void {
   updateActiveImage()
 }
 
+/** 「选择」工具下单击文字：打开修改。拖动平移不算点击。 */
+function handleSelectClick(event: PointerEvent): void {
+  const press = selectPress
+  selectPress = null
+  if (!press || press.pointerId !== event.pointerId) {
+    return
+  }
+  if (Math.hypot(event.clientX - press.x, event.clientY - press.y) > 4) {
+    return
+  }
+  const hit = imageAtEvent(event)
+  const existing = hit ? findTextAt(hit.image.annotations, hit.point) : null
+  if (hit && existing) {
+    commitText()
+    editExistingText(hit.image, existing)
+  }
+}
+
 function onPointerUp(event: PointerEvent): void {
   if (isDrawing.value && event.pointerId === drawingPointerId) {
     finishDrawing()
     return
+  }
+  if (annotationTool.value === 'select') {
+    handleSelectClick(event)
   }
   if (!panState || event.pointerId !== panState.pointerId) {
     return
@@ -957,7 +1298,7 @@ function onViewportKeydown(event: KeyboardEvent): void {
     return
   }
   if (event.key === 'Escape') {
-    textDraft.value = null
+    cancelText()
     return
   }
   if (event.key === '+' || event.key === '=') {
@@ -1057,6 +1398,7 @@ function renderPreview(): void {
     zoom: zoom.value,
     offset: offset.value,
     dpr: Math.min(window.devicePixelRatio || 1, PREVIEW_MAX_DPR),
+    hiddenAnnotationId: textDraft.value?.editingId ?? null,
   })
   if (!isHoldingActiveImage) {
     updateActiveImage()
@@ -1070,6 +1412,8 @@ function scheduleRender(): void {
 
 watch(() => props.layout, scheduleRender, { flush: 'post' })
 watch(zoom, scheduleRender, { flush: 'post' })
+// 开始 / 结束修改已有文字时重画：原文字在编辑期间隐藏。
+watch(() => textDraft.value?.editingId ?? null, scheduleRender)
 watch(activeImageId, (id) => {
   emit('active-change', id)
   if (!id) {
@@ -1096,7 +1440,7 @@ watch(
     if (isDrawing.value) {
       finishDrawing()
     }
-    textDraft.value = null
+    commitText()
     annotationTool.value = 'select'
   },
 )
@@ -1214,6 +1558,7 @@ defineExpose({ focusImage })
           'is-panning': isPanning,
           'is-zoomed': zoom > 1,
           'is-annotating': annotationTool !== 'select',
+          'is-painting': isPaintingTool,
           'is-drawing': isDrawing,
         }"
         role="region"
@@ -1224,6 +1569,7 @@ defineExpose({ focusImage })
         @pointermove="onPointerMove"
         @pointerup="onPointerUp"
         @pointercancel="onPointerUp"
+        @pointerleave="hideToolCursor"
         @dblclick="resetView"
         @keydown="onViewportKeydown"
       >
@@ -1392,29 +1738,54 @@ defineExpose({ focusImage })
           <span class="blank-size-hint">也可拖动右下角调整</span>
         </div>
 
+        <span
+          v-if="toolCursorStyle"
+          class="tool-cursor"
+          :class="`tool-cursor--${annotationTool}`"
+          :style="toolCursorStyle"
+          aria-hidden="true"
+        />
+
         <div
-          v-if="textDraft"
+          v-if="textDraft && textEditorLayout"
           class="text-editor"
-          :style="textEditorStyle"
+          :style="textEditorLayout.box"
           @pointerdown.stop
           @click.stop
+          @dblclick.stop
+          @wheel.stop
         >
+          <span
+            v-tooltip="'拖动移动文字'"
+            class="text-editor__grip"
+            aria-hidden="true"
+            @pointerdown="startTextDrag"
+            @pointermove="moveTextDrag"
+            @pointerup="endTextDrag"
+            @pointercancel="endTextDrag"
+          >
+            <GripVertical :size="13" :stroke-width="1.9" />
+          </span>
           <input
             ref="textInputRef"
             v-model="textDraft.value"
+            class="text-editor__input"
             type="text"
             maxlength="120"
-            placeholder="输入文字后回车"
-            aria-label="标注文字"
+            placeholder="输入文字"
+            :style="textEditorLayout.input"
+            :aria-label="textDraft.editingId ? '修改标注文字' : '标注文字'"
             @keydown.enter.prevent="commitText"
             @keydown.esc.prevent="cancelText"
           />
-          <button v-tooltip="'确认文字'" type="button" aria-label="确认文字" @click="commitText">
-            <Check :size="14" :stroke-width="2" />
-          </button>
-          <button v-tooltip="'取消文字'" type="button" aria-label="取消文字" @click="cancelText">
-            <X :size="14" :stroke-width="2" />
-          </button>
+          <span class="text-editor__actions">
+            <button v-tooltip="'确认文字（回车）'" type="button" aria-label="确认文字" @click="commitText">
+              <Check :size="14" :stroke-width="2" />
+            </button>
+            <button v-tooltip="'取消（Esc）'" type="button" aria-label="取消文字" @click="cancelText">
+              <X :size="14" :stroke-width="2" />
+            </button>
+          </span>
         </div>
       </div>
 
@@ -1497,6 +1868,33 @@ defineExpose({ focusImage })
         </button>
         <span class="zoom-hint" aria-hidden="true">滚轮缩放 · 拖动查看</span>
       </FloatingToolbar>
+
+      <div v-if="healChoice" class="stage-busy heal-choice" role="status">
+        <Wand2 :size="13" :stroke-width="1.9" />
+        <span>已用「{{ healChoice.current }}」补全</span>
+        <button
+          v-tooltip="'结构优先适合栏杆、窗格等直线重复的结构；平滑优先适合天空、渐变、曲面。两种结果都已算好，可随时换回'"
+          class="heal-choice__switch"
+          type="button"
+          @click="swapHealFill"
+        >
+          换成{{ healChoice.other }}
+        </button>
+        <button
+          v-tooltip="'关闭'"
+          class="heal-choice__close"
+          type="button"
+          aria-label="关闭补法切换"
+          @click="lastHealed = null"
+        >
+          <X :size="12" :stroke-width="2" />
+        </button>
+      </div>
+
+      <div v-if="isHealing" class="stage-busy" role="status">
+        <Loader2 class="spin" :size="13" :stroke-width="2" />
+        <span class="tnum">{{ healEngineLabel ? `正在用 ${healEngineLabel} 修瑕` : '正在修瑕' }} {{ healPercent }}</span>
+      </div>
 
       <div v-if="isImporting && images.length > 0" class="stage-busy" role="status">
         <Loader2 class="spin" :size="13" :stroke-width="2" />
@@ -2060,39 +2458,59 @@ defineExpose({ focusImage })
   line-height: 1.4;
 }
 
+/* 文字编辑：输入框就是最终效果（字号、颜色、位置都一致），只加一圈虚线框表示正在编辑。 */
 .text-editor {
   position: absolute;
   z-index: 5;
   display: flex;
-  width: 228px;
-  align-items: center;
-  gap: 2px;
-  padding: 4px;
-  border: 1px solid var(--accent-line-strong);
-  border-radius: 8px;
-  background: var(--surface);
-  box-shadow: var(--shadow-float);
+  align-items: flex-start;
+  gap: 6px;
+  cursor: default;
 }
 
-.text-editor input {
-  min-width: 0;
-  height: 28px;
-  flex: 1;
-  padding: 0 7px;
+.text-editor__grip {
+  display: inline-flex;
+  width: 14px;
+  height: 22px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.94);
+  color: var(--text-muted);
+  cursor: grab;
+  touch-action: none;
+}
+
+.text-editor__input {
+  flex: 0 0 auto;
+  padding: 0;
   border: 0;
   background: transparent;
-  color: var(--text-strong);
-  font-size: 12px;
+  outline: 1px dashed var(--accent);
+  outline-offset: 3px;
 }
 
-.text-editor input:focus {
-  outline: none;
+.text-editor__input::placeholder {
+  color: var(--text-faint);
+}
+
+.text-editor__actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: var(--shadow-xs);
 }
 
 .text-editor button {
   display: inline-flex;
-  width: 26px;
-  height: 26px;
+  width: 24px;
+  height: 24px;
   align-items: center;
   justify-content: center;
   border-radius: 5px;
@@ -2102,6 +2520,51 @@ defineExpose({ focusImage })
 .text-editor button:hover {
   background: var(--surface-hover);
   color: var(--text-strong);
+}
+
+/* 画笔、橡皮擦、修瑕的实际作用范围：圈的直径就是落笔的真实直径。 */
+.stage-viewport.is-painting .preview-canvas {
+  cursor: none;
+}
+
+.tool-cursor {
+  position: absolute;
+  z-index: 4;
+  border-radius: 50%;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+}
+
+.tool-cursor::after {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--text-strong);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.9);
+  content: '';
+  transform: translate(-50%, -50%);
+}
+
+.tool-cursor--brush {
+  border: 1px solid rgba(255, 255, 255, 0.95);
+  background: var(--cursor-color);
+  box-shadow: 0 0 0 1px rgba(19, 32, 28, 0.55);
+  opacity: 0.55;
+}
+
+.tool-cursor--eraser {
+  border: 1.5px dashed var(--text-strong);
+  background: rgba(255, 255, 255, 0.28);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.85);
+}
+
+.tool-cursor--heal {
+  border: 1.5px solid rgba(217, 45, 32, 0.9);
+  background: rgba(217, 45, 32, 0.22);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.85);
 }
 
 .zoom-toolbar {
@@ -2311,6 +2774,40 @@ defineExpose({ focusImage })
   backdrop-filter: blur(4px);
 }
 
+.heal-choice {
+  padding: 4px 6px 4px 10px;
+}
+
+.heal-choice__switch {
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--accent-line-strong);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.heal-choice__switch:hover {
+  background: var(--accent-soft-strong);
+}
+
+.heal-choice__close {
+  display: inline-flex;
+  width: 22px;
+  height: 22px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  color: var(--text-muted);
+}
+
+.heal-choice__close:hover {
+  background: var(--surface-hover);
+  color: var(--text-strong);
+}
+
 .stage-drop-overlay {
   position: absolute;
   z-index: 4;
@@ -2389,9 +2886,6 @@ defineExpose({ focusImage })
     padding: 8px;
   }
 
-  .text-editor {
-    width: 200px;
-  }
 
   .blank-selection-label {
     font-size: 8px;

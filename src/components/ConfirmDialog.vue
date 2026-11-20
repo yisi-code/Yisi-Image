@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { nextTick, ref, watch } from 'vue'
-import { AlertTriangle } from 'lucide-vue-next'
+import { AlertTriangle, Download } from 'lucide-vue-next'
 
 const props = withDefaults(
   defineProps<{
@@ -9,10 +9,13 @@ const props = withDefaults(
     description: string
     confirmLabel?: string
     cancelLabel?: string
+    /** danger：删除、清空等不可撤销操作（红色确认按钮）；download：下载等普通确认 */
+    tone?: 'danger' | 'download'
   }>(),
   {
     confirmLabel: '确认',
     cancelLabel: '取消',
+    tone: 'danger',
   },
 )
 
@@ -78,8 +81,9 @@ function onClosed(): void {
     >
       <div class="confirm-card">
         <div class="confirm-heading">
-          <span class="confirm-icon" aria-hidden="true">
-            <AlertTriangle :size="20" :stroke-width="1.9" />
+          <span class="confirm-icon" :class="`confirm-icon--${tone}`" aria-hidden="true">
+            <Download v-if="tone === 'download'" :size="20" :stroke-width="1.9" />
+            <AlertTriangle v-else :size="20" :stroke-width="1.9" />
           </span>
           <div>
             <h2 id="confirm-title">{{ title }}</h2>
@@ -96,7 +100,12 @@ function onClosed(): void {
           >
             {{ cancelLabel }}
           </button>
-          <button class="button button-danger" type="button" @click="emit('confirm')">
+          <button
+            class="button"
+            :class="tone === 'download' ? 'button-primary' : 'button-danger'"
+            type="button"
+            @click="emit('confirm')"
+          >
             {{ confirmLabel }}
           </button>
         </div>
@@ -158,6 +167,11 @@ function onClosed(): void {
   border-radius: 11px;
   background: var(--danger-soft);
   color: var(--danger);
+}
+
+.confirm-icon--download {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
 }
 
 .confirm-heading h2 {

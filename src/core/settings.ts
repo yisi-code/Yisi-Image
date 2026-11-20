@@ -1,10 +1,13 @@
 import { normalizeFloatingPosition } from './floating'
 import type { FloatingPosition } from './floating'
 import { DEFAULT_GAP, clampGap } from './layout'
+import type { AiModelId } from './modelApi'
 
 export type ThumbnailOrientation = 'auto' | 'horizontal' | 'vertical'
 export type ThumbnailSize = 'small' | 'medium' | 'large'
 export type ThumbnailFit = 'contain' | 'cover' | 'fill'
+/** 局部修瑕的补全方式：经典算法（默认，无需下载）或某个 AI 模型。 */
+export type HealEngine = 'classic' | AiModelId
 
 /**
  * 预览区面板（标注栏、缩放栏、空白页尺寸面板、缩略图）的显示状态。
@@ -26,6 +29,7 @@ export interface ToolSettings {
   zoomToolbar: PanelState
   blankPanel: PanelState
   thumbnailPanel: PanelState
+  healEngine: HealEngine
 }
 
 export type PanelKey = 'annotationToolbar' | 'zoomToolbar' | 'blankPanel' | 'thumbnailPanel'
@@ -81,6 +85,55 @@ export const THUMBNAIL_FIT_OPTIONS: SettingsOption<ThumbnailFit>[] = [
   },
 ]
 
+export interface HealEngineOption {
+  value: HealEngine
+  label: string
+  /** 选项右上角的短标签：要不要下载、多大 */
+  tag: string
+  /** 一句话定位 */
+  summary: string
+  /** 与其他两种相比的长处 */
+  strengths: string[]
+  /** 与其他两种相比的短处与代价 */
+  limits: string[]
+}
+
+/** 三种补全方式及区别；设置页选择时逐条列出，耗时为本机实测量级。 */
+export const HEAL_ENGINE_OPTIONS: HealEngineOption[] = [
+  {
+    value: 'classic',
+    label: '经典算法',
+    tag: '无需下载',
+    summary: '按画面里重复出现的间距整段平移补全',
+    strengths: [
+      '栏杆、格栅、砖墙等重复结构接得最准',
+      '同时给出结构优先、平滑优先两种结果，可一键切换',
+      '不用下载，浏览器版也能用',
+    ],
+    limits: ['不理解画面内容，被挡住的独特物体只能拼出近似', '常见 1–4 秒'],
+  },
+  {
+    value: 'migan',
+    label: 'AI · MI-GAN',
+    tag: '约 41 MB',
+    summary: '轻量 AI 模型，按画面内容补出合理的形状与明暗',
+    strengths: ['花瓣、衣物、地面等不规则内容过渡自然', '速度快，常见 1–2 秒', 'MIT 许可'],
+    limits: ['细密重复纹理不如经典算法规整，边缘偶尔发软', '需下载模型 26.8 MB + 运行库 14.2 MB'],
+  },
+  {
+    value: 'lama',
+    label: 'AI · LaMa',
+    tag: '约 213 MB',
+    summary: '大型 AI 模型，适合大块缺失与远景',
+    strengths: ['大面积缺失、远景和重复纹理更连贯', 'Apache-2.0 许可'],
+    limits: [
+      '较慢：每次约 7 秒，首次加载模型另需约 6 秒，加载后约占 600 MB 内存',
+      '固定按 512 × 512 计算，大区域细节偏软',
+      '需下载模型 198.4 MB（运行库与 MI-GAN 共用）',
+    ],
+  },
+]
+
 export const THUMBNAIL_SIZE_PX: Record<
   ThumbnailSize,
   { width: number; height: number }
@@ -104,6 +157,7 @@ export const DEFAULT_SETTINGS: Readonly<ToolSettings> = Object.freeze({
   zoomToolbar: DEFAULT_PANEL_STATE,
   blankPanel: DEFAULT_PANEL_STATE,
   thumbnailPanel: DEFAULT_PANEL_STATE,
+  healEngine: 'classic',
 })
 
 function isOrientation(value: unknown): value is ThumbnailOrientation {
@@ -116,6 +170,10 @@ function isSize(value: unknown): value is ThumbnailSize {
 
 function isFit(value: unknown): value is ThumbnailFit {
   return value === 'contain' || value === 'cover' || value === 'fill'
+}
+
+function isHealEngine(value: unknown): value is HealEngine {
+  return value === 'classic' || value === 'migan' || value === 'lama'
 }
 
 function normalizeGap(value: unknown): number {
@@ -148,6 +206,7 @@ export function normalizeSettings(value: unknown): ToolSettings {
     zoomToolbar: normalizePanelState(parsed.zoomToolbar),
     blankPanel: normalizePanelState(parsed.blankPanel),
     thumbnailPanel: normalizePanelState(parsed.thumbnailPanel),
+    healEngine: isHealEngine(parsed.healEngine) ? parsed.healEngine : DEFAULT_SETTINGS.healEngine,
   }
 }
 

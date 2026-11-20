@@ -1,28 +1,43 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import type { Component } from 'vue'
 import {
   ArrowLeftRight,
   ArrowUpDown,
+  Brain,
   Crop,
+  Download,
   Expand,
   FileCog,
+  FolderCog,
   FolderInput,
   FolderOpen,
   Loader2,
   Maximize2,
+  Pause,
+  Play,
   RefreshCw,
   RotateCcw,
   Settings2,
+  Trash2,
   Undo2,
+  Wand2,
+  Zap,
 } from 'lucide-vue-next'
+import ConfirmDialog from './ConfirmDialog.vue'
 import type { ConfigDirStatus, SettingsStorage } from '../composables/useSettings'
 import type { ConfigLocation } from '../core/configApi'
+import { formatFileSize } from '../core/image'
+import { isModelBusy } from '../core/modelApi'
+import type { AiModelId, ModelStatus, ModelsSnapshot } from '../core/modelApi'
 import {
+  HEAL_ENGINE_OPTIONS,
   THUMBNAIL_FIT_OPTIONS,
   THUMBNAIL_ORIENTATION_OPTIONS,
   THUMBNAIL_SIZE_OPTIONS,
 } from '../core/settings'
 import type {
+  HealEngine,
   ThumbnailFit,
   ThumbnailOrientation,
   ThumbnailSize,
@@ -38,6 +53,12 @@ const props = defineProps<{
   saveError: string
   isMovingDir: boolean
   dirStatus: ConfigDirStatus | null
+  /** 是否在 EXE 版里运行：只有这时才能下载和使用 AI 模型 */
+  modelsAvailable: boolean
+  models: ModelsSnapshot | null
+  modelsLoadError: string
+  modelsBusy: boolean
+  modelsStatus: ConfigDirStatus | null
 }>()
 
 const emit = defineEmits<{
@@ -46,6 +67,12 @@ const emit = defineEmits<{
   'change-dir': []
   'reset-dir': []
   'open-dir': []
+  'download-model': [id: AiModelId]
+  'pause-model': [id: AiModelId]
+  'delete-model': [id: AiModelId]
+  'change-models-dir': []
+  'reset-models-dir': []
+  'open-models-dir': []
 }>()
 
 const titleRef = ref<HTMLElement | null>(null)
@@ -104,6 +131,157 @@ const configStatus = computed<ConfigDirStatus | null>(
     return null
   },
 )
+
+const engineIcons: Record<HealEngine, Component> = {
+  classic: Wand2,
+  migan: Zap,
+  lama: Brain,
+}
+
+const aiOptions = HEAL_ENGINE_OPTIONS.filter((option) => isAiEngine(option.value))
+
+/** 要用户确认下载 / 删除的模型；null 表示没有打开确认框。 */
+const pendingDownload = ref<AiModelId | null>(null)
+const pendingDelete = ref<AiModelId | null>(null)
+
+function isAiEngine(value: HealEngine): value is AiModelId {
+  return value !== 'classic'
+}
+
+function engineLabel(value: HealEngine): string {
+  return HEAL_ENGINE_OPTIONS.find((option) => option.value === value)?.label ?? value
+}
+
+function modelStatus(id: AiModelId): ModelStatus | null {
+  return props.models?.items.find((item) => item.id === id) ?? null
+}
+
+function percentOf(status: ModelStatus | null): number {
+  return status && status.total > 0 ? Math.floor((status.downloaded / status.total) * 100) : 0
+}
+
+function remainingOf(status: ModelStatus): number {
+  return Math.max(0, status.total - status.downloaded)
+}
+
+function modelStateText(status: ModelStatus | null): string {
+  if (!props.modelsAvailable) {
+    return '仅免安装 EXE 版可用'
+  }
+  if (!status) {
+    return props.modelsLoadError ? `读不到模型状态：${props.modelsLoadError}` : '正在读取模型状态…'
+  }
+  const progress = `${formatFileSize(status.downloaded)} / ${formatFileSize(status.total)}`
+  switch (status.state) {
+    case 'missing':
+      return status.downloaded > 0
+        ? `未下载，需 ${formatFileSize(remainingOf(status))}（运行库已就绪）`
+        : `未下载，需 ${formatFileSize(remainingOf(status))}`
+    case 'queued':
+      return '排队中，等前一个模型下完'
+    case 'downloading':
+      return `下载中 ${percentOf(status)}% · ${progress}`
+    case 'verifying':
+      return '下载完成，正在校验文件…'
+    case 'paused':
+      return `已暂停 ${percentOf(status)}% · ${progress}`
+    case 'ready':
+      return '已下载，可以使用'
+    case 'error':
+      return `下载失败：${status.error}`
+  }
+}
+
+const healSummary = computed(() => {
+  const engine = props.settings.healEngine
+  if (!isAiEngine(engine)) {
+    return engineLabel(engine)
+  }
+  return modelStatus(engine)?.state === 'ready'
+    ? engineLabel(engine)
+    : `${engineLabel(engine)}（模型未就绪，暂用经典算法）`
+})
+
+const modelsDirStatus = computed<ConfigDirStatus | null>(() => {
+  if (props.modelsStatus) {
+    return props.modelsStatus
+  }
+  return props.modelsLoadError
+    ? { tone: 'error', text: `读不到模型状态：${props.modelsLoadError}` }
+    : null
+})
+
+const downloadPrompt = computed(() => {
+  const id = pendingDownload.value
+  const status = id ? modelStatus(id) : null
+  if (!id || !status) {
+    return { title: '', description: '' }
+  }
+  const label = engineLabel(id)
+  const resume = status.modelDownloaded > 0 ? '，会接着上次的进度继续' : ''
+  const runtimeReady = status.downloaded - status.modelDownloaded >= status.runtimeSize
+  const parts = runtimeReady
+    ? `模型 ${formatFileSize(status.modelSize)}；运行库已就绪`
+    : `模型 ${formatFileSize(status.modelSize)}，另需运行库 ${formatFileSize(status.runtimeSize)}，两个 AI 模型共用`
+  return {
+    title: `下载 ${label}？`,
+    description:
+      `使用 ${label} 需要先下载约 ${formatFileSize(remainingOf(status))}${resume}（${parts}），` +
+      `保存到 ${props.models?.dir ?? '模型目录'}。下载期间修瑕先用经典算法，下完自动改用 ${label}；可随时暂停或删除。`,
+  }
+})
+
+const deletePrompt = computed(() => {
+  const id = pendingDelete.value
+  const status = id ? modelStatus(id) : null
+  if (!id || !status) {
+    return { title: '', description: '' }
+  }
+  const label = engineLabel(id)
+  const current = props.settings.healEngine === id ? '当前选用的就是它，删除后修瑕改用经典算法。' : ''
+  return {
+    title: `删除 ${label} 模型？`,
+    description: `将删除模型文件 ${formatFileSize(status.modelDownloaded)}（含下了一半的部分；运行库另一个 AI 模型还在用时保留），之后再用需要重新下载。${current}`,
+  }
+})
+
+function selectEngine(value: HealEngine): void {
+  if (!isAiEngine(value)) {
+    emit('update', { healEngine: value })
+    return
+  }
+  if (!props.modelsAvailable) {
+    return
+  }
+  const status = modelStatus(value)
+  if (status && (status.state === 'ready' || isModelBusy(status.state))) {
+    emit('update', { healEngine: value })
+    return
+  }
+  // 模型还没下完：先问是否下载，同意后再切换。
+  pendingDownload.value = value
+}
+
+function confirmDownload(): void {
+  const id = pendingDownload.value
+  pendingDownload.value = null
+  if (id) {
+    emit('update', { healEngine: id })
+    emit('download-model', id)
+  }
+}
+
+function confirmDelete(): void {
+  const id = pendingDelete.value
+  pendingDelete.value = null
+  if (!id) {
+    return
+  }
+  if (props.settings.healEngine === id) {
+    emit('update', { healEngine: 'classic' })
+  }
+  emit('delete-model', id)
+}
 
 function focusTitle(): void {
   titleRef.value?.focus()
@@ -235,11 +413,213 @@ defineExpose({ focusTitle })
       </div>
     </section>
 
+    <section class="settings-card" aria-labelledby="heal-settings-title">
+      <header class="settings-card__head">
+        <div>
+          <h3 id="heal-settings-title">局部修瑕</h3>
+          <p>涂抹要去掉的物体后，按这里选的方式补全被挡住的内容。AI 模型下载一次后离线使用，图片不会上传。</p>
+        </div>
+        <span class="settings-summary">{{ healSummary }}</span>
+      </header>
+
+      <div class="setting-block">
+        <div class="setting-label">
+          <h4>补全方式</h4>
+          <p>三种方式各有长处和代价，可按画面选择，随时可以换。选了 AI 但模型还没下完时，修瑕先用经典算法。</p>
+        </div>
+        <div class="settings-choices settings-choices--three" role="group" aria-label="局部修瑕补全方式">
+          <button
+            v-for="option in HEAL_ENGINE_OPTIONS"
+            :key="option.value"
+            class="settings-choice engine-choice"
+            :class="{ 'is-selected': settings.healEngine === option.value }"
+            type="button"
+            :aria-pressed="settings.healEngine === option.value"
+            :disabled="isAiEngine(option.value) && !modelsAvailable"
+            @click="selectEngine(option.value)"
+          >
+            <span class="engine-choice__head">
+              <component :is="engineIcons[option.value]" :size="17" :stroke-width="1.8" />
+              <span class="engine-choice__name">{{ option.label }}</span>
+              <span class="engine-choice__tag">{{ option.tag }}</span>
+            </span>
+            <small>{{ option.summary }}</small>
+            <span class="engine-points">
+              <span
+                v-for="point in option.strengths"
+                :key="point"
+                class="engine-point engine-point--strength"
+              >
+                {{ point }}
+              </span>
+              <span
+                v-for="point in option.limits"
+                :key="point"
+                class="engine-point engine-point--limit"
+              >
+                {{ point }}
+              </span>
+            </span>
+            <span
+              v-if="isAiEngine(option.value)"
+              class="engine-choice__state"
+              :class="{ 'is-ready': modelStatus(option.value)?.state === 'ready' }"
+            >
+              {{ modelStateText(modelStatus(option.value)) }}
+            </span>
+          </button>
+        </div>
+      </div>
+
+      <div class="setting-block">
+        <div class="setting-label">
+          <h4>AI 模型下载</h4>
+          <p>由本机程序下载，可暂停后接着下；下完按 SHA-256 校验，内容与官方发布一致才会启用。</p>
+        </div>
+        <div v-if="modelsAvailable" class="model-list">
+          <div v-for="option in aiOptions" :key="option.value" class="model-row">
+            <div class="model-row__info">
+              <span class="model-row__name">{{ option.label }}</span>
+              <span
+                class="model-row__state"
+                :class="{ 'is-error': modelStatus(option.value as AiModelId)?.state === 'error' }"
+              >
+                {{ modelStateText(modelStatus(option.value as AiModelId)) }}
+              </span>
+            </div>
+            <div
+              v-if="(modelStatus(option.value as AiModelId)?.state ?? 'missing') !== 'missing'"
+              class="model-progress"
+              role="progressbar"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              :aria-valuenow="percentOf(modelStatus(option.value as AiModelId))"
+              :aria-label="`${option.label} 下载进度`"
+              :style="{ '--model-progress': `${percentOf(modelStatus(option.value as AiModelId))}%` }"
+            >
+              <span class="model-progress__bar" />
+            </div>
+            <div v-if="modelStatus(option.value as AiModelId)" class="model-row__actions">
+              <template v-for="status in [modelStatus(option.value as AiModelId)!]" :key="status.id">
+                <button
+                  v-if="status.state === 'downloading' || status.state === 'queued'"
+                  class="button button-secondary"
+                  type="button"
+                  :disabled="modelsBusy"
+                  @click="emit('pause-model', status.id)"
+                >
+                  <Pause :size="14" :stroke-width="1.9" />
+                  暂停
+                </button>
+                <button
+                  v-else-if="status.state === 'paused'"
+                  class="button button-secondary"
+                  type="button"
+                  :disabled="modelsBusy"
+                  @click="emit('download-model', status.id)"
+                >
+                  <Play :size="14" :stroke-width="1.9" />
+                  继续下载
+                </button>
+                <button
+                  v-else-if="status.state === 'missing' || status.state === 'error'"
+                  class="button button-secondary"
+                  type="button"
+                  :disabled="modelsBusy"
+                  @click="emit('download-model', status.id)"
+                >
+                  <Download :size="14" :stroke-width="1.9" />
+                  {{ status.state === 'error' ? '重新下载' : '下载' }}
+                </button>
+                <button
+                  v-if="status.modelDownloaded > 0 && status.state !== 'verifying'"
+                  class="button button-secondary"
+                  type="button"
+                  :disabled="modelsBusy"
+                  @click="pendingDelete = status.id"
+                >
+                  <Trash2 :size="14" :stroke-width="1.9" />
+                  删除
+                </button>
+              </template>
+            </div>
+          </div>
+        </div>
+        <p v-else class="config-note">
+          当前以浏览器页面运行。AI 模型由免安装 EXE 版的本机程序下载和提供，在这里只能使用经典算法。
+        </p>
+      </div>
+
+      <div class="setting-block setting-block--last">
+        <div class="setting-label">
+          <h4>模型目录</h4>
+          <p>默认放在程序所在目录的 models 文件夹；更改后会把已下载的模型一起移过去。下载进行中不能更改。</p>
+        </div>
+        <div v-if="modelsAvailable && models" class="config-location">
+          <div class="config-path">
+            <FolderCog :size="15" :stroke-width="1.8" aria-hidden="true" />
+            <span class="config-path__text">{{ models.dir }}</span>
+          </div>
+          <div class="config-actions">
+            <button
+              class="button button-secondary"
+              type="button"
+              :disabled="modelsBusy"
+              @click="emit('change-models-dir')"
+            >
+              <Loader2 v-if="modelsBusy" class="spin" :size="14" :stroke-width="1.9" />
+              <FolderInput v-else :size="14" :stroke-width="1.9" />
+              更改目录…
+            </button>
+            <button
+              class="button button-secondary"
+              type="button"
+              :disabled="modelsBusy"
+              @click="emit('open-models-dir')"
+            >
+              <FolderOpen :size="14" :stroke-width="1.9" />
+              打开目录
+            </button>
+            <button
+              v-if="!models.isDefault"
+              class="button button-secondary"
+              type="button"
+              :disabled="modelsBusy"
+              @click="emit('reset-models-dir')"
+            >
+              <Undo2 :size="14" :stroke-width="1.9" />
+              移回程序目录
+            </button>
+          </div>
+          <p
+            v-if="modelsDirStatus"
+            class="config-status"
+            :class="`config-status--${modelsDirStatus.tone}`"
+            role="status"
+          >
+            {{ modelsDirStatus.text }}
+          </p>
+        </div>
+        <div v-else class="config-location">
+          <p v-if="!modelsAvailable" class="config-note">只有免安装 EXE 版会下载模型，浏览器页面没有模型目录。</p>
+          <p
+            v-else-if="modelsDirStatus"
+            class="config-status"
+            :class="`config-status--${modelsDirStatus.tone}`"
+            role="status"
+          >
+            {{ modelsDirStatus.text }}
+          </p>
+          <p v-else class="config-note">正在读取模型目录…</p>
+        </div>
+      </div>
+    </section>
+
     <section class="settings-card" aria-labelledby="config-settings-title">
       <header class="settings-card__head">
         <div>
           <h3 id="config-settings-title">配置文件</h3>
-          <p>缩略图设置、拼接间距，以及预览面板（标注栏、缩放栏、空白页面板、缩略图）的位置与显示状态都保存在这里。</p>
+          <p>缩略图设置、拼接间距、修瑕补全方式，以及预览面板（标注栏、缩放栏、空白页面板、缩略图）的位置与显示状态都保存在这里；AI 模型文件放在上面的模型目录里。</p>
         </div>
         <span class="settings-summary">{{ configSummary }}</span>
       </header>
@@ -314,7 +694,7 @@ defineExpose({ focusTitle })
 
     <footer class="settings-footer">
       <p v-if="isFileStorage">
-        设置自动保存到配置文件。恢复默认会同时重置拼接间距和预览面板的位置与显示状态，不改变配置目录。
+        设置自动保存到配置文件。恢复默认会同时重置拼接间距、修瑕补全方式和预览面板的位置与显示状态，不改变配置目录，也不删除已下载的模型。
       </p>
       <p v-else>
         设置自动保存在本机浏览器，换浏览器或清除站点数据后会恢复默认。恢复默认会同时重置拼接间距和预览面板的位置与显示状态。
@@ -324,6 +704,24 @@ defineExpose({ focusTitle })
         恢复默认设置
       </button>
     </footer>
+
+    <ConfirmDialog
+      :open="pendingDownload !== null"
+      tone="download"
+      :title="downloadPrompt.title"
+      :description="downloadPrompt.description"
+      confirm-label="下载并使用"
+      @confirm="confirmDownload"
+      @cancel="pendingDownload = null"
+    />
+    <ConfirmDialog
+      :open="pendingDelete !== null"
+      :title="deletePrompt.title"
+      :description="deletePrompt.description"
+      confirm-label="删除模型"
+      @confirm="confirmDelete"
+      @cancel="pendingDelete = null"
+    />
   </section>
 </template>
 
@@ -527,6 +925,165 @@ defineExpose({ focusTitle })
   font-size: 10px;
   font-weight: 450;
   line-height: 1.45;
+}
+
+.settings-choice:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.settings-choice:disabled:hover {
+  border-color: var(--border);
+  background: var(--surface-subtle);
+}
+
+.engine-choice {
+  gap: 7px;
+}
+
+.engine-choice__head {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 6px;
+}
+
+.engine-choice__head > svg {
+  flex: 0 0 auto;
+  color: var(--accent-ink);
+}
+
+.engine-choice__name {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.engine-choice__tag {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 9.5px;
+  font-weight: 600;
+}
+
+.engine-points {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 7px;
+  border-top: 1px dashed var(--border);
+}
+
+/* 长处与代价用 + / − 前缀区分，不只靠颜色。 */
+.engine-point {
+  position: relative;
+  padding-left: 13px;
+  color: var(--text);
+  font-size: 10.5px;
+  font-weight: 450;
+  line-height: 1.5;
+}
+
+.engine-point::before {
+  position: absolute;
+  left: 0;
+  font-weight: 700;
+}
+
+.engine-point--strength::before {
+  content: '+';
+  color: var(--success);
+}
+
+.engine-point--limit {
+  color: var(--text-muted);
+}
+
+.engine-point--limit::before {
+  content: '−';
+  color: var(--text-faint);
+}
+
+.engine-choice__state {
+  margin-top: auto;
+  padding-top: 2px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.engine-choice__state.is-ready {
+  color: var(--success);
+}
+
+.model-list {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.model-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px 14px;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-subtle);
+}
+
+.model-row__info {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.model-row__name {
+  color: var(--text-strong);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.model-row__state {
+  color: var(--text-muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.model-row__state.is-error {
+  color: var(--danger);
+}
+
+.model-row__actions {
+  display: flex;
+  grid-column: 2;
+  grid-row: 1;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.model-progress {
+  grid-column: 1 / -1;
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--border);
+}
+
+.model-progress__bar {
+  display: block;
+  width: var(--model-progress, 0%);
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.3s var(--ease);
 }
 
 .settings-choice--size {
@@ -748,6 +1305,16 @@ defineExpose({ focusTitle })
 
   .settings-choice--fit {
     align-items: center;
+  }
+
+  .model-row {
+    grid-template-columns: 1fr;
+  }
+
+  .model-row__actions {
+    grid-column: 1;
+    grid-row: auto;
+    justify-content: flex-start;
   }
 
   .settings-footer {
