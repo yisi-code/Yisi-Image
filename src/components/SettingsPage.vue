@@ -1,7 +1,20 @@
+<script lang="ts">
+import { ref } from 'vue'
+
+type SettingsCategory = 'thumbnail' | 'heal' | 'config'
+
+/**
+ * 当前选中的设置分类。放在模块级：返回拼接时设置页会卸载，再进设置仍停在上次看的分类；
+ * 重新打开程序回到第一个分类。它只是界面状态，不写进配置文件。
+ */
+const activeCategory = ref<SettingsCategory>('thumbnail')
+</script>
+
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import type { Component } from 'vue'
+import { computed } from 'vue'
+import type { Component, ComponentPublicInstance } from 'vue'
 import {
+  AlertTriangle,
   ArrowLeftRight,
   ArrowUpDown,
   Brain,
@@ -12,6 +25,7 @@ import {
   FolderCog,
   FolderInput,
   FolderOpen,
+  GalleryThumbnails,
   Loader2,
   Maximize2,
   Pause,
@@ -76,6 +90,16 @@ const emit = defineEmits<{
 }>()
 
 const titleRef = ref<HTMLElement | null>(null)
+
+/** 分类与原来的三张卡一一对应、顺序不变；恢复默认作用于全部分类，留在页脚。 */
+const categories: { key: SettingsCategory; label: string; icon: Component }[] = [
+  { key: 'thumbnail', label: '预览缩略图', icon: GalleryThumbnails },
+  { key: 'heal', label: '局部修瑕', icon: Wand2 },
+  { key: 'config', label: '配置文件', icon: FileCog },
+]
+
+/** 方向键切换分类后把焦点移到新页签。 */
+const tabButtons = new Map<SettingsCategory, HTMLButtonElement>()
 
 const orientationMeta: Record<
   ThumbnailOrientation,
@@ -211,6 +235,15 @@ const modelsDirStatus = computed<ConfigDirStatus | null>(() => {
     : null
 })
 
+/** 有错误的分类在页签上标出来：停在别的分类时，也能看到配置没保存上、模型下载失败。 */
+const categoryAlerts = computed<Record<SettingsCategory, boolean>>(() => ({
+  thumbnail: false,
+  heal:
+    modelsDirStatus.value?.tone === 'error' ||
+    (props.models?.items.some((item) => item.state === 'error') ?? false),
+  config: configStatus.value?.tone === 'error',
+}))
+
 const downloadPrompt = computed(() => {
   const id = pendingDownload.value
   const status = id ? modelStatus(id) : null
@@ -287,6 +320,41 @@ function focusTitle(): void {
   titleRef.value?.focus()
 }
 
+function setTabButton(key: SettingsCategory, el: Element | ComponentPublicInstance | null): void {
+  if (el instanceof HTMLButtonElement) {
+    tabButtons.set(key, el)
+  } else {
+    tabButtons.delete(key)
+  }
+}
+
+/** 页签的键盘操作：左右方向键循环切换，Home / End 跳到首尾。 */
+function onTabKeydown(event: KeyboardEvent): void {
+  const count = categories.length
+  const index = categories.findIndex((category) => category.key === activeCategory.value)
+  let next: number
+  switch (event.key) {
+    case 'ArrowRight':
+      next = (index + 1) % count
+      break
+    case 'ArrowLeft':
+      next = (index - 1 + count) % count
+      break
+    case 'Home':
+      next = 0
+      break
+    case 'End':
+      next = count - 1
+      break
+    default:
+      return
+  }
+  event.preventDefault()
+  const key = categories[next].key
+  activeCategory.value = key
+  tabButtons.get(key)?.focus()
+}
+
 function selectOrientation(value: ThumbnailOrientation): void {
   emit('update', { thumbnailOrientation: value })
 }
@@ -314,15 +382,55 @@ defineExpose({ focusTitle })
           <span class="settings-pill">仅本机</span>
         </div>
         <p v-if="isFileStorage">
-          调整预览缩略图的方向、大小和图片显示方式。设置会自动保存到配置文件（默认在程序所在目录），不影响导出的原图。
+          按类别调整预览缩略图、局部修瑕的补全方式与 AI 模型，以及配置文件的位置。设置会自动保存到配置文件（默认在程序所在目录），不影响导出的原图。
         </p>
         <p v-else>
-          调整预览缩略图的方向、大小和图片显示方式。设置会自动保存在当前浏览器，不影响导出的原图。
+          按类别调整预览缩略图和局部修瑕的补全方式。设置会自动保存在当前浏览器，不影响导出的原图。
         </p>
       </div>
     </header>
 
-    <section class="settings-card" aria-labelledby="thumbnail-settings-title">
+    <div
+      class="segmented settings-tabs"
+      role="tablist"
+      aria-label="设置分类"
+      @keydown="onTabKeydown"
+    >
+      <button
+        v-for="category in categories"
+        :id="`settings-tab-${category.key}`"
+        :key="category.key"
+        :ref="(el) => setTabButton(category.key, el)"
+        class="segment settings-tab"
+        :class="{ 'is-active': activeCategory === category.key }"
+        type="button"
+        role="tab"
+        :aria-selected="activeCategory === category.key"
+        :aria-controls="`settings-panel-${category.key}`"
+        :tabindex="activeCategory === category.key ? 0 : -1"
+        @click="activeCategory = category.key"
+      >
+        <component :is="category.icon" :size="15" :stroke-width="1.8" aria-hidden="true" />
+        <span>{{ category.label }}</span>
+        <template v-if="categoryAlerts[category.key]">
+          <AlertTriangle
+            class="settings-tab__alert"
+            :size="13"
+            :stroke-width="2"
+            aria-hidden="true"
+          />
+          <span class="sr-only">（有错误）</span>
+        </template>
+      </button>
+    </div>
+
+    <section
+      v-show="activeCategory === 'thumbnail'"
+      id="settings-panel-thumbnail"
+      class="settings-card"
+      role="tabpanel"
+      aria-labelledby="settings-tab-thumbnail"
+    >
       <header class="settings-card__head">
         <div>
           <h3 id="thumbnail-settings-title">预览缩略图</h3>
@@ -413,7 +521,13 @@ defineExpose({ focusTitle })
       </div>
     </section>
 
-    <section class="settings-card" aria-labelledby="heal-settings-title">
+    <section
+      v-show="activeCategory === 'heal'"
+      id="settings-panel-heal"
+      class="settings-card"
+      role="tabpanel"
+      aria-labelledby="settings-tab-heal"
+    >
       <header class="settings-card__head">
         <div>
           <h3 id="heal-settings-title">局部修瑕</h3>
@@ -615,11 +729,17 @@ defineExpose({ focusTitle })
       </div>
     </section>
 
-    <section class="settings-card" aria-labelledby="config-settings-title">
+    <section
+      v-show="activeCategory === 'config'"
+      id="settings-panel-config"
+      class="settings-card"
+      role="tabpanel"
+      aria-labelledby="settings-tab-config"
+    >
       <header class="settings-card__head">
         <div>
           <h3 id="config-settings-title">配置文件</h3>
-          <p>缩略图设置、拼接间距、修瑕补全方式，以及预览面板（标注栏、缩放栏、空白页面板、缩略图）的位置与显示状态都保存在这里；AI 模型文件放在上面的模型目录里。</p>
+          <p>缩略图设置、拼接间距、修瑕补全方式，以及预览面板（标注栏、缩放栏、空白页面板、缩略图）的位置与显示状态都保存在这里；AI 模型文件放在「局部修瑕」分类的模型目录里。</p>
         </div>
         <span class="settings-summary">{{ configSummary }}</span>
       </header>
@@ -802,8 +922,30 @@ defineExpose({ focusTitle })
   line-height: 1.75;
 }
 
-.settings-card {
+/* 分类页签：外观用 base.css 的分段控件，这里只管位置与宽度；分类再多时横向滚动，不换行。 */
+.settings-tabs {
+  width: fit-content;
+  max-width: 100%;
   margin-top: 16px;
+  overflow-x: auto;
+}
+
+.settings-tab {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* 外侧焦点框会被横向滚动的容器裁掉，改画在页签里面。 */
+.settings-tab:focus-visible {
+  outline-offset: -2px;
+}
+
+.settings-tab__alert {
+  color: var(--danger);
+}
+
+.settings-card {
+  margin-top: 12px;
   padding: 22px 24px;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -1298,6 +1440,14 @@ defineExpose({ focusTitle })
     padding: 18px;
   }
 
+  .settings-tabs {
+    width: 100%;
+  }
+
+  .settings-tab {
+    flex: 1 0 0;
+  }
+
   .settings-choices--three,
   .settings-choices--fit {
     grid-template-columns: 1fr;
@@ -1336,6 +1486,10 @@ defineExpose({ focusTitle })
 
   .settings-hero h2 {
     font-size: 21px;
+  }
+
+  .settings-tab {
+    padding: 0 6px;
   }
 }
 </style>

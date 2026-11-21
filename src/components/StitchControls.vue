@@ -193,49 +193,6 @@ function onRangeInput(event: Event): void {
   line-height: 1.2;
 }
 
-.segmented {
-  display: flex;
-  gap: 2px;
-  padding: 3px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 9px;
-  background: var(--surface-inset);
-}
-
-.segment {
-  display: flex;
-  height: 30px;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  padding: 0 12px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  color: var(--text-muted);
-  font-size: 11.5px;
-  font-weight: 600;
-  transition:
-    background-color 0.15s var(--ease),
-    color 0.15s var(--ease),
-    box-shadow 0.15s var(--ease);
-}
-
-.segment:hover:not(.is-active):not(:disabled) {
-  color: var(--text);
-}
-
-.segment:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-.segment.is-active {
-  border-color: var(--border);
-  background: var(--surface);
-  color: var(--text-strong);
-  box-shadow: var(--shadow-xs);
-}
-
 .control-divider {
   width: 1px;
   height: 36px;

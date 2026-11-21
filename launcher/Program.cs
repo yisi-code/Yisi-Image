@@ -16,8 +16,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("本地多图拼接工具")]
 [assembly: AssemblyProduct("Yisi 图像工具")]
 [assembly: AssemblyCompany("Yisi")]
-[assembly: AssemblyVersion("0.11.0.0")]
-[assembly: AssemblyFileVersion("0.11.0.0")]
+[assembly: AssemblyVersion("0.11.1.0")]
+[assembly: AssemblyFileVersion("0.11.1.0")]
 
 namespace Yisi.ImageTool
 {

@@ -96,7 +96,7 @@ const healEngineChoice = computed<HealEngineChoice>(() => {
   } else if (isModelBusy(status.state) && status.total > 0) {
     reason = `模型还在下载（${Math.floor((status.downloaded / status.total) * 100)}%）`
   }
-  return { kind: 'classic', notice: `${label} ${reason}，这次用经典算法；可在设置里查看下载` }
+  return { kind: 'classic', notice: `${label} ${reason}，这次用经典算法；可在「设置 · 局部修瑕」里查看下载` }
 })
 
 const direction = ref<StitchDirection>('vertical')
@@ -158,7 +158,7 @@ watch(
       push({
         tone: 'error',
         title: '设置未能保存',
-        message: `${message}。可在「设置」里更换配置目录。`,
+        message: `${message}。可在「设置 · 配置文件」里更换配置目录。`,
       })
     }
   },
@@ -552,7 +552,7 @@ async function handleExport(): Promise<void> {
             ref="settingsButtonRef"
             class="button button-secondary header-page-button header-page-button--collapse"
             type="button"
-            title="调整缩略图方向、大小与显示方式"
+            title="调整预览缩略图、局部修瑕与配置文件"
             aria-label="设置"
             @click="openSettings"
           >
