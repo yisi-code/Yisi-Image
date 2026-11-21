@@ -20,6 +20,7 @@ import {
   Settings2,
   ShieldCheck,
   SlidersHorizontal,
+  Star,
   UserRound,
   ZoomIn,
 } from 'lucide-vue-next'
@@ -42,12 +43,14 @@ const projectLinks = [
     name: 'GitHub',
     handle: 'yisi-code/Yisi-Image',
     url: 'https://github.com/yisi-code/Yisi-Image',
+    issuesUrl: 'https://github.com/yisi-code/Yisi-Image/issues',
     icon: Github,
   },
   {
     name: 'Gitee',
     handle: 'yisi-code/yisi-image',
     url: 'https://gitee.com/yisi-code/yisi-image',
+    issuesUrl: 'https://gitee.com/yisi-code/yisi-image/issues',
     icon: GitBranch,
   },
 ]
@@ -223,7 +226,7 @@ defineExpose({ focusTitle })
         <h3 id="about-update-title">软件更新</h3>
         <span class="about-update-badge">自动检查已开启</span>
       </div>
-      <p class="about-update-copy">
+      <p class="about-section-copy">
         启动后自动检查更新，最多每 24 小时一次。下载会显示进度并校验 SHA-256，
         通过后由安装器替换并重启；浏览器页面不能直接覆盖 EXE。
       </p>
@@ -278,6 +281,20 @@ defineExpose({ focusTitle })
 
     <section class="about-section" aria-labelledby="about-contact-title">
       <h3 id="about-contact-title">项目与联系</h3>
+      <div class="about-support">
+        <p class="about-section-copy">
+          <Star class="about-support-star" :size="12" :stroke-width="2" aria-hidden="true" />
+          觉得好用，欢迎到 GitHub 或 Gitee 给项目点个 Star。点星的人多了，才更有动力继续开发更多功能。
+        </p>
+        <p class="about-section-copy">
+          有需求或想法，可以在
+          <template v-for="(project, index) in projectLinks" :key="project.name">
+            <template v-if="index > 0"> 或 </template>
+            <a :href="project.issuesUrl" target="_blank" rel="noreferrer">{{ project.name }} Issues</a>
+          </template>
+          提问题，也可以通过下方的联系方式直接联系我。
+        </p>
+      </div>
       <div class="about-projects">
         <a
           v-for="project in projectLinks"
@@ -499,12 +516,14 @@ defineExpose({ focusTitle })
   white-space: nowrap;
 }
 
-.about-fact dd a {
+.about-fact dd a,
+.about-section-copy a {
   color: var(--accent-ink);
   text-decoration: none;
 }
 
-.about-fact dd a:hover {
+.about-fact dd a:hover,
+.about-section-copy a:hover {
   text-decoration: underline;
 }
 
@@ -531,11 +550,30 @@ defineExpose({ focusTitle })
   font-weight: 600;
 }
 
-.about-update-copy {
+/* 分区里的说明文字：软件更新、项目与联系共用这一种写法。 */
+.about-section-copy {
   max-width: 760px;
   color: var(--text-muted);
   font-size: 11.5px;
   line-height: 1.7;
+}
+
+.about-support {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 12px;
+}
+
+/* 灰色说明文字里的链接只靠颜色区分不明显，加粗一档让人一眼看出能点。 */
+.about-section-copy a {
+  font-weight: 600;
+}
+
+.about-support-star {
+  margin-right: 4px;
+  color: var(--accent);
+  vertical-align: -2px;
 }
 
 .about-update-actions {
