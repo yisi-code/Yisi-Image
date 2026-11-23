@@ -71,7 +71,7 @@ export interface StitchImage {
 
 /**
  * 对原图做的整体处理（目前只有清晰化）。结果画布替代原图参与预览、导出和修瑕取样，
- * 原图文件不变；对比视图里「原图」一侧仍画 element。
+ * 原图文件不变；对比视图里「原图」一侧仍画 element。结果画布可能比原图大（见 resolution）。
  */
 export interface ImageEnhance {
   /** 用哪种方式清晰化的 */
@@ -80,6 +80,13 @@ export interface ImageEnhance {
   sharpen: SharpenSettings
   /** AI 清晰化的等级；经典锐化时为空 */
   aiLevel?: AiSharpenLevel
+  /** AI 清晰化用的模型编号；经典锐化时为空 */
+  model?: string
+  /**
+   * 结果画布是原图的几倍：经典锐化恒为 1；AI 可保留 2 倍、4 倍细节，
+   * 图片在画布上的大小不变，导出时把尺寸放大才用得上。
+   */
+  resolution: number
   canvas: HTMLCanvasElement
 }
 

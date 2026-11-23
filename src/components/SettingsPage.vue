@@ -36,12 +36,14 @@ import {
   Zap,
 } from 'lucide-vue-next'
 import ConfirmDialog from './ConfirmDialog.vue'
+import CustomModelRow from './CustomModelRow.vue'
 import ModelRow from './ModelRow.vue'
 import type { ConfigDirStatus, SettingsStorage } from '../composables/useSettings'
 import type { ConfigLocation } from '../core/configApi'
 import { formatFileSize } from '../core/image'
 import { isModelBusy } from '../core/modelApi'
-import type { HealModelId, ModelId, ModelStatus, ModelsSnapshot, SharpenModelId } from '../core/modelApi'
+import type { CustomModel, HealModelId, ModelId, ModelStatus, ModelsSnapshot } from '../core/modelApi'
+import { BUILTIN_SHARPEN_MODELS, findBuiltinSharpenModel } from '../core/sharpenModels'
 import {
   HEAL_ENGINE_OPTIONS,
   SHARPEN_ENGINE_OPTIONS,
@@ -87,6 +89,9 @@ const emit = defineEmits<{
   'change-models-dir': []
   'reset-models-dir': []
   'open-models-dir': []
+  'import-custom-model': []
+  'rename-custom-model': [id: string, name: string]
+  'delete-custom-model': [id: string]
 }>()
 
 const titleRef = ref<HTMLElement | null>(null)
@@ -165,21 +170,17 @@ const engineIcons: Record<HealEngine, Component> = {
 
 const sharpenIcons: Record<SharpenEngine, Component> = {
   classic: Sparkles,
-  realesrgan: Brain,
+  ai: Brain,
 }
 
 const aiOptions = HEAL_ENGINE_OPTIONS.filter((option) => isAiEngine(option.value))
-const sharpenAiOptions = SHARPEN_ENGINE_OPTIONS.filter((option) => isAiSharpen(option.value))
 
 /** 要用户确认下载 / 删除的模型；null 表示没有打开确认框。 */
 const pendingDownload = ref<ModelId | null>(null)
 const pendingDelete = ref<ModelId | null>(null)
+const pendingCustomDelete = ref<CustomModel | null>(null)
 
 function isAiEngine(value: HealEngine): value is HealModelId {
-  return value !== 'classic'
-}
-
-function isAiSharpen(value: SharpenEngine): value is SharpenModelId {
   return value !== 'classic'
 }
 
@@ -191,12 +192,28 @@ function engineLabel(value: HealEngine): string {
   return HEAL_ENGINE_OPTIONS.find((option) => option.value === value)?.label ?? value
 }
 
-function sharpenLabel(value: SharpenEngine): string {
-  return SHARPEN_ENGINE_OPTIONS.find((option) => option.value === value)?.label ?? value
+function modelLabel(id: ModelId): string {
+  return isHealModel(id) ? engineLabel(id) : `AI · ${findBuiltinSharpenModel(id)?.label ?? id}`
 }
 
-function modelLabel(id: ModelId): string {
-  return isHealModel(id) ? engineLabel(id) : sharpenLabel(id)
+/** 清晰化默认模型的名字：内置模型或自定义模型。 */
+function sharpenModelLabel(key: string): string {
+  return (
+    findBuiltinSharpenModel(key)?.label ??
+    props.models?.custom.find((model) => model.id === key)?.name ??
+    '未选择'
+  )
+}
+
+/** 自定义模型能不能用：要有共用的运行库、文件还在。 */
+function customStateText(model: CustomModel): { text: string; error: boolean } {
+  if (!model.available) {
+    return { text: '文件不见了，请重新导入', error: true }
+  }
+  if (!props.models?.runtimeReady) {
+    return { text: '缺 AI 运行库：先下载上面的内置模型，运行库会一起下载', error: true }
+  }
+  return { text: '可以使用，第一次用时会自动识别放大倍数', error: false }
 }
 
 /** 模型用在哪：修瑕或清晰化；提示文案按它说。 */
@@ -254,15 +271,11 @@ const healSummary = computed(() => {
     : `${engineLabel(engine)}（模型未就绪，暂用经典算法）`
 })
 
-const sharpenSummary = computed(() => {
-  const engine = props.settings.sharpenEngine
-  if (!isAiSharpen(engine)) {
-    return sharpenLabel(engine)
-  }
-  return modelStatus(engine)?.state === 'ready'
-    ? sharpenLabel(engine)
-    : `${sharpenLabel(engine)}（模型未就绪，暂不能用）`
-})
+const sharpenSummary = computed(() =>
+  props.settings.sharpenEngine === 'classic'
+    ? '经典锐化'
+    : `AI · ${sharpenModelLabel(props.settings.sharpenModel)}`,
+)
 
 const modelsDirStatus = computed<ConfigDirStatus | null>(() => {
   if (props.modelsStatus) {
@@ -313,7 +326,9 @@ const deletePrompt = computed(() => {
     return { title: '', description: '' }
   }
   const label = modelLabel(id)
-  const inUse = props.settings.healEngine === id || props.settings.sharpenEngine === id
+  const inUse =
+    props.settings.healEngine === id ||
+    (props.settings.sharpenEngine === 'ai' && props.settings.sharpenModel === id)
   const current = inUse ? `当前选用的就是它，删除后${modelPurpose(id)}改用经典方式。` : ''
   return {
     title: `删除 ${label} 模型？`,
@@ -339,20 +354,47 @@ function selectEngine(value: HealEngine): void {
 }
 
 function selectSharpenEngine(value: SharpenEngine): void {
-  if (!isAiSharpen(value)) {
-    emit('update', { sharpenEngine: value })
+  if (value === 'ai' && !props.modelsAvailable) {
     return
   }
-  if (!props.modelsAvailable) {
+  emit('update', { sharpenEngine: value })
+}
+
+/** 设为默认的 AI 模型；内置模型还没下载时先问是否下载。 */
+function selectSharpenModel(key: string): void {
+  const builtin = findBuiltinSharpenModel(key)
+  if (builtin) {
+    const status = modelStatus(builtin.id)
+    if (status && status.state !== 'ready' && !isModelBusy(status.state)) {
+      pendingDownload.value = builtin.id
+      return
+    }
+  }
+  emit('update', { sharpenEngine: 'ai', sharpenModel: key })
+}
+
+const customDeletePrompt = computed(() => {
+  const model = pendingCustomDelete.value
+  if (!model) {
+    return { title: '', description: '' }
+  }
+  const inUse = props.settings.sharpenModel === model.id ? '它是当前的默认模型，删除后改用内置模型。' : ''
+  return {
+    title: `删除自定义模型「${model.name}」？`,
+    description: `将删除导入时复制到模型目录的文件（${formatFileSize(model.size)}），你原来的文件不受影响。${inUse}`,
+  }
+})
+
+function confirmCustomDelete(): void {
+  const model = pendingCustomDelete.value
+  pendingCustomDelete.value = null
+  if (!model) {
     return
   }
-  const status = modelStatus(value)
-  if (status && (status.state === 'ready' || isModelBusy(status.state))) {
-    emit('update', { sharpenEngine: value })
-    return
+  if (props.settings.sharpenModel === model.id) {
+    emit('update', { sharpenModel: BUILTIN_SHARPEN_MODELS[0].id })
   }
-  // 模型还没下完：先问是否下载，同意后再切换。
-  pendingDownload.value = value
+  emit('delete-custom-model', model.id)
 }
 
 function confirmDownload(): void {
@@ -361,7 +403,7 @@ function confirmDownload(): void {
   if (!id) {
     return
   }
-  emit('update', isHealModel(id) ? { healEngine: id } : { sharpenEngine: id })
+  emit('update', isHealModel(id) ? { healEngine: id } : { sharpenEngine: 'ai', sharpenModel: id })
   emit('download-model', id)
 }
 
@@ -374,7 +416,7 @@ function confirmDelete(): void {
   if (props.settings.healEngine === id) {
     emit('update', { healEngine: 'classic' })
   }
-  if (props.settings.sharpenEngine === id) {
+  if (props.settings.sharpenEngine === 'ai' && props.settings.sharpenModel === id) {
     emit('update', { sharpenEngine: 'classic' })
   }
   emit('delete-model', id)
@@ -747,7 +789,7 @@ defineExpose({ focusTitle })
       <header class="settings-card__head">
         <div>
           <h3 id="sharpen-settings-title">清晰化</h3>
-          <p>在预览标注栏的「清晰化」面板里使用；这里选默认方式、下载 AI 模型。AI 模型下载一次后离线使用，图片不会上传。</p>
+          <p>在预览标注栏的「清晰化」面板里使用；这里选默认方式、下载内置 AI 模型或导入自己的模型。模型都在本机运行，图片不会上传。</p>
         </div>
         <span class="settings-summary">{{ sharpenSummary }}</span>
       </header>
@@ -765,7 +807,7 @@ defineExpose({ focusTitle })
             :class="{ 'is-selected': settings.sharpenEngine === option.value }"
             type="button"
             :aria-pressed="settings.sharpenEngine === option.value"
-            :disabled="isAiSharpen(option.value) && !modelsAvailable"
+            :disabled="option.value === 'ai' && !modelsAvailable"
             @click="selectSharpenEngine(option.value)"
           >
             <span class="engine-choice__head">
@@ -790,12 +832,8 @@ defineExpose({ focusTitle })
                 {{ point }}
               </span>
             </span>
-            <span
-              v-if="isAiSharpen(option.value)"
-              class="engine-choice__state"
-              :class="{ 'is-ready': modelStatus(option.value)?.state === 'ready' }"
-            >
-              {{ modelStateText(modelStatus(option.value)) }}
+            <span v-if="option.value === 'ai'" class="engine-choice__state">
+              {{ modelsAvailable ? `默认模型：${sharpenModelLabel(settings.sharpenModel)}` : '仅免安装 EXE 版可用' }}
             </span>
           </button>
         </div>
@@ -803,21 +841,58 @@ defineExpose({ focusTitle })
 
       <div class="setting-block setting-block--last">
         <div class="setting-label">
-          <h4>AI 模型下载</h4>
-          <p>与局部修瑕的模型放在同一个模型目录（在「局部修瑕」里更改），运行库共用一份；下完按 SHA-256 校验。</p>
+          <h4>AI 模型</h4>
+          <p>内置模型下完按 SHA-256 校验；也可以导入自己找的 ONNX 模型。都放在「局部修瑕」里设置的模型目录，运行库共用一份。</p>
         </div>
         <div v-if="modelsAvailable" class="model-list">
           <ModelRow
-            v-for="option in sharpenAiOptions"
-            :key="option.value"
-            :label="option.label"
-            :status="modelStatus(option.value as SharpenModelId)"
-            :state-text="modelStateText(modelStatus(option.value as SharpenModelId))"
+            v-for="model in BUILTIN_SHARPEN_MODELS"
+            :key="model.id"
+            :label="`${model.label} · ${model.summary}`"
+            :status="modelStatus(model.id)"
+            :state-text="modelStateText(modelStatus(model.id))"
             :busy="modelsBusy"
+            selectable
+            :selected="settings.sharpenModel === model.id"
             @download="emit('download-model', $event)"
             @pause="emit('pause-model', $event)"
             @delete="pendingDelete = $event"
+            @select="selectSharpenModel"
           />
+          <CustomModelRow
+            v-for="model in models?.custom ?? []"
+            :key="model.id"
+            :model="model"
+            :state-text="customStateText(model).text"
+            :state-error="customStateText(model).error"
+            :selected="settings.sharpenModel === model.id"
+            :busy="modelsBusy"
+            @select="selectSharpenModel"
+            @rename="(id, name) => emit('rename-custom-model', id, name)"
+            @delete="pendingCustomDelete = models?.custom.find((item) => item.id === $event) ?? null"
+          />
+          <div class="custom-import">
+            <button
+              class="button button-secondary"
+              type="button"
+              :disabled="modelsBusy"
+              @click="emit('import-custom-model')"
+            >
+              <FolderInput :size="14" :stroke-width="1.9" />
+              导入模型…
+            </button>
+            <p class="config-note">
+              支持超分 / 清晰化类的 ONNX 模型：一个输入 float32 [1, 3, 高, 宽]、RGB 取值 0–1，输出是输入的整数倍（×1–×8）；固定尺寸输入会自动分块补边。不符合时用的时候会提示原因。注意查看模型的许可证（如 CC BY-NC 不能商用）。
+            </p>
+          </div>
+          <p
+            v-if="modelsDirStatus"
+            class="config-status"
+            :class="`config-status--${modelsDirStatus.tone}`"
+            role="status"
+          >
+            {{ modelsDirStatus.text }}
+          </p>
         </div>
         <p v-else class="config-note">
           当前以浏览器页面运行。AI 模型由免安装 EXE 版的本机程序下载和提供，在这里只能使用经典锐化。
@@ -929,6 +1004,14 @@ defineExpose({ focusTitle })
       confirm-label="下载并使用"
       @confirm="confirmDownload"
       @cancel="pendingDownload = null"
+    />
+    <ConfirmDialog
+      :open="pendingCustomDelete !== null"
+      :title="customDeletePrompt.title"
+      :description="customDeletePrompt.description"
+      confirm-label="删除模型"
+      @confirm="confirmCustomDelete"
+      @cancel="pendingCustomDelete = null"
     />
     <ConfirmDialog
       :open="pendingDelete !== null"
@@ -1266,6 +1349,14 @@ defineExpose({ focusTitle })
   min-width: 0;
   flex-direction: column;
   gap: 10px;
+}
+
+.custom-import {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 2px;
 }
 
 .settings-choice--size {

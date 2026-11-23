@@ -5,15 +5,17 @@ import type { ExportOptions } from './exportOptions'
 import { normalizeFloatingPosition } from './floating'
 import type { FloatingPosition } from './floating'
 import { DEFAULT_GAP, clampGap } from './layout'
-import type { HealModelId, SharpenModelId } from './modelApi'
+import type { HealModelId } from './modelApi'
 
 export type ThumbnailOrientation = 'auto' | 'horizontal' | 'vertical'
 export type ThumbnailSize = 'small' | 'medium' | 'large'
 export type ThumbnailFit = 'contain' | 'cover' | 'fill'
 /** 局部修瑕的补全方式：经典算法（默认，无需下载）或某个 AI 模型。 */
 export type HealEngine = 'classic' | HealModelId
-/** 清晰化方式：经典锐化（默认，无需下载）或 AI 模型。 */
-export type SharpenEngine = 'classic' | SharpenModelId
+/** 清晰化方式：经典锐化（默认，无需下载）或 AI 模型（具体用哪个见 sharpenModel）。 */
+export type SharpenEngine = 'classic' | 'ai'
+/** AI 清晰化默认用的模型：内置模型编号，或自定义模型编号（custom-…） */
+export const DEFAULT_SHARPEN_MODEL = 'realesrgan'
 /** 工作区：多图拼接，或逐张编辑单张图片 */
 export type WorkMode = 'stitch' | 'single'
 export { DEFAULT_BACKGROUND, TRANSPARENT_BACKGROUND, normalizeBackground } from './background'
@@ -44,6 +46,8 @@ export interface ToolSettings {
   healEngine: HealEngine
   /** 清晰化方式 */
   sharpenEngine: SharpenEngine
+  /** AI 清晰化用的模型编号 */
+  sharpenModel: string
   /** 上次使用的工作区，下次打开沿用 */
   workMode: WorkMode
   /** 导出对话框的格式与压缩设置，拼接与单图共用 */
@@ -166,19 +170,19 @@ export const SHARPEN_ENGINE_OPTIONS: EngineOption<SharpenEngine>[] = [
     limits: ['只能让轻微发软的图更锐利，真正糊掉的细节补不回来', '调过头会出现白边、放大噪点'],
   },
   {
-    value: 'realesrgan',
-    label: 'AI · Real-ESRGAN',
-    tag: '约 19 MB',
-    summary: 'AI 模型按画面内容重建细节',
+    value: 'ai',
+    label: 'AI 模型',
+    tag: '需下载模型',
+    summary: 'AI 模型按画面内容重建细节，可在下面选内置模型或导入自己的模型',
     strengths: [
       '「保真」不缩小直接处理，截图和文字边缘更干净',
-      '「增强」重建更多，明显模糊、压缩过的照片也能补出纹理',
-      '顺带去掉噪点和压缩块；BSD-3 许可',
+      '可保留 2 倍、4 倍分辨率的结果，导出时放大尺寸，小字更清楚',
+      '顺带去掉噪点和压缩块',
     ],
     limits: [
       '较慢：保真约每百万像素 1–2 分钟（看电脑和浏览器），处理前显示预计时间，可随时停止',
       '「增强」会重画细节，小字可能变形；人脸也可能被画成近似的样子',
-      '需下载模型 4.6 MB + 运行库 14.2 MB（运行库与修瑕 AI 共用）',
+      '只有免安装 EXE 版能用；模型与运行库（14.2 MB，与修瑕 AI 共用）要先下载',
     ],
   },
 ]
@@ -209,6 +213,7 @@ export const DEFAULT_SETTINGS: Readonly<ToolSettings> = Object.freeze({
   thumbnailPanel: DEFAULT_PANEL_STATE,
   healEngine: 'classic',
   sharpenEngine: 'classic',
+  sharpenModel: DEFAULT_SHARPEN_MODEL,
   workMode: 'stitch',
   exportOptions: DEFAULT_EXPORT_OPTIONS,
 })
@@ -261,7 +266,13 @@ export function normalizeSettings(value: unknown): ToolSettings {
     blankPanel: normalizePanelState(parsed.blankPanel),
     thumbnailPanel: normalizePanelState(parsed.thumbnailPanel),
     healEngine: isHealEngine(parsed.healEngine) ? parsed.healEngine : DEFAULT_SETTINGS.healEngine,
-    sharpenEngine: parsed.sharpenEngine === 'realesrgan' ? 'realesrgan' : 'classic',
+    // 旧版本存的是模型编号 realesrgan，等于「AI + Real-ESRGAN」。
+    sharpenEngine:
+      parsed.sharpenEngine === 'ai' || parsed.sharpenEngine === 'realesrgan' ? 'ai' : 'classic',
+    sharpenModel:
+      typeof parsed.sharpenModel === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(parsed.sharpenModel)
+        ? parsed.sharpenModel
+        : DEFAULT_SHARPEN_MODEL,
     workMode: parsed.workMode === 'single' ? 'single' : 'stitch',
     exportOptions: normalizeExportOptions(parsed.exportOptions),
   }

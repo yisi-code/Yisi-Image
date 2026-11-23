@@ -1,23 +1,33 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Download, Pause, Play, Trash2 } from 'lucide-vue-next'
+import { Check, Download, Pause, Play, Trash2 } from 'lucide-vue-next'
 import type { ModelId, ModelStatus } from '../core/modelApi'
 
 /**
  * 设置页里一个 AI 模型的下载行：名称、状态文字、进度条，以及下载 / 暂停 / 继续 / 删除。
- * 局部修瑕与清晰化两个分类共用。
+ * 局部修瑕与清晰化两个分类共用；清晰化里还能「设为默认」。行的样式在 base.css（与自定义模型行共用）。
  */
-const props = defineProps<{
-  label: string
-  status: ModelStatus | null
-  stateText: string
-  busy: boolean
-}>()
+const props = withDefaults(
+  defineProps<{
+    label: string
+    status: ModelStatus | null
+    stateText: string
+    busy: boolean
+    /** 显示「设为默认」 */
+    selectable?: boolean
+    selected?: boolean
+  }>(),
+  {
+    selectable: false,
+    selected: false,
+  },
+)
 
 const emit = defineEmits<{
   download: [id: ModelId]
   pause: [id: ModelId]
   delete: [id: ModelId]
+  select: [id: ModelId]
 }>()
 
 const percent = computed(() =>
@@ -28,7 +38,7 @@ const percent = computed(() =>
 </script>
 
 <template>
-  <div class="model-row">
+  <div class="model-row" :class="{ 'is-selected': selected }">
     <div class="model-row__info">
       <span class="model-row__name">{{ label }}</span>
       <span class="model-row__state" :class="{ 'is-error': status?.state === 'error' }">
@@ -48,6 +58,20 @@ const percent = computed(() =>
       <span class="model-progress__bar" />
     </div>
     <div v-if="status" class="model-row__actions">
+      <span v-if="selectable && selected" class="model-row__badge">
+        <Check :size="12" :stroke-width="2.2" />
+        默认
+      </span>
+      <button
+        v-else-if="selectable"
+        class="button button-secondary"
+        type="button"
+        :disabled="busy"
+        title="清晰化面板选 AI 时默认用这个模型"
+        @click="emit('select', status.id)"
+      >
+        设为默认
+      </button>
       <button
         v-if="status.state === 'downloading' || status.state === 'queued'"
         class="button button-secondary"
@@ -91,77 +115,3 @@ const percent = computed(() =>
     </div>
   </div>
 </template>
-
-<style scoped>
-.model-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px 14px;
-  padding: 11px 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-subtle);
-}
-
-.model-row__info {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.model-row__name {
-  color: var(--text-strong);
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.model-row__state {
-  color: var(--text-muted);
-  font-size: 11px;
-  overflow-wrap: anywhere;
-}
-
-.model-row__state.is-error {
-  color: var(--danger);
-}
-
-.model-row__actions {
-  display: flex;
-  grid-column: 2;
-  grid-row: 1;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
-}
-
-.model-progress {
-  grid-column: 1 / -1;
-  height: 5px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: var(--border);
-}
-
-.model-progress__bar {
-  display: block;
-  width: var(--model-progress, 0%);
-  height: 100%;
-  border-radius: inherit;
-  background: var(--accent);
-  transition: width 0.3s var(--ease);
-}
-
-@media (max-width: 620px) {
-  .model-row {
-    grid-template-columns: 1fr;
-  }
-
-  .model-row__actions {
-    grid-column: 1;
-    grid-row: auto;
-    justify-content: flex-start;
-  }
-}
-</style>

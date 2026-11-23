@@ -23,7 +23,8 @@ const CUSTOM_SETTINGS: ToolSettings = {
   blankPanel: { collapsed: true, position: null },
   thumbnailPanel: { collapsed: true, position: null },
   healEngine: 'migan',
-  sharpenEngine: 'realesrgan',
+  sharpenEngine: 'ai',
+  sharpenModel: 'custom-0123456789ab',
   workMode: 'single',
   exportOptions: {
     format: 'webp',
@@ -79,6 +80,14 @@ describe('normalizeSettings', () => {
         exportOptions: { format: 'tiff', quality: 'high', compressBy: 'size', resize: 'fit' },
       }),
     ).toEqual(DEFAULT_SETTINGS)
+  })
+
+  it('旧版的 realesrgan 迁移为 AI + Real-ESRGAN，非法模型编号回退默认', () => {
+    expect(normalizeSettings({ sharpenEngine: 'realesrgan' })).toMatchObject({
+      sharpenEngine: 'ai',
+      sharpenModel: 'realesrgan',
+    })
+    expect(normalizeSettings({ sharpenModel: '../evil' }).sharpenModel).toBe('realesrgan')
   })
 
   it('间距超出范围时限制到 0–200', () => {

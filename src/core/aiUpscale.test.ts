@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
+  allowedResolutions,
+  defaultResolution,
   estimateAiSeconds,
+  getOutputFactor,
   formatDuration,
   planAiInput,
   planTiles,
@@ -30,7 +33,7 @@ describe('planTiles', () => {
     const width = 500
     const height = 333
     const cover = new Uint8Array(width * height)
-    for (const tile of planTiles(width, height, 192, 16)) {
+    for (const tile of planTiles(width, height, { tileSize: 192, overlap: 16 })) {
       expect(tile.x).toBeGreaterThanOrEqual(0)
       expect(tile.x + tile.width).toBeLessThanOrEqual(width)
       expect(tile.coreX).toBeGreaterThanOrEqual(tile.x)
@@ -56,7 +59,7 @@ describe('tile tensors', () => {
       rgba[index * 4 + 2] = 0
       rgba[index * 4 + 3] = 255
     }
-    const [tile] = planTiles(width, height, 8, 0)
+    const [tile] = planTiles(width, height, { tileSize: 8, overlap: 0 })
     const tensor = tileToTensor(rgba, width, tile)
     const plane = width * height
     expect(tensor[0]).toBe(1)
@@ -87,7 +90,7 @@ describe('tile tensors', () => {
 
   it('输出倍数小于模型倍数时按块取平均，结果只有目标尺寸', () => {
     // 一个 1×1 的块，模型放大 4 倍；只要 1 倍：16 个输出像素取平均。
-    const [tile] = planTiles(1, 1, 8, 0)
+    const [tile] = planTiles(1, 1, { tileSize: 8, overlap: 0 })
     const output = new Float32Array(16 * 3)
     for (let index = 0; index < 16; index += 1) {
       output[index] = index < 8 ? 1 : 0
@@ -97,5 +100,41 @@ describe('tile tensors', () => {
     const target = new Uint8ClampedArray(4)
     writeTileResult(target, 1, output, tile, 4, 1)
     expect(Array.from(target)).toEqual([128, 128, 255, 255])
+  })
+})
+
+describe('padding and resolutions', () => {
+  it('补到倍数或固定尺寸，补边沿用边缘像素', () => {
+    const [tile] = planTiles(10, 6, { tileSize: 64, overlap: 0, multiple: 8 })
+    expect(tile).toMatchObject({ width: 10, height: 6, inputWidth: 16, inputHeight: 8 })
+    const fixedTiles = planTiles(100, 40, { overlap: 4, fixed: { width: 64, height: 64 } })
+    expect(fixedTiles.every((item) => item.inputWidth === 64 && item.inputHeight === 64)).toBe(true)
+    expect(fixedTiles[0].coreWidth).toBe(56)
+    // 重叠最多取边长的 1/8：64 的块重叠 8，中间部分 48。
+    expect(planTiles(200, 200, { overlap: 16, fixed: { width: 64, height: 64 } })[0].coreWidth).toBe(48)
+
+    const rgba = new Uint8ClampedArray(10 * 6 * 4)
+    for (let index = 0; index < 60; index += 1) {
+      rgba[index * 4] = index
+    }
+    const tensor = tileToTensor(rgba, 10, tile)
+    // 第 0 行第 15 列补在右边，沿用第 0 行最后一个像素（值 9）。
+    expect(tensor[15]).toBeCloseTo(9 / 255)
+    // 第 7 行补在下面，沿用最后一行（第 5 行）第 0 列（值 50）。
+    expect(tensor[7 * 16]).toBeCloseTo(50 / 255)
+  })
+
+  it('结果倍数必须是模型倍数的约数，且不超过内存上限', () => {
+    expect(getOutputFactor(1, 1, 4)).toBe(1)
+    expect(getOutputFactor(2, 0.5, 4)).toBe(4)
+    expect(getOutputFactor(4, 0.5, 4)).toBeNull()
+    expect(getOutputFactor(1, 1, 3)).toBe(1)
+    expect(getOutputFactor(2, 1, 3)).toBeNull()
+    expect(allowedResolutions(1000, 1000, 'fidelity', 4)).toEqual([1, 2, 4])
+    expect(allowedResolutions(1000, 1000, 'fidelity', 2)).toEqual([1, 2])
+    expect(allowedResolutions(1000, 1000, 'enhance', 2)).toEqual([1])
+    expect(allowedResolutions(4000, 4000, 'fidelity', 4)).toEqual([1])
+    expect(defaultResolution([1, 2, 4])).toBe(2)
+    expect(defaultResolution([1])).toBe(1)
   })
 })

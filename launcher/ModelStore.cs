@@ -237,6 +237,10 @@ namespace Yisi.ImageTool
                 result["defaultDir"] = defaultDir;
                 result["isDefault"] = ConfigStore.SameDirectory(dir, defaultDir);
                 result["items"] = items;
+                // 自定义模型与内置模型共用运行库：页面据此判断导入的模型能不能用。
+                result["runtimeReady"] = IsComplete(Path.Combine(dir, RuntimeFile.Name), RuntimeFile);
+                result["runtimeUrl"] = "/models/" + RuntimeFile.Name;
+                result["custom"] = CustomModelStore.Describe();
                 return new JavaScriptSerializer().Serialize(result);
             }
         }
@@ -358,7 +362,9 @@ namespace Yisi.ImageTool
                 List<string[]> moved = new List<string[]>();
                 try
                 {
-                    foreach (string name in KnownFileNames())
+                    List<string> names = new List<string>(KnownFileNames());
+                    names.AddRange(CustomModelStore.RelativeFiles(currentDir));
+                    foreach (string name in names)
                     {
                         string source = Path.Combine(currentDir, name);
                         if (!File.Exists(source))
@@ -366,6 +372,8 @@ namespace Yisi.ImageTool
                             continue;
                         }
                         string target = Path.Combine(targetDir, name);
+                        // 自定义模型在 custom 子目录里，目标目录可能还没有它。
+                        Directory.CreateDirectory(Path.GetDirectoryName(target));
                         if (File.Exists(target))
                         {
                             File.Delete(target);
@@ -406,6 +414,12 @@ namespace Yisi.ImageTool
         /// <summary>页面请求 /models/文件名 时：只认清单里的文件，且必须已完整下载。返回完整路径与类型，否则 null。</summary>
         internal static string[] ResolveServedFile(string name)
         {
+            string customPrefix = CustomModelStore.FolderName + "/";
+            if (name.StartsWith(customPrefix, StringComparison.Ordinal))
+            {
+                string customPath = CustomModelStore.Resolve(name.Substring(customPrefix.Length));
+                return customPath == null ? null : new string[] { customPath, "application/octet-stream" };
+            }
             lock (Sync)
             {
                 foreach (ModelEntry entry in Entries)
@@ -745,7 +759,7 @@ namespace Yisi.ImageTool
                 out value) && value == start;
         }
 
-        private static string Sha256Of(string path)
+        internal static string Sha256Of(string path)
         {
             using (SHA256 sha = SHA256.Create())
             using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))

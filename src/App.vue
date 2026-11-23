@@ -36,7 +36,10 @@ import { getSizeChangePercent } from './core/exportOptions'
 import type { ExportOptions } from './core/exportOptions'
 import { IS_DESKTOP_APP } from './core/appInfo'
 import type { HealEngineChoice } from './core/healEngine'
-import type { SharpenAiState } from './core/sharpenEngine'
+import type { AiModelChoice, SharpenAiState } from './core/sharpenEngine'
+import { BUILTIN_SHARPEN_MODELS, CUSTOM_MODEL_MULTIPLE } from './core/sharpenModels'
+import type { BuiltinSharpenModel } from './core/sharpenModels'
+import type { CustomModel } from './core/modelApi'
 import {
   IMAGE_ACCEPT,
   SUPPORTED_FORMAT_LABEL,
@@ -97,14 +100,25 @@ const healEngineChoice = computed<HealEngineChoice>(() => {
   return { kind: 'classic', notice: `${label} ${reason}，这次用经典算法；可在「设置 · 局部修瑕」里查看下载` }
 })
 
-/** AI 清晰化能不能用：只在 EXE 版、且 Real-ESRGAN 模型下好时可用，否则说明原因。 */
-const sharpenAiState = computed<SharpenAiState>(() => {
+const EXE_ONLY_REASON = 'AI 清晰化只能在免安装 EXE 版里使用，浏览器页面请用经典锐化。'
+
+/** 内置清晰化模型能不能用：只在 EXE 版、且模型下好时可用，否则说明原因。 */
+function builtinSharpenState(model: BuiltinSharpenModel): SharpenAiState {
   if (!models.isAvailable) {
-    return { ready: false, reason: 'AI 清晰化只能在免安装 EXE 版里使用，浏览器页面请用经典锐化。' }
+    return { ready: false, reason: EXE_ONLY_REASON }
   }
-  const status = models.statusOf('realesrgan')
+  const status = models.statusOf(model.id)
   if (status?.state === 'ready') {
-    return { ready: true, files: { modelUrl: status.modelUrl, runtimeUrl: status.runtimeUrl } }
+    return {
+      ready: true,
+      model: {
+        key: model.id,
+        label: model.label,
+        files: { modelUrl: status.modelUrl, runtimeUrl: status.runtimeUrl },
+        scale: model.scale,
+        multiple: model.multiple,
+      },
+    }
   }
   let reason = '模型还没下载'
   if (!status) {
@@ -112,8 +126,52 @@ const sharpenAiState = computed<SharpenAiState>(() => {
   } else if (isModelBusy(status.state) && status.total > 0) {
     reason = `模型还在下载（${Math.floor((status.downloaded / status.total) * 100)}%）`
   }
-  return { ready: false, reason: `${reason}，可在「设置 · 清晰化」里下载（约 19 MB）。` }
-})
+  return { ready: false, reason: `${reason}，可在「设置 · 清晰化」里下载。` }
+}
+
+/** 自定义模型要有共用的运行库才能跑；运行库随任一内置 AI 模型一起下载。 */
+function customSharpenState(model: CustomModel): SharpenAiState {
+  const snapshot = models.snapshot.value
+  if (!snapshot?.runtimeReady) {
+    return {
+      ready: false,
+      reason: '还没有 AI 运行库：先在「设置 · 清晰化」下载 Real-ESRGAN，运行库会一起下载。',
+    }
+  }
+  if (!model.available) {
+    return { ready: false, reason: '模型文件不见了，请在「设置 · 清晰化」里重新导入。' }
+  }
+  return {
+    ready: true,
+    model: {
+      key: model.id,
+      label: model.name,
+      files: { modelUrl: model.modelUrl, runtimeUrl: snapshot.runtimeUrl },
+      scale: null,
+      multiple: CUSTOM_MODEL_MULTIPLE,
+    },
+  }
+}
+
+/** 清晰化面板里可选的 AI 模型：内置在前，自定义在后。 */
+const aiModelChoices = computed<AiModelChoice[]>(() => [
+  ...BUILTIN_SHARPEN_MODELS.map((model) => ({
+    key: model.id,
+    label: model.label,
+    state: builtinSharpenState(model),
+  })),
+  ...(models.snapshot.value?.custom ?? []).map((model) => ({
+    key: model.id,
+    label: `自定义 · ${model.name}`,
+    state: customSharpenState(model),
+  })),
+])
+/** 设置里选的模型不见了（例如自定义模型被删）时用第一个。 */
+const aiModelKey = computed(() =>
+  aiModelChoices.value.some((choice) => choice.key === settings.value.sharpenModel)
+    ? settings.value.sharpenModel
+    : (aiModelChoices.value[0]?.key ?? ''),
+)
 
 const direction = ref<StitchDirection>('vertical')
 /** 间距随设置一起保存到配置文件；底部滑块与数字框通过它读写。 */
@@ -369,6 +427,7 @@ const exportItems = computed<ExportItem[]>(() => {
         width: stitchLayout.width,
         height: stitchLayout.height,
         originalSize: 0,
+        detailScale: Math.max(1, ...stitchImages.map((image) => image.enhance?.resolution ?? 1)),
         render: (scale, background) =>
           renderStitch(document.createElement('canvas'), stitchLayout, stitchImages, {
             scale,
@@ -383,6 +442,7 @@ const exportItems = computed<ExportItem[]>(() => {
     width: image.width,
     height: image.height,
     originalSize: image.size,
+    detailScale: image.enhance?.resolution ?? 1,
     render: (scale: number, background: string | null) =>
       renderStitch(
         document.createElement('canvas'),
@@ -905,7 +965,8 @@ function onExported(summary: ExportSummary): void {
           :background="exportBackground"
           :single-image="!isStitchMode"
           :sharpen-engine="settings.sharpenEngine"
-          :sharpen-ai="sharpenAiState"
+          :ai-models="aiModelChoices"
+          :ai-model-key="aiModelKey"
           :heal-engine="healEngineChoice"
           @pick="openFilePicker"
           @add="handleAdd"
@@ -917,6 +978,7 @@ function onExported(summary: ExportSummary): void {
           @busy-change="isPreviewBusy = $event"
           @sharpen-failed="onSharpenFailed"
           @update-sharpen-engine="updateSettings({ sharpenEngine: $event })"
+          @update-sharpen-model="updateSettings({ sharpenModel: $event })"
         />
 
         <StitchControls
@@ -966,6 +1028,9 @@ function onExported(summary: ExportSummary): void {
         @change-models-dir="models.changeDir"
         @reset-models-dir="models.resetDir"
         @open-models-dir="models.openDir"
+        @import-custom-model="models.importCustom"
+        @rename-custom-model="models.renameCustom"
+        @delete-custom-model="models.removeCustom"
       />
     </main>
 

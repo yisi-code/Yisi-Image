@@ -2,17 +2,17 @@
 import { computed } from 'vue'
 import type { CSSProperties } from 'vue'
 import { Loader2, Play, RotateCcw, Square, X } from 'lucide-vue-next'
-import { AI_SHARPEN_LEVELS, formatDuration } from '../core/aiUpscale'
+import { AI_SHARPEN_LEVELS, OUTPUT_RESOLUTIONS, formatDuration } from '../core/aiUpscale'
 import type { AiSharpenLevel } from '../core/aiUpscale'
 import { SHARPEN_LIMITS, SHARPEN_PRESETS, isSameSharpen } from '../core/sharpen'
 import type { SharpenSettings } from '../core/sharpen'
-import type { SharpenAiState } from '../core/sharpenEngine'
+import type { AiModelChoice, SharpenAiState } from '../core/sharpenEngine'
 import type { SharpenEngine } from '../core/settings'
 
 /**
  * 清晰化面板，两种方式：
  * - 经典锐化：预设与强度 / 半径 / 阈值滑块，改动即应用（由使用方防抖后计算）；
- * - AI（Real-ESRGAN）：选等级后点「开始处理」，较慢，显示进度。
+ * - AI：选模型（内置或自定义）、等级和结果倍数后点「开始处理」，较慢，显示进度。
  * 拼接时作用于预览里当前选中的那张，单图编辑时作用于正在编辑的那张。
  */
 const props = defineProps<{
@@ -24,9 +24,19 @@ const props = defineProps<{
   settings: SharpenSettings
   aiLevel: AiSharpenLevel
   aiState: SharpenAiState
+  aiModels: AiModelChoice[]
+  aiModelKey: string
+  /** 自定义模型试算中 / 失败原因 / 已识别的倍数 */
+  aiModelNote: string
+  /** 结果保留原图的几倍 */
+  aiResolution: number
+  /** 当前模型、等级、图片下能选的倍数；倍数未知时为空 */
+  aiAllowedResolutions: number[]
   /** 这张图已应用的方式；没处理过为 null */
   appliedEngine: SharpenEngine | null
   appliedAiLevel: AiSharpenLevel | null
+  appliedModel: string | null
+  appliedResolution: number
   /** 按当前等级估算的 AI 耗时（秒）；没有目标图时为 0 */
   aiEstimateSeconds: number
   busy: boolean
@@ -38,6 +48,8 @@ const emit = defineEmits<{
   change: [settings: SharpenSettings]
   'update:engine': [engine: SharpenEngine]
   'update:aiLevel': [level: AiSharpenLevel]
+  'update:aiModel': [key: string]
+  'update:aiResolution': [resolution: number]
   'ai-start': []
   'ai-stop': []
   reset: []
@@ -54,13 +66,33 @@ const SLIDERS: Array<{ key: SliderKey; label: string; unit: string; title: strin
 
 const ENGINES: Array<{ value: SharpenEngine; label: string; title: string }> = [
   { value: 'classic', label: '经典锐化', title: '加强已有的边缘，几乎立刻完成' },
-  { value: 'realesrgan', label: 'AI', title: 'AI 模型按画面内容重建细节，较慢' },
+  { value: 'ai', label: 'AI', title: 'AI 模型按画面内容重建细节，较慢' },
 ]
 
 /** 预计超过这么多秒就提醒换「增强」或经典锐化 */
 const LONG_AI_SECONDS = 90
 
-const isAi = computed(() => props.engine === 'realesrgan')
+const isAi = computed(() => props.engine === 'ai')
+const canStart = computed(
+  () => props.aiState.ready && props.aiAllowedResolutions.includes(props.aiResolution),
+)
+
+function resolutionLabel(resolution: number): string {
+  return resolution === 1 ? '原尺寸' : `${resolution} 倍`
+}
+
+function resolutionTitle(resolution: number): string {
+  if (!props.aiAllowedResolutions.includes(resolution)) {
+    return '这个模型、等级或图片尺寸下做不到（倍数要能被模型整除，结果最多 4000 万像素）'
+  }
+  return resolution === 1
+    ? '结果缩回原尺寸，占内存最少'
+    : `保留 ${resolution} 倍分辨率；导出时把「尺寸」调到 ${resolution * 100}% 小字才会更清楚`
+}
+
+function onModelChange(event: Event): void {
+  emit('update:aiModel', (event.target as HTMLSelectElement).value)
+}
 const estimateText = computed(() =>
   props.aiEstimateSeconds > 0 ? `预计${formatDuration(props.aiEstimateSeconds)}` : '',
 )
@@ -75,9 +107,10 @@ const statusText = computed(() => {
   if (props.busy) {
     return `正在处理 ${Math.round(props.progress * 100)}%`
   }
-  if (props.appliedEngine === 'realesrgan') {
+  if (props.appliedEngine === 'ai') {
     const level = AI_SHARPEN_LEVELS.find((option) => option.value === props.appliedAiLevel)?.label ?? ''
-    return `已应用 AI 清晰化${level ? `（${level}）` : ''}`
+    const parts = [level, props.appliedResolution > 1 ? `${props.appliedResolution} 倍` : ''].filter(Boolean)
+    return `已应用 AI 清晰化${parts.length ? `（${parts.join(' · ')}）` : ''}`
   }
   return props.appliedEngine === 'classic' ? '已应用经典锐化' : '还没有清晰化'
 })
@@ -177,6 +210,33 @@ function applyPreset(settings: SharpenSettings): void {
       </template>
 
       <template v-else>
+        <label class="sharpen-model">
+          <span class="control-label">模型</span>
+          <select :value="aiModelKey" :disabled="busy" @change="onModelChange">
+            <option v-for="choice in aiModels" :key="choice.key" :value="choice.key">
+              {{ choice.label }}{{ choice.state.ready ? '' : '（未就绪）' }}
+            </option>
+          </select>
+        </label>
+        <p v-if="aiModelNote" class="sharpen-estimate">{{ aiModelNote }}</p>
+        <div class="sharpen-ai">
+          <span class="control-label">结果</span>
+          <div class="segmented" role="group" aria-label="AI 清晰化结果分辨率">
+            <button
+              v-for="resolution in OUTPUT_RESOLUTIONS"
+              :key="resolution"
+              type="button"
+              class="segment"
+              :class="{ 'is-active': aiResolution === resolution }"
+              :aria-pressed="aiResolution === resolution"
+              :disabled="busy || !aiAllowedResolutions.includes(resolution)"
+              :title="resolutionTitle(resolution)"
+              @click="emit('update:aiResolution', resolution)"
+            >
+              {{ resolutionLabel(resolution) }}
+            </button>
+          </div>
+        </div>
         <div class="sharpen-ai">
           <span class="control-label">等级</span>
           <div class="segmented" role="group" aria-label="AI 清晰化等级">
@@ -208,16 +268,19 @@ function applyPreset(settings: SharpenSettings): void {
             v-else
             class="button button-primary sharpen-start"
             type="button"
-            :disabled="!aiState.ready"
+            :disabled="!canStart"
             @click="emit('ai-start')"
           >
             <Play :size="13" :stroke-width="2" />
-            {{ appliedEngine === 'realesrgan' ? '重新处理' : '开始处理' }}
+            {{ appliedEngine === 'ai' ? '重新处理' : '开始处理' }}
           </button>
         </div>
         <p v-if="!aiState.ready" class="sharpen-warning">{{ aiState.reason }}</p>
         <p v-else-if="estimateText && !busy" class="sharpen-estimate" :class="{ 'is-long': isLongAi }">
           {{ estimateText }}<template v-if="isLongAi">；图片较大，可改用「增强」（快约 4 倍）或经典锐化</template>
+        </p>
+        <p v-if="aiState.ready && aiResolution > 1 && !busy" class="sharpen-estimate">
+          结果保留 {{ aiResolution }} 倍分辨率，导出时把「尺寸」调到 {{ aiResolution * 100 }}%，小字才会更清楚。
         </p>
       </template>
 
@@ -329,6 +392,28 @@ function applyPreset(settings: SharpenSettings): void {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.sharpen-model {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.sharpen-model select {
+  min-width: 0;
+  height: 30px;
+  flex: 1;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text-strong);
+  font-size: 12px;
+}
+
+.sharpen-model select:hover:not(:disabled) {
+  border-color: var(--border-strong);
 }
 
 .sharpen-start {

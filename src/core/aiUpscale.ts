@@ -8,8 +8,14 @@
  * 大图分块推理（每块四周多带一圈重叠），只取每块中间那部分写回，避免接缝。
  */
 
-/** 模型固定放大倍数 */
+/** Real-ESRGAN 的放大倍数；其他模型的倍数由各自登记或首次使用时试算得出 */
 export const UPSCALE_FACTOR = 4
+
+/** 结果画布的倍数选项：1 为原尺寸，2、4 保留放大后的细节（导出时把尺寸调到 200% / 400% 才用得上） */
+export const OUTPUT_RESOLUTIONS = [1, 2, 4] as const
+
+/** 结果画布最多这么多像素；超过的倍数不提供，免得一张图吃掉几百 MB 内存 */
+export const MAX_RESULT_PIXELS = 40_000_000
 
 export type AiSharpenLevel = 'fidelity' | 'enhance'
 
@@ -69,12 +75,47 @@ export function formatDuration(seconds: number): string {
   return `约 ${minutes} 分钟`
 }
 
+/**
+ * 一种结果倍数在某个模型、某个等级下能不能做：
+ * 模型输出是送进去那张的 modelScale 倍，结果要原图的 resolution 倍，
+ * 中间要按块平均缩小，所以 resolution / inputScale 必须是 modelScale 的约数；结果太大也不提供。
+ */
+export function getOutputFactor(resolution: number, inputScale: number, modelScale: number): number | null {
+  const factor = resolution / inputScale
+  if (!Number.isInteger(factor) || factor < 1 || factor > modelScale || modelScale % factor !== 0) {
+    return null
+  }
+  return factor
+}
+
+export function allowedResolutions(
+  width: number,
+  height: number,
+  level: AiSharpenLevel,
+  modelScale: number,
+): number[] {
+  const inputScale = AI_SHARPEN_LEVELS.find((option) => option.value === level)?.inputScale ?? 1
+  return OUTPUT_RESOLUTIONS.filter(
+    (resolution) =>
+      getOutputFactor(resolution, inputScale, modelScale) !== null &&
+      width * height * resolution * resolution <= MAX_RESULT_PIXELS,
+  )
+}
+
+/** 默认结果倍数：能保留 2 倍细节就用 2 倍，否则原尺寸。 */
+export function defaultResolution(allowed: readonly number[]): number {
+  return allowed.includes(2) ? 2 : (allowed[0] ?? 1)
+}
+
 export interface AiTile {
   /** 送进模型的那块（含重叠）在输入图里的位置 */
   x: number
   y: number
   width: number
   height: number
+  /** 实际送进模型的尺寸：补边到模型要求的倍数或固定尺寸，补的部分沿用图像边缘像素 */
+  inputWidth: number
+  inputHeight: number
   /** 这块真正要写回的中间部分（不含重叠），在输入图里的位置 */
   coreX: number
   coreY: number
@@ -82,31 +123,69 @@ export interface AiTile {
   coreHeight: number
 }
 
-/** 把输入图切成不超过 tileSize 的块，每块四周再带 overlap 像素（贴边处不带）；各块的中间部分正好铺满整张图。 */
-export function planTiles(width: number, height: number, tileSize = 192, overlap = 16): AiTile[] {
+export interface TileOptions {
+  tileSize?: number
+  overlap?: number
+  /** 送进模型的宽高要补到它的整数倍（窗口注意力类模型常要求 8 或 16） */
+  multiple?: number
+  /** 模型只接受固定尺寸时的宽高；每块都补到这个尺寸 */
+  fixed?: { width: number; height: number } | null
+}
+
+function roundUp(value: number, multiple: number): number {
+  return Math.ceil(value / multiple) * multiple
+}
+
+/**
+ * 把输入图切成块，每块四周再带 overlap 像素（贴边处不带）；各块的中间部分正好铺满整张图。
+ * 模型要求固定尺寸时，块的中间部分取「固定尺寸 − 两倍重叠」，送进模型前补到固定尺寸。
+ */
+export function planTiles(width: number, height: number, options: TileOptions = {}): AiTile[] {
+  const fixed = options.fixed ?? null
+  // 固定尺寸很小（如 64×64）时重叠太多会白算大半，重叠最多取边长的 1/8。
+  const overlap = fixed
+    ? Math.min(options.overlap ?? 16, Math.floor(Math.min(fixed.width, fixed.height) / 8))
+    : (options.overlap ?? 16)
+  const multiple = Math.max(1, options.multiple ?? 1)
+  const coreWidthLimit = fixed ? Math.max(8, fixed.width - overlap * 2) : (options.tileSize ?? 192)
+  const coreHeightLimit = fixed ? Math.max(8, fixed.height - overlap * 2) : (options.tileSize ?? 192)
   const tiles: AiTile[] = []
-  for (let coreY = 0; coreY < height; coreY += tileSize) {
-    const coreHeight = Math.min(tileSize, height - coreY)
-    for (let coreX = 0; coreX < width; coreX += tileSize) {
-      const coreWidth = Math.min(tileSize, width - coreX)
+  for (let coreY = 0; coreY < height; coreY += coreHeightLimit) {
+    const coreHeight = Math.min(coreHeightLimit, height - coreY)
+    for (let coreX = 0; coreX < width; coreX += coreWidthLimit) {
+      const coreWidth = Math.min(coreWidthLimit, width - coreX)
       const x = Math.max(0, coreX - overlap)
       const y = Math.max(0, coreY - overlap)
       const right = Math.min(width, coreX + coreWidth + overlap)
       const bottom = Math.min(height, coreY + coreHeight + overlap)
-      tiles.push({ x, y, width: right - x, height: bottom - y, coreX, coreY, coreWidth, coreHeight })
+      const tileWidth = right - x
+      const tileHeight = bottom - y
+      tiles.push({
+        x,
+        y,
+        width: tileWidth,
+        height: tileHeight,
+        inputWidth: fixed ? Math.max(fixed.width, tileWidth) : roundUp(tileWidth, multiple),
+        inputHeight: fixed ? Math.max(fixed.height, tileHeight) : roundUp(tileHeight, multiple),
+        coreX,
+        coreY,
+        coreWidth,
+        coreHeight,
+      })
     }
   }
   return tiles
 }
 
-/** 取出一块 RGBA，转成模型要的 float32 NCHW、RGB 0–1。 */
+/** 取出一块 RGBA，转成模型要的 float32 NCHW、RGB 0–1；超出块的补边部分沿用块边缘的像素。 */
 export function tileToTensor(rgba: Uint8ClampedArray, imageWidth: number, tile: AiTile): Float32Array {
-  const plane = tile.width * tile.height
+  const plane = tile.inputWidth * tile.inputHeight
   const tensor = new Float32Array(plane * 3)
-  for (let row = 0; row < tile.height; row += 1) {
-    for (let column = 0; column < tile.width; column += 1) {
-      const source = ((tile.y + row) * imageWidth + tile.x + column) * 4
-      const target = row * tile.width + column
+  for (let row = 0; row < tile.inputHeight; row += 1) {
+    const sourceRow = tile.y + Math.min(row, tile.height - 1)
+    for (let column = 0; column < tile.inputWidth; column += 1) {
+      const source = (sourceRow * imageWidth + tile.x + Math.min(column, tile.width - 1)) * 4
+      const target = row * tile.inputWidth + column
       tensor[target] = rgba[source] / 255
       tensor[plane + target] = rgba[source + 1] / 255
       tensor[plane * 2 + target] = rgba[source + 2] / 255
@@ -130,8 +209,8 @@ export function writeTileResult(
   outputFactor = factor,
 ): void {
   const block = factor / outputFactor
-  const outWidth = tile.width * factor
-  const plane = outWidth * tile.height * factor
+  const outWidth = tile.inputWidth * factor
+  const plane = outWidth * tile.inputHeight * factor
   const startX = (tile.coreX - tile.x) * factor
   const startY = (tile.coreY - tile.y) * factor
   const width = tile.coreWidth * outputFactor

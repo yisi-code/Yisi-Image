@@ -19,12 +19,12 @@ describe('normalizeExportOptions', () => {
     const options = normalizeExportOptions({
       quality: 3,
       targetKb: 999_999,
-      percent: 120,
+      percent: 999,
       longEdge: 4.6,
     })
     expect(options.quality).toBe(10)
     expect(options.targetKb).toBe(51_200)
-    expect(options.percent).toBe(100)
+    expect(options.percent).toBe(400)
     expect(options.longEdge).toBe(16)
   })
 

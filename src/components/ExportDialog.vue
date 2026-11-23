@@ -78,7 +78,7 @@ const DOWNLOAD_GAP_MS = 260
 
 const RESIZE_OPTIONS: Array<{ value: ResizeMode; label: string; title: string }> = [
   { value: 'none', label: '原尺寸', title: '保持原始像素尺寸' },
-  { value: 'percent', label: '百分比', title: '按百分比等比缩小' },
+  { value: 'percent', label: '百分比', title: '按百分比缩小或放大（最高 400%）' },
   { value: 'longEdge', label: '最长边', title: '把最长边限制在指定像素以内，原本更小的不放大' },
 ]
 
@@ -125,6 +125,15 @@ const currentResult = computed(() =>
     ? previewResult.value
     : null,
 )
+/** 有图片做了保留 2 倍 / 4 倍细节的 AI 清晰化，但这次导出尺寸没放大到那么多时提醒一句。 */
+const detailHint = computed(() => {
+  const item = previewItem.value
+  const output = outputSize.value
+  if (!item || !output || item.detailScale <= 1 || output.scale >= item.detailScale - 0.001) {
+    return ''
+  }
+  return `这张图的 AI 清晰化保留了 ${item.detailScale} 倍细节；「尺寸」选百分比 ${item.detailScale * 100}% 导出，小字才会更清楚。`
+})
 const sizeChange = computed(() =>
   currentResult.value && previewItem.value
     ? getSizeChangePercent(previewItem.value.originalSize, currentResult.value.blob.size)
@@ -814,6 +823,7 @@ onBeforeUnmount(clearPreview)
               </div>
             </dl>
 
+            <p v-if="detailHint" class="export-note export-note--accent">{{ detailHint }}</p>
             <p v-if="isBatch" class="export-note">
               按同样的设置逐张导出全部 {{ items.length }} 张，文件名沿用原名并换成 .{{ format.extension }}；预览显示的是当前这张。
             </p>
@@ -1012,6 +1022,10 @@ onBeforeUnmount(clearPreview)
   color: var(--text-muted);
   font-size: 11px;
   line-height: 1.65;
+}
+
+.export-note--accent {
+  color: var(--accent-ink);
 }
 
 .export-warning {

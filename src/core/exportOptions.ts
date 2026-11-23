@@ -19,7 +19,7 @@ export interface ExportOptions {
   /** 目标大小，单位 KB */
   targetKb: number
   resize: ResizeMode
-  /** 5–100 */
+  /** 5–400；超过 100 是放大 */
   percent: number
   /** 最长边像素 */
   longEdge: number
@@ -28,7 +28,8 @@ export interface ExportOptions {
 export const MIN_QUALITY = 10
 export const MAX_QUALITY = 100
 export const MIN_PERCENT = 5
-export const MAX_PERCENT = 100
+/** 允许放大到 400%：AI 清晰化保留了 2 倍、4 倍细节的图片，放大导出才用得上 */
+export const MAX_PERCENT = 400
 export const MIN_LONG_EDGE = 16
 export const MAX_LONG_EDGE = 16_384
 export const MIN_TARGET_KB = 10
@@ -83,7 +84,7 @@ export interface OutputSize {
   scale: number
 }
 
-/** 按缩小设置换算输出尺寸；最长边模式只缩不放，原图已经更小时保持原尺寸。 */
+/** 按尺寸设置换算输出尺寸：百分比可缩可放；最长边模式只缩不放，原图已经更小时保持原尺寸。 */
 export function getOutputSize(
   width: number,
   height: number,

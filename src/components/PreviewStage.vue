@@ -27,13 +27,18 @@ import {
 import FloatingToolbar from './FloatingToolbar.vue'
 import SharpenPanel from './SharpenPanel.vue'
 import { releaseCanvas } from '../core/exportJob'
-import { DEFAULT_AI_SHARPEN_LEVEL } from '../core/aiUpscale'
+import { DEFAULT_AI_SHARPEN_LEVEL, allowedResolutions, defaultResolution } from '../core/aiUpscale'
 import type { AiSharpenLevel } from '../core/aiUpscale'
 import { DEFAULT_SHARPEN, isSharpenNoop } from '../core/sharpen'
 import type { SharpenSettings } from '../core/sharpen'
 import { AiCanceledError, cancelAiJobs } from '../core/aiWorkerClient'
-import { aiSharpenImage, estimateAiSharpenSeconds, sharpenImage } from '../core/sharpenEngine'
-import type { SharpenAiState } from '../core/sharpenEngine'
+import {
+  aiSharpenImage,
+  estimateAiSharpenSeconds,
+  probeAiModel,
+  sharpenImage,
+} from '../core/sharpenEngine'
+import type { AiModelChoice, AiModelInfo, SharpenAiState } from '../core/sharpenEngine'
 import { useFileDrop } from '../composables/useFileDrop'
 import {
   cloneAnnotations,
@@ -99,8 +104,10 @@ const props = defineProps<{
   singleImage?: boolean
   /** 清晰化面板默认用的方式（随设置保存） */
   sharpenEngine: SharpenEngine
-  /** AI 清晰化能不能用（由 App 按模型下载状态算出） */
-  sharpenAi: SharpenAiState
+  /** 可选的 AI 清晰化模型及各自能不能用（由 App 按模型下载状态算出） */
+  aiModels: AiModelChoice[]
+  /** 当前选的 AI 模型编号（随设置保存） */
+  aiModelKey: string
   /** 这次修瑕用经典算法还是 AI 模型（由 App 按设置与模型下载状态算出） */
   healEngine: HealEngineChoice
 }>()
@@ -118,6 +125,7 @@ const emit = defineEmits<{
   'busy-change': [busy: boolean]
   'sharpen-failed': [message: string]
   'update-sharpen-engine': [engine: SharpenEngine]
+  'update-sharpen-model': [key: string]
 }>()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
@@ -155,6 +163,10 @@ const healProgress = ref(0)
 const isSharpenOpen = ref(false)
 const sharpenDraft = ref<SharpenSettings>({ ...DEFAULT_SHARPEN })
 const aiSharpenLevel = ref<AiSharpenLevel>(DEFAULT_AI_SHARPEN_LEVEL)
+/** AI 结果保留原图的几倍（1 原尺寸、2、4）；默认 2 倍，做不到时退回能做的 */
+const aiResolution = ref(2)
+/** 各模型试算出的倍数（自定义模型第一次用时才知道）；error 为试算失败的原因 */
+const aiModelInfos = ref<Record<string, AiModelInfo | { error: string } | 'probing'>>({})
 /** 每跑完一次 AI 清晰化就 +1，让预计耗时按新测的速度重算 */
 const aiSpeedVersion = ref(0)
 const sharpenRunning = ref(0)
@@ -293,10 +305,48 @@ const sharpenDisabledReason = computed(() => {
   return ''
 })
 const comparePercent = computed(() => Math.round(compareSplit.value * 100))
+const aiChoice = computed(
+  () => props.aiModels.find((choice) => choice.key === props.aiModelKey) ?? props.aiModels[0] ?? null,
+)
+const aiState = computed<SharpenAiState>(
+  () => aiChoice.value?.state ?? { ready: false, reason: '没有可用的 AI 模型' },
+)
+/** 选中模型的倍数：内置模型登记过；自定义模型要等试算完 */
+const aiModelScale = computed(() => {
+  const state = aiState.value
+  if (!state.ready) {
+    return null
+  }
+  if (state.model.scale !== null) {
+    return state.model.scale
+  }
+  const info = aiModelInfos.value[state.model.key]
+  return info && typeof info === 'object' && 'scale' in info ? info.scale : null
+})
+/** 选中模型试算中、或试算失败的原因 */
+const aiModelNote = computed(() => {
+  const state = aiState.value
+  if (!state.ready || state.model.scale !== null) {
+    return ''
+  }
+  const info = aiModelInfos.value[state.model.key]
+  if (info === 'probing' || info === undefined) {
+    return '正在识别这个模型的放大倍数…'
+  }
+  return 'error' in info ? `这个模型用不了：${info.error}` : `已识别：×${info.scale}`
+})
+const aiAllowedResolutions = computed(() => {
+  const target = sharpenTarget.value
+  const scale = aiModelScale.value
+  return target && scale ? allowedResolutions(target.width, target.height, aiSharpenLevel.value, scale) : []
+})
 const aiEstimateSeconds = computed(() => {
   void aiSpeedVersion.value
   const target = sharpenTarget.value
-  return target?.element ? estimateAiSharpenSeconds(target.width, target.height, aiSharpenLevel.value) : 0
+  const key = aiChoice.value?.key ?? ''
+  return target?.element
+    ? estimateAiSharpenSeconds(target.width, target.height, aiSharpenLevel.value, key)
+    : 0
 })
 const activeItem = computed(
   () => props.layout.items.find((item) => item.id === activeImageId.value) ?? null,
@@ -1480,24 +1530,53 @@ async function runSharpen(image: StitchImage, settings: SharpenSettings): Promis
     scheduleRender()
     return
   }
-  await applyEnhance(image, { engine: 'classic', sharpen: { ...settings } }, (report) =>
+  await applyEnhance(image, { engine: 'classic', sharpen: { ...settings }, resolution: 1 }, (report) =>
     sharpenImage(element, image.width, image.height, settings, report),
   )
 }
 
+/** 选了一个还不知道倍数的自定义模型：在 Worker 里试算一次（结果缓存，失败时给出原因）。 */
+function probeSelectedModel(): void {
+  const state = aiState.value
+  if (!isSharpenOpen.value || props.sharpenEngine !== 'ai' || !state.ready || state.model.scale !== null) {
+    return
+  }
+  const key = state.model.key
+  if (aiModelInfos.value[key]) {
+    return
+  }
+  aiModelInfos.value = { ...aiModelInfos.value, [key]: 'probing' }
+  probeAiModel(state.model)
+    .then((info) => {
+      aiModelInfos.value = { ...aiModelInfos.value, [key]: info }
+    })
+    .catch((error: unknown) => {
+      const message = error instanceof Error && error.message ? error.message : '无法读取这个模型'
+      aiModelInfos.value = { ...aiModelInfos.value, [key]: { error: message } }
+    })
+}
+
 function startAiSharpen(): void {
   const target = sharpenTarget.value
-  const state = props.sharpenAi
+  const state = aiState.value
   const element = target?.element
-  if (!target || !element || !state.ready || sharpenDisabledReason.value) {
+  const resolution = aiResolution.value
+  if (
+    !target ||
+    !element ||
+    !state.ready ||
+    sharpenDisabledReason.value ||
+    !aiAllowedResolutions.value.includes(resolution)
+  ) {
     return
   }
   window.clearTimeout(sharpenTimer)
   const level = aiSharpenLevel.value
+  const spec = state.model
   void applyEnhance(
     target,
-    { engine: 'realesrgan', sharpen: { ...sharpenDraft.value }, aiLevel: level },
-    (report) => aiSharpenImage(element, target.width, target.height, level, state.files, report),
+    { engine: 'ai', sharpen: { ...sharpenDraft.value }, aiLevel: level, model: spec.key, resolution },
+    (report) => aiSharpenImage(element, target.width, target.height, level, spec, resolution, report),
   )
 }
 
@@ -1657,6 +1736,13 @@ watch(() => props.background, scheduleRender)
 watch([isComparing, compareSplit], scheduleRender)
 // 换了作用的图片（切换单图、拼接里选中另一张），面板里的参数跟着换成那张的。
 watch(() => sharpenTarget.value?.id ?? null, syncSharpenDraft)
+watch([isSharpenOpen, () => props.sharpenEngine, aiState], probeSelectedModel)
+// 换了模型、等级或目标图后，原来选的结果倍数做不到时退回能做的（默认 2 倍）。
+watch(aiAllowedResolutions, (allowed) => {
+  if (allowed.length > 0 && !allowed.includes(aiResolution.value)) {
+    aiResolution.value = defaultResolution(allowed)
+  }
+})
 // 开始 / 结束修改已有文字时重画：原文字在编辑期间隐藏。
 watch(() => textDraft.value?.editingId ?? null, scheduleRender)
 watch(activeImageId, (id) => {
@@ -1918,7 +2004,14 @@ defineExpose({ focusImage })
         :engine="sharpenEngine"
         :settings="sharpenDraft"
         :ai-level="aiSharpenLevel"
-        :ai-state="sharpenAi"
+        :ai-state="aiState"
+        :ai-models="aiModels"
+        :ai-model-key="aiChoice?.key ?? ''"
+        :ai-model-note="aiModelNote"
+        :ai-resolution="aiResolution"
+        :ai-allowed-resolutions="aiAllowedResolutions"
+        :applied-model="sharpenTarget?.enhance?.model ?? null"
+        :applied-resolution="sharpenTarget?.enhance?.resolution ?? 1"
         :applied-engine="sharpenTarget?.enhance?.engine ?? null"
         :applied-ai-level="sharpenTarget?.enhance?.aiLevel ?? null"
         :ai-estimate-seconds="aiEstimateSeconds"
@@ -1927,6 +2020,8 @@ defineExpose({ focusImage })
         @change="onSharpenChange"
         @update:engine="emit('update-sharpen-engine', $event)"
         @update:ai-level="aiSharpenLevel = $event"
+        @update:ai-model="emit('update-sharpen-model', $event)"
+        @update:ai-resolution="aiResolution = $event"
         @ai-start="startAiSharpen"
         @ai-stop="stopAiSharpen"
         @reset="resetSharpen"

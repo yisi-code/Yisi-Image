@@ -1,5 +1,8 @@
 import { onBeforeUnmount, ref } from 'vue'
 import {
+  deleteCustomModel,
+  importCustomModel,
+  renameCustomModel,
   deleteModel,
   downloadModel,
   fetchModels,
@@ -122,6 +125,32 @@ export function useModels(enabled: boolean) {
     })
   }
 
+  function importCustom(): Promise<void> {
+    return run('请在弹出的窗口中选择 .onnx 模型文件…', async () => {
+      const result = await importCustomModel()
+      apply(result.snapshot)
+      if (!result.imported) {
+        return null
+      }
+      const name = result.snapshot.custom.find((item) => item.id === result.imported)?.name ?? '模型'
+      return { tone: 'success', text: `已导入「${name}」，第一次使用时会自动识别放大倍数` }
+    })
+  }
+
+  function renameCustom(id: string, name: string): Promise<void> {
+    return run('', async () => {
+      apply(await renameCustomModel(id, name))
+      return null
+    })
+  }
+
+  function removeCustom(id: string): Promise<void> {
+    return run('正在删除…', async () => {
+      apply(await deleteCustomModel(id))
+      return { tone: 'success', text: '自定义模型已删除' }
+    })
+  }
+
   function openDir(): Promise<void> {
     return run('', async () => {
       await openModelsDir()
@@ -150,5 +179,8 @@ export function useModels(enabled: boolean) {
     changeDir,
     resetDir,
     openDir,
+    importCustom,
+    renameCustom,
+    removeCustom,
   }
 }

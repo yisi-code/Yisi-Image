@@ -2,7 +2,6 @@ import * as ort from 'onnxruntime-web/wasm'
 import ortGlueUrl from 'onnxruntime-web/ort-wasm-simd-threaded.mjs?url'
 import { LAMA_SIZE, lamaCrop, lamaFeeds, lamaResult, miganFeeds, miganResult } from './aiInpaint'
 import { UPSCALE_FACTOR, planTiles, tileToTensor, writeTileResult } from './aiUpscale'
-import type { ModelId } from './modelApi'
 
 /**
  * 在 Worker 里用 onnxruntime-web（wasm）跑 AI 模型（修瑕、清晰化），页面不卡。
@@ -15,9 +14,10 @@ const IDLE_RELEASE_MS = 3 * 60 * 1000
 
 interface AiRequest {
   id: number
-  /** inpaint：修瑕（默认）；upscale：清晰化，输出宽高是输入的 4 倍 */
-  kind?: 'inpaint' | 'upscale'
-  model: ModelId
+  /** inpaint：修瑕（默认）；upscale：清晰化；probe：读一个陌生模型的输入要求并试算放大倍数 */
+  kind?: 'inpaint' | 'upscale' | 'probe'
+  /** 修瑕时是 migan / lama；清晰化时是内置或自定义模型的编号，只用来区分 */
+  model: string
   modelUrl: string
   runtimeUrl: string
   width: number
@@ -27,8 +27,14 @@ interface AiRequest {
   mask?: Uint8Array
   /** 是否允许多线程；主线程发现多线程卡住后会传 false 重试 */
   threads?: boolean
-  /** 清晰化结果要输入的几倍大（1、2 或 4）；模型输出 4 倍，多出来的按块取平均 */
+  /** 清晰化结果要输入的几倍大；必须是 modelScale 的约数，多出来的按块取平均 */
   outputFactor?: number
+  /** 模型的放大倍数，默认 4（Real-ESRGAN） */
+  modelScale?: number
+  /** 送进模型的宽高补到它的整数倍 */
+  multiple?: number
+  /** 模型只接受的固定输入尺寸 */
+  fixedSize?: { width: number; height: number } | null
 }
 
 interface AiResult {
@@ -36,6 +42,19 @@ interface AiResult {
   width: number
   height: number
 }
+
+/** probe 的结果：放大倍数与固定输入尺寸（没有固定尺寸时为 null） */
+interface ProbeResult {
+  scale: number
+  fixedSize: { width: number; height: number } | null
+}
+
+interface InputMetadata {
+  type?: string
+  shape?: ReadonlyArray<number | string>
+}
+
+const PROBE_SIZE = 32
 
 const scope = self as unknown as {
   onmessage: ((event: MessageEvent<AiRequest>) => void) | null
@@ -93,43 +112,90 @@ async function getSession(request: AiRequest, report: (fraction: number) => void
   return session
 }
 
-/** 清晰化：分块送进 Real-ESRGAN，每块只取中间部分，缩到 outputFactor 倍后拼回结果。 */
+/**
+ * 读模型的输入要求并用一小块灰图试算一次，得出放大倍数。只支持「一个 float32 [1,3,h,w] 输入、
+ * 一个同类型输出、宽高按同一整数倍放大」的模型，不符合时给出能看懂的原因。
+ */
+async function probe(session: ort.InferenceSession): Promise<ProbeResult> {
+  if (session.inputNames.length !== 1) {
+    throw new Error(`这个模型有 ${session.inputNames.length} 个输入，只支持一个图像输入的超分模型`)
+  }
+  const metadata = (session as unknown as { inputMetadata?: InputMetadata[] }).inputMetadata?.[0]
+  if (metadata?.type && metadata.type !== 'float32') {
+    throw new Error(`模型输入是 ${metadata.type}，目前只支持 float32`)
+  }
+  const shape = metadata?.shape
+  if (shape && shape.length !== 4) {
+    throw new Error('模型输入不是 [1, 3, 高, 宽] 的四维图像')
+  }
+  if (shape && typeof shape[1] === 'number' && shape[1] !== 3) {
+    throw new Error(`模型输入是 ${shape[1]} 通道，只支持 3 通道 RGB`)
+  }
+  const fixedHeight = typeof shape?.[2] === 'number' && shape[2] > 0 ? shape[2] : null
+  const fixedWidth = typeof shape?.[3] === 'number' && shape[3] > 0 ? shape[3] : null
+  const testWidth = fixedWidth ?? PROBE_SIZE
+  const testHeight = fixedHeight ?? PROBE_SIZE
+  const input = new Float32Array(3 * testWidth * testHeight).fill(0.5)
+  const result = await session.run({
+    [session.inputNames[0]]: new ort.Tensor('float32', input, [1, 3, testHeight, testWidth]),
+  })
+  const output = result[session.outputNames[0]]
+  if (output.type !== 'float32' || output.dims.length !== 4 || output.dims[1] !== 3) {
+    throw new Error('模型输出不是 float32 的 [1, 3, 高, 宽] 图像')
+  }
+  const scaleX = Number(output.dims[3]) / testWidth
+  const scaleY = Number(output.dims[2]) / testHeight
+  if (scaleX !== scaleY || !Number.isInteger(scaleX) || scaleX < 1 || scaleX > 8) {
+    throw new Error('模型输出不是输入的 1–8 整数倍，不是超分 / 清晰化模型')
+  }
+  return {
+    scale: scaleX,
+    fixedSize: fixedWidth && fixedHeight ? { width: fixedWidth, height: fixedHeight } : null,
+  }
+}
+
+/** 清晰化：分块送进模型，每块只取中间部分，缩到 outputFactor 倍后拼回结果。 */
 async function upscale(
   session: ort.InferenceSession,
   request: AiRequest,
   report: (fraction: number) => void,
 ): Promise<AiResult> {
   const { width, height, rgba } = request
-  const outputFactor = [1, 2, 4].includes(request.outputFactor ?? 0) ? (request.outputFactor as number) : UPSCALE_FACTOR
+  const modelScale = request.modelScale ?? UPSCALE_FACTOR
+  const outputFactor =
+    request.outputFactor && modelScale % request.outputFactor === 0 ? request.outputFactor : modelScale
   const outWidth = width * outputFactor
   const outHeight = height * outputFactor
   const output = new Uint8ClampedArray(outWidth * outHeight * 4)
-  const tiles = planTiles(width, height)
+  const tiles = planTiles(width, height, {
+    multiple: request.multiple ?? 1,
+    fixed: request.fixedSize ?? null,
+  })
   for (let index = 0; index < tiles.length; index += 1) {
     const tile = tiles[index]
     const result = await session.run({
       [session.inputNames[0]]: new ort.Tensor('float32', tileToTensor(rgba, width, tile), [
         1,
         3,
-        tile.height,
-        tile.width,
+        tile.inputHeight,
+        tile.inputWidth,
       ]),
     })
-    writeTileResult(
-      output,
-      outWidth,
-      result[session.outputNames[0]].data as Float32Array,
-      tile,
-      UPSCALE_FACTOR,
-      outputFactor,
-    )
+    const data = result[session.outputNames[0]].data
+    if (!(data instanceof Float32Array)) {
+      throw new Error('模型输出不是 float32')
+    }
+    writeTileResult(output, outWidth, data, tile, modelScale, outputFactor)
     report(0.25 + (0.75 * (index + 1)) / tiles.length)
   }
   return { rgba: output, width: outWidth, height: outHeight }
 }
 
-async function run(request: AiRequest, report: (fraction: number) => void): Promise<AiResult> {
+async function run(request: AiRequest, report: (fraction: number) => void): Promise<AiResult | ProbeResult> {
   const session = await getSession(request, report)
+  if (request.kind === 'probe') {
+    return probe(session)
+  }
   if (request.kind === 'upscale') {
     report(0.25)
     return upscale(session, request, report)
@@ -184,12 +250,16 @@ scope.onmessage = (event) => {
       running -= 1
       scheduleRelease()
     })
-    .then((result) =>
-      scope.postMessage(
-        { id: request.id, type: 'done', rgba: result.rgba, width: result.width, height: result.height },
-        [result.rgba.buffer],
-      ),
-    )
+    .then((result) => {
+      if ('rgba' in result) {
+        scope.postMessage(
+          { id: request.id, type: 'done', rgba: result.rgba, width: result.width, height: result.height },
+          [result.rgba.buffer],
+        )
+      } else {
+        scope.postMessage({ id: request.id, type: 'done', probe: result })
+      }
+    })
     .catch((error: unknown) =>
       scope.postMessage({
         id: request.id,

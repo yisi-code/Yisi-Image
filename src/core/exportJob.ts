@@ -12,6 +12,8 @@ export interface ExportItem {
   height: number
   /** 原文件字节数；拼接结果没有原文件，为 0 */
   originalSize: number
+  /** 这一项里 AI 清晰化保留的最高倍数（没有时为 1）；导出尺寸低于它时提示放大 */
+  detailScale: number
   /** 按缩放比例画出导出画布；background 为 null 时保留透明 */
   render: (scale: number, background: string | null) => HTMLCanvasElement
 }

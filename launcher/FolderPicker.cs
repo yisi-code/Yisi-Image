@@ -44,6 +44,28 @@ namespace Yisi.ImageTool
             }
         }
 
+        /// <summary>系统「打开文件」窗口，返回选中的文件；用户取消时返回 null。必须在 UI 线程调用。</summary>
+        internal static string PickFile(string title, string filter, string initialDirectory)
+        {
+            using (Form owner = CreateOwner())
+            using (OpenFileDialog dialog = new OpenFileDialog())
+            {
+                owner.Show();
+                owner.Activate();
+                SetForegroundWindow(owner.Handle);
+                dialog.Title = title;
+                dialog.Filter = filter;
+                dialog.CheckFileExists = true;
+                dialog.Multiselect = false;
+                dialog.RestoreDirectory = true;
+                if (!string.IsNullOrWhiteSpace(initialDirectory) && Directory.Exists(initialDirectory))
+                {
+                    dialog.InitialDirectory = initialDirectory;
+                }
+                return dialog.ShowDialog(owner) == DialogResult.OK ? dialog.FileName : null;
+            }
+        }
+
         private static Form CreateOwner()
         {
             Rectangle area = Screen.FromPoint(Cursor.Position).WorkingArea;

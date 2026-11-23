@@ -257,6 +257,8 @@ namespace Yisi.ImageTool
 
             // 设置页「更改目录」：HTTP 线程在这里等待用户在系统窗口里选完目录。
             server.PickFolderRequested = PickFolderOnUiThread;
+            // 设置页「导入模型…」：同样在 UI 线程弹出系统「打开文件」窗口。
+            server.PickFileRequested = PickModelFileOnUiThread;
 
             ToolStripMenuItem exitItem = new ToolStripMenuItem("退出");
             exitItem.Click += delegate { ExitApplication(); };
@@ -348,6 +350,45 @@ namespace Yisi.ImageTool
                 throw failure is ConfigException
                     ? failure
                     : new ConfigException("无法打开选择目录窗口：" + failure.Message, failure);
+            }
+            return selected;
+        }
+
+        private string PickModelFileOnUiThread(string initialDirectory)
+        {
+            string selected = null;
+            Exception failure = null;
+            uiContext.Send(delegate
+            {
+                if (isPickingFolder)
+                {
+                    failure = new ModelException("选择窗口已经打开，请先完成或取消");
+                    return;
+                }
+
+                isPickingFolder = true;
+                try
+                {
+                    selected = FolderPicker.PickFile(
+                        "选择要导入的 ONNX 清晰化模型",
+                        "ONNX 模型 (*.onnx)|*.onnx",
+                        initialDirectory);
+                }
+                catch (Exception ex)
+                {
+                    failure = ex;
+                }
+                finally
+                {
+                    isPickingFolder = false;
+                }
+            }, null);
+
+            if (failure != null)
+            {
+                throw failure is ModelException
+                    ? failure
+                    : new ModelException("无法打开选择文件窗口：" + failure.Message, failure);
             }
             return selected;
         }
@@ -495,6 +536,9 @@ namespace Yisi.ImageTool
         /// 由托盘上下文转到 UI 线程弹出系统窗口。
         /// </summary>
         internal Func<string, string> PickFolderRequested { get; set; }
+
+        /// <summary>设置页请求导入模型文件时调用，参数是初始目录；返回选中的文件，取消时返回 null。</summary>
+        internal Func<string, string> PickFileRequested { get; set; }
 
         public StaticServer(string url)
         {
@@ -899,6 +943,35 @@ namespace Yisi.ImageTool
                 {
                     ModelStore.OpenInExplorer();
                     json = "{\"ok\":true}";
+                }
+                else if (path == "/api/models/custom/import")
+                {
+                    Func<string, string> picker = PickFileRequested;
+                    if (picker == null)
+                    {
+                        status = "503 Service Unavailable";
+                        json = ErrorJson("选择文件功能不可用");
+                    }
+                    else
+                    {
+                        string selected = picker(null);
+                        json = selected == null
+                            ? "{\"canceled\":true," + ModelStore.DescribeJson().Substring(1)
+                            : "{\"imported\":" + new JavaScriptSerializer().Serialize(CustomModelStore.Import(selected)) +
+                                "," + ModelStore.DescribeJson().Substring(1);
+                    }
+                }
+                else if (path == "/api/models/custom/rename")
+                {
+                    CustomModelStore.Rename(
+                        ReadStringField(request.Body, "id"),
+                        ReadStringField(request.Body, "name"));
+                    json = ModelStore.DescribeJson();
+                }
+                else if (path == "/api/models/custom/delete")
+                {
+                    CustomModelStore.Delete(ReadStringField(request.Body, "id"));
+                    json = ModelStore.DescribeJson();
                 }
                 else
                 {

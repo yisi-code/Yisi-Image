@@ -46,11 +46,27 @@ export interface ModelStatus {
   modelUrl: string
 }
 
+/** 用户导入的清晰化模型（只在 EXE 版里，由启动器保存在模型目录的 custom 文件夹） */
+export interface CustomModel {
+  /** custom-SHA-256 前 12 位 */
+  id: string
+  name: string
+  size: number
+  sha256: string
+  /** 文件还在、大小一致 */
+  available: boolean
+  modelUrl: string
+}
+
 export interface ModelsSnapshot {
   dir: string
   defaultDir: string
   isDefault: boolean
   items: ModelStatus[]
+  /** 各模型共用的运行库是否已下载；自定义模型要靠它才能运行 */
+  runtimeReady: boolean
+  runtimeUrl: string
+  custom: CustomModel[]
 }
 
 const MODEL_STATES: readonly ModelState[] = [
@@ -75,6 +91,10 @@ interface ModelsResponse extends LauncherResponse {
   items?: unknown
   moved?: boolean
   canceled?: boolean
+  runtimeReady?: unknown
+  runtimeUrl?: unknown
+  custom?: unknown
+  imported?: unknown
 }
 
 function toStatus(value: unknown): ModelStatus | null {
@@ -103,16 +123,43 @@ function toStatus(value: unknown): ModelStatus | null {
   }
 }
 
+function toCustom(value: unknown): CustomModel | null {
+  const item = (value ?? {}) as Record<string, unknown>
+  if (
+    typeof item.id !== 'string' ||
+    typeof item.name !== 'string' ||
+    typeof item.modelUrl !== 'string' ||
+    typeof item.size !== 'number'
+  ) {
+    return null
+  }
+  return {
+    id: item.id,
+    name: item.name,
+    size: item.size,
+    sha256: typeof item.sha256 === 'string' ? item.sha256 : '',
+    available: item.available === true,
+    modelUrl: item.modelUrl,
+  }
+}
+
 function toSnapshot(body: ModelsResponse): ModelsSnapshot {
   const items = Array.isArray(body.items) ? body.items.map(toStatus) : null
   if (typeof body.dir !== 'string' || !items || items.some((item) => item === null)) {
     throw new ConfigApiError('本地服务返回的模型信息不完整')
   }
+  // 自定义模型清单里个别条目损坏时跳过它，不让整个模型列表读不出来。
+  const custom = Array.isArray(body.custom)
+    ? body.custom.map(toCustom).filter((item): item is CustomModel => item !== null)
+    : []
   return {
     dir: body.dir,
     defaultDir: typeof body.defaultDir === 'string' ? body.defaultDir : body.dir,
     isDefault: body.isDefault === true,
     items: items as ModelStatus[],
+    runtimeReady: body.runtimeReady === true,
+    runtimeUrl: typeof body.runtimeUrl === 'string' ? body.runtimeUrl : '',
+    custom,
   }
 }
 
@@ -155,6 +202,20 @@ export async function moveModelsDir(
 ): Promise<{ snapshot: ModelsSnapshot; moved: boolean }> {
   const body = await post('/api/models/location', { dir })
   return { snapshot: toSnapshot(body), moved: body.moved === true }
+}
+
+/** 弹出系统「打开文件」窗口导入一个 ONNX 模型；取消时 imported 为 null。 */
+export async function importCustomModel(): Promise<{ snapshot: ModelsSnapshot; imported: string | null }> {
+  const body = await post('/api/models/custom/import')
+  return { snapshot: toSnapshot(body), imported: typeof body.imported === 'string' ? body.imported : null }
+}
+
+export async function renameCustomModel(id: string, name: string): Promise<ModelsSnapshot> {
+  return toSnapshot(await post('/api/models/custom/rename', { id, name }))
+}
+
+export async function deleteCustomModel(id: string): Promise<ModelsSnapshot> {
+  return toSnapshot(await post('/api/models/custom/delete', { id }))
 }
 
 export async function openModelsDir(): Promise<void> {
