@@ -456,6 +456,60 @@ p {
   box-shadow: 0 1px 3px rgba(19, 32, 28, 0.18);
 }
 
+/* 前后对比的标签、中线与拖动把手：导出对话框的对比视图与预览画布的对比共用。
+   中线由使用方用 left 定位，父元素需是定位容器。 */
+.compare-label {
+  position: absolute;
+  top: 8px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(19, 32, 28, 0.66);
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 600;
+  pointer-events: none;
+}
+
+.compare-label--before {
+  left: 8px;
+}
+
+.compare-label--after {
+  right: 8px;
+}
+
+.compare-divider {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--surface);
+  box-shadow: 0 0 0 1px rgba(19, 32, 28, 0.18);
+  pointer-events: none;
+}
+
+.compare-handle {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: var(--shadow-xs);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: ew-resize;
+  pointer-events: auto;
+  transform: translate(-50%, -50%);
+}
+
 .spin {
   animation: ui-spin 0.9s linear infinite;
 }

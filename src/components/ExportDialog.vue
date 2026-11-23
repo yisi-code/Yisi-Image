@@ -141,7 +141,8 @@ const subtitle = computed(() => {
     ? `拼接结果 ${formatDimensions(item.width, item.height)} px`
     : `${item.name} · ${formatDimensions(item.width, item.height)} px`
 })
-const beforeLabel = computed(() => (props.mode === 'stitch' ? '未压缩' : '原图'))
+// 左边是处理后（标注、修瑕、清晰化都在）但还没压缩的画面，右边是真实编码后的效果。
+const beforeLabel = '未压缩'
 const afterLabel = computed(() => `导出 ${format.value.label}`)
 const canSave = computed(
   () => !isSaving.value && previewItem.value !== null && (isBatch.value || sizeCheck.value?.ok === true),

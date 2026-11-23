@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Loader2 } from 'lucide-vue-next'
+import { Loader2, Minus, Plus } from 'lucide-vue-next'
 import { getCheckerPattern } from '../core/render'
 
 /**
  * 前后对比视图：左边画「处理前」，右边画「处理后」，中间竖线可拖动。
- * 「适应」把整张图缩进视图；「100%」按实际像素显示，可按住拖动查看局部。
+ * 可滚轮缩放（以指针处为中心）、按 − / + 逐级缩放，「适应」把整张图缩进视图，「100%」按实际像素显示；
+ * 画面比视图大时按住拖动平移，拖中线才改对比位置；双击在适应与 100% 之间切换。
  */
 const props = withDefaults(
   defineProps<{
@@ -25,15 +26,18 @@ const props = withDefaults(
   },
 )
 
-type ZoomMode = 'fit' | 'actual'
-
 const SPLIT_STEP = 0.05
+const MAX_SCALE = 8
+const ZOOM_STEP = 1.25
+/** 滚轮每单位 deltaY 对应的缩放指数 */
+const WHEEL_ZOOM_SPEED = 0.0015
 
 const containerRef = ref<HTMLDivElement | null>(null)
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 const viewSize = ref({ width: 0, height: 0 })
 const split = ref(0.5)
-const zoomMode = ref<ZoomMode>('fit')
+/** 用户选的缩放比例；null 表示「适应」，跟着视图大小变 */
+const customScale = ref<number | null>(null)
 const offset = ref({ x: 0, y: 0 })
 let dragState:
   | { kind: 'split'; pointerId: number }
@@ -42,13 +46,25 @@ let dragState:
 let resizeObserver: ResizeObserver | null = null
 let frame = 0
 
-const scale = computed(() => {
+/** 整张图放进视图的比例；小图不放大，最多 100%。 */
+const fitScale = computed(() => {
   const { width, height } = viewSize.value
-  if (zoomMode.value === 'actual' || props.width <= 0 || props.height <= 0) {
+  if (props.width <= 0 || props.height <= 0 || width <= 0 || height <= 0) {
     return 1
   }
   return Math.min(1, width / props.width, height / props.height)
 })
+const minScale = computed(() => Math.min(fitScale.value, 1))
+const scale = computed(() => customScale.value ?? fitScale.value)
+const scalePercent = computed(() => `${Math.round(scale.value * 100)}%`)
+const isFit = computed(() => customScale.value === null)
+const isActual = computed(() => Math.abs(scale.value - 1) < 0.001)
+/** 画面超出视图时可以拖动平移 */
+const canPan = computed(
+  () =>
+    props.width * scale.value > viewSize.value.width + 0.5 ||
+    props.height * scale.value > viewSize.value.height + 0.5,
+)
 
 const splitPercent = computed(() => Math.round(split.value * 100))
 
@@ -89,8 +105,8 @@ function draw(): void {
 
   context.fillStyle = getCheckerPattern(context)
   context.fillRect(left, top, contentWidth, contentHeight)
-  // 100% 时按像素原样显示，方便看压缩块和锐化边缘。
-  context.imageSmoothingEnabled = zoomMode.value === 'fit'
+  // 放大到 100% 及以上时按像素原样显示，方便看压缩块和锐化边缘。
+  context.imageSmoothingEnabled = scale.value < 1
   context.imageSmoothingQuality = 'high'
 
   if (props.before) {
@@ -126,10 +142,58 @@ function measure(): void {
   scheduleDraw()
 }
 
-function setZoom(mode: ZoomMode): void {
-  zoomMode.value = mode
+function fitView(): void {
+  customScale.value = null
   offset.value = { x: 0, y: 0 }
   scheduleDraw()
+}
+
+/** 缩放到 next，并让视图里 (anchorX, anchorY) 处的那一点保持不动；不给锚点时以视图中心为准。 */
+function zoomTo(next: number, anchorX = viewSize.value.width / 2, anchorY = viewSize.value.height / 2): void {
+  const previous = scale.value
+  const target = Math.min(MAX_SCALE, Math.max(minScale.value, next))
+  if (Math.abs(target - previous) < 0.0001) {
+    return
+  }
+  const { width: viewWidth, height: viewHeight } = viewSize.value
+  const left = (viewWidth - props.width * previous) / 2 + offset.value.x
+  const top = (viewHeight - props.height * previous) / 2 + offset.value.y
+  const contentX = (anchorX - left) / previous
+  const contentY = (anchorY - top) / previous
+  customScale.value = target
+  offset.value = clampOffset({
+    x: anchorX - contentX * target - (viewWidth - props.width * target) / 2,
+    y: anchorY - contentY * target - (viewHeight - props.height * target) / 2,
+  })
+  scheduleDraw()
+}
+
+function onWheel(event: WheelEvent): void {
+  if (props.width <= 0 || props.height <= 0) {
+    return
+  }
+  event.preventDefault()
+  const rect = containerRef.value?.getBoundingClientRect()
+  if (!rect) {
+    return
+  }
+  zoomTo(
+    scale.value * Math.exp(-event.deltaY * WHEEL_ZOOM_SPEED),
+    event.clientX - rect.left,
+    event.clientY - rect.top,
+  )
+}
+
+function onDoubleClick(event: MouseEvent): void {
+  if (event.target instanceof HTMLElement && event.target.closest('.compare-handle')) {
+    return
+  }
+  if (isActual.value) {
+    fitView()
+    return
+  }
+  const rect = containerRef.value?.getBoundingClientRect()
+  zoomTo(1, rect ? event.clientX - rect.left : undefined, rect ? event.clientY - rect.top : undefined)
 }
 
 function splitFromEvent(event: PointerEvent): number {
@@ -147,8 +211,8 @@ function onPointerDown(event: PointerEvent): void {
   const target = event.currentTarget as HTMLElement
   target.setPointerCapture(event.pointerId)
   const onHandle = event.target instanceof HTMLElement && event.target.closest('.compare-handle')
-  // 适应模式下点哪里中线就到哪里；100% 模式下拖动画面平移，拖中线才改对比位置。
-  if (onHandle || zoomMode.value === 'fit') {
+  // 画面完整放得下时点哪里中线就到哪里；超出视图时拖动画面平移，拖中线才改对比位置。
+  if (onHandle || !canPan.value) {
     dragState = { kind: 'split', pointerId: event.pointerId }
     split.value = splitFromEvent(event)
   } else {
@@ -229,7 +293,9 @@ onBeforeUnmount(() => {
     <div
       ref="containerRef"
       class="compare-viewport"
-      :class="{ 'is-actual': zoomMode === 'actual' }"
+      :class="{ 'can-pan': canPan }"
+      @wheel="onWheel"
+      @dblclick="onDoubleClick"
       @pointerdown="onPointerDown"
       @pointermove="onPointerMove"
       @pointerup="onPointerUp"
@@ -260,30 +326,53 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="compare-toolbar">
-      <div class="segmented compare-zoom" role="group" aria-label="对比视图缩放">
+      <div class="compare-zoom-steps" role="group" aria-label="对比视图缩放">
+        <button
+          class="icon-button compare-zoom-button"
+          type="button"
+          :disabled="scale <= minScale + 0.0001"
+          title="缩小"
+          aria-label="缩小对比视图"
+          @click="zoomTo(scale / ZOOM_STEP)"
+        >
+          <Minus :size="14" :stroke-width="2" />
+        </button>
+        <span class="compare-zoom-value tnum" aria-live="polite">{{ scalePercent }}</span>
+        <button
+          class="icon-button compare-zoom-button"
+          type="button"
+          :disabled="scale >= MAX_SCALE - 0.0001"
+          title="放大"
+          aria-label="放大对比视图"
+          @click="zoomTo(scale * ZOOM_STEP)"
+        >
+          <Plus :size="14" :stroke-width="2" />
+        </button>
+      </div>
+      <div class="segmented compare-zoom" role="group" aria-label="对比视图快捷缩放">
         <button
           type="button"
           class="segment"
-          :class="{ 'is-active': zoomMode === 'fit' }"
-          :aria-pressed="zoomMode === 'fit'"
+          :class="{ 'is-active': isFit }"
+          :aria-pressed="isFit"
           title="整张图缩进视图"
-          @click="setZoom('fit')"
+          @click="fitView"
         >
           适应
         </button>
         <button
           type="button"
           class="segment"
-          :class="{ 'is-active': zoomMode === 'actual' }"
-          :aria-pressed="zoomMode === 'actual'"
+          :class="{ 'is-active': !isFit && isActual }"
+          :aria-pressed="!isFit && isActual"
           title="按实际像素显示，按住拖动查看局部"
-          @click="setZoom('actual')"
+          @click="zoomTo(1)"
         >
           100%
         </button>
       </div>
       <span class="compare-tip">
-        {{ zoomMode === 'fit' ? '点击或拖动画面移动中线' : '拖动画面平移，拖中线对比' }}
+        {{ canPan ? '滚轮缩放，拖动画面平移，拖中线对比' : '滚轮缩放，点击或拖动画面移动中线' }}
       </span>
     </div>
   </div>
@@ -314,7 +403,7 @@ onBeforeUnmount(() => {
   user-select: none;
 }
 
-.compare-viewport.is-actual {
+.compare-viewport.can-pan {
   cursor: grab;
 }
 
@@ -324,58 +413,6 @@ onBeforeUnmount(() => {
   display: block;
   width: 100%;
   height: 100%;
-}
-
-.compare-label {
-  position: absolute;
-  top: 8px;
-  padding: 3px 8px;
-  border-radius: 999px;
-  background: rgba(19, 32, 28, 0.66);
-  color: #fff;
-  font-size: 10.5px;
-  font-weight: 600;
-  pointer-events: none;
-}
-
-.compare-label--before {
-  left: 8px;
-}
-
-.compare-label--after {
-  right: 8px;
-}
-
-.compare-divider {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 2px;
-  margin-left: -1px;
-  background: var(--surface);
-  box-shadow: 0 0 0 1px rgba(19, 32, 28, 0.18);
-  pointer-events: none;
-}
-
-.compare-handle {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  display: inline-flex;
-  width: 30px;
-  height: 30px;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--border-strong);
-  border-radius: 50%;
-  background: var(--surface);
-  box-shadow: var(--shadow-xs);
-  color: var(--text-muted);
-  font-size: 12px;
-  font-weight: 700;
-  cursor: ew-resize;
-  pointer-events: auto;
-  transform: translate(-50%, -50%);
 }
 
 .compare-busy {
@@ -396,8 +433,28 @@ onBeforeUnmount(() => {
 
 .compare-toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 6px 10px;
+}
+
+.compare-zoom-steps {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.compare-zoom-button {
+  width: 28px;
+  height: 28px;
+}
+
+.compare-zoom-value {
+  min-width: 46px;
+  color: var(--text-strong);
+  font-size: 11.5px;
+  font-weight: 650;
+  text-align: center;
 }
 
 .compare-zoom .segment {

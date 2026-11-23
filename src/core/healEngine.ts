@@ -1,4 +1,5 @@
 import type { HealJob } from './heal'
+import { WorkerClient } from './workerClient'
 import type { AiModelId } from './modelApi'
 import type { HealFill } from './types'
 
@@ -26,83 +27,9 @@ export type HealEngineChoice =
 
 /**
  * 修瑕引擎入口：经典算法与 AI 模型各在自己的 Web Worker 里跑，
- * 两个 Worker 共用一套「按请求 id 回传进度与结果」的协议（WorkerClient）。
+ * 两个 Worker 共用一套「按请求 id 回传进度与结果」的协议（workerClient.ts）。
  * AI 出错（模型文件损坏、内存不足等）时自动改用经典算法，并在 notice 里说明原因。
  */
-
-interface WorkerMessage {
-  id: number
-  type: 'progress' | 'done' | 'error'
-  fraction?: number
-  message?: string
-  [key: string]: unknown
-}
-
-interface PendingCall {
-  resolve: (message: WorkerMessage) => void
-  reject: (error: Error) => void
-  onProgress?: (fraction: number) => void
-}
-
-class WorkerClient {
-  private worker: Worker | null = null
-  private sequence = 0
-  private readonly pending = new Map<number, PendingCall>()
-
-  constructor(
-    private readonly create: () => Worker,
-    private readonly failureText: string,
-  ) {}
-
-  call(
-    payload: Record<string, unknown>,
-    transfer: Transferable[],
-    onProgress?: (fraction: number) => void,
-  ): Promise<WorkerMessage> {
-    return new Promise((resolve, reject) => {
-      this.sequence += 1
-      const id = this.sequence
-      this.pending.set(id, { resolve, reject, onProgress })
-      this.getWorker().postMessage({ ...payload, id }, transfer)
-    })
-  }
-
-  private getWorker(): Worker {
-    if (this.worker) {
-      return this.worker
-    }
-    const worker = this.create()
-    worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
-      const message = event.data
-      const call = this.pending.get(message.id)
-      if (!call) {
-        return
-      }
-      if (message.type === 'progress') {
-        call.onProgress?.(message.fraction ?? 0)
-        return
-      }
-      this.pending.delete(message.id)
-      if (message.type === 'done') {
-        call.resolve(message)
-      } else {
-        call.reject(new Error(message.message || this.failureText))
-      }
-    }
-    worker.onerror = (event) => {
-      event.preventDefault()
-      const error = new Error(event.message || this.failureText)
-      for (const call of this.pending.values()) {
-        call.reject(error)
-      }
-      this.pending.clear()
-      worker.terminate()
-      this.worker = null
-    }
-    this.worker = worker
-    return worker
-  }
-}
 
 const classicWorker = new WorkerClient(
   () => new Worker(new URL('./inpaint.worker.ts', import.meta.url), { type: 'module' }),

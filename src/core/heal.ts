@@ -1,4 +1,5 @@
 import { traceStroke } from './annotations'
+import { getImageSource } from './image'
 import type { HealPatch, StitchImage, StrokeAnnotation } from './types'
 
 /**
@@ -76,11 +77,13 @@ export function prepareHealJob(image: StitchImage, stroke: StrokeAnnotation): He
   const sourceContext = context2d(source)
   sourceContext.imageSmoothingQuality = 'high'
   sourceContext.setTransform(scale, 0, 0, scale, -x * scale, -y * scale)
-  if (image.kind === 'blank' || !image.element) {
+  // 取样用这张图当前的画面：清晰化过就从清晰化结果里补。
+  const picture = image.kind === 'blank' ? null : getImageSource(image)
+  if (!picture) {
     sourceContext.fillStyle = image.backgroundColor ?? '#ffffff'
     sourceContext.fillRect(0, 0, image.width, image.height)
   } else {
-    sourceContext.drawImage(image.element, 0, 0, image.width, image.height)
+    sourceContext.drawImage(picture, 0, 0, image.width, image.height)
   }
   // 之前的修瑕结果也是「画面」的一部分；画笔和文字不算，修瑕时会被补成背景。
   for (const annotation of image.annotations) {

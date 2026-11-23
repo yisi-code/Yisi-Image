@@ -110,7 +110,18 @@ export function createBlankPage(
   }
 }
 
+/** 这张图当前的画面：清晰化过就用结果画布，否则用原图；空白页返回 null。 */
+export function getImageSource(image: StitchImage): CanvasImageSource | null {
+  return image.enhance?.canvas ?? image.element ?? null
+}
+
 export function releaseImage(image: StitchImage): void {
+  if (image.enhance) {
+    // 及早释放清晰化结果占用的内存。
+    image.enhance.canvas.width = 0
+    image.enhance.canvas.height = 0
+    image.enhance = undefined
+  }
   if (!image.element) {
     return
   }

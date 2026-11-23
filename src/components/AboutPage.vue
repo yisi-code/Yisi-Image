@@ -96,8 +96,8 @@ const features = [
   },
   {
     icon: PenLine,
-    title: '预览标注',
-    detail: '文字可再改；笔触显示范围；修瑕可选经典或 AI',
+    title: '标注与处理',
+    detail: '文字可再改；修瑕可选经典或 AI；清晰化与前后对比',
   },
   {
     icon: FilePlus2,

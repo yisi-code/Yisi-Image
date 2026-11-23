@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, markRaw, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { Component } from 'vue'
 import {
   Check,
   ChevronsRight,
   ChevronsUp,
+  Columns2,
   Eraser,
   FilePlus2,
   GripVertical,
@@ -16,6 +17,7 @@ import {
   Paintbrush,
   Plus,
   Redo2,
+  Sparkles,
   Type,
   Undo2,
   UploadCloud,
@@ -23,6 +25,11 @@ import {
   X,
 } from 'lucide-vue-next'
 import FloatingToolbar from './FloatingToolbar.vue'
+import SharpenPanel from './SharpenPanel.vue'
+import { releaseCanvas } from '../core/exportJob'
+import { DEFAULT_SHARPEN, isSharpenNoop } from '../core/sharpen'
+import type { SharpenSettings } from '../core/sharpen'
+import { sharpenImage } from '../core/sharpenEngine'
 import { useFileDrop } from '../composables/useFileDrop'
 import {
   cloneAnnotations,
@@ -99,6 +106,7 @@ const emit = defineEmits<{
   'heal-notice': [message: string]
   /** 修瑕计算开始 / 结束；单图模式据此暂时禁止切换图片，免得结果写不回去 */
   'busy-change': [busy: boolean]
+  'sharpen-failed': [message: string]
 }>()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
@@ -132,6 +140,18 @@ const textDraft = ref<TextDraft | null>(null)
 /** 修瑕正在计算：期间不接受新的涂抹与撤销重做。 */
 const isHealing = ref(false)
 const healProgress = ref(0)
+/** 清晰化面板是否打开、面板里显示的参数、正在计算的张数与进度 */
+const isSharpenOpen = ref(false)
+const sharpenDraft = ref<SharpenSettings>({ ...DEFAULT_SHARPEN })
+const sharpenRunning = ref(0)
+const sharpenProgress = ref(0)
+/** 前后对比：打开后画布上出现中线，左边画原图 */
+const isComparing = ref(false)
+const compareSplit = ref(0.5)
+let sharpenTimer: ReturnType<typeof setTimeout> | undefined
+/** 每张图最新一次清晰化请求的编号，旧请求的结果到了直接丢掉 */
+const sharpenTokens = new Map<string, number>()
+let compareDrag: { pointerId: number } | null = null
 /** 画笔、橡皮擦、修瑕的范围圈位置（视口内坐标）；指针不在画布上时为空。 */
 const cursorPoint = ref<{ x: number; y: number } | null>(null)
 const undoStack = ref<HistoryEntry[]>([])
@@ -241,6 +261,24 @@ const previewLabel = computed(() =>
 const activeImage = computed(
   () => props.images.find((image) => image.id === activeImageId.value) ?? null,
 )
+/** 清晰化作用的图片：单图编辑是当前这张，拼接是预览里选中的那张 */
+const sharpenTarget = computed<StitchImage | null>(() =>
+  props.singleImage ? (props.images[0] ?? null) : activeImage.value,
+)
+const sharpenDisabledReason = computed(() => {
+  const target = sharpenTarget.value
+  if (!target) {
+    return '先选中一张图片：点左侧卡片，或把它移到画面中间。'
+  }
+  if (target.kind === 'blank') {
+    return '空白页不需要清晰化；选中一张图片再试。'
+  }
+  if (!target.element) {
+    return '图片还没读完，请稍候。'
+  }
+  return ''
+})
+const comparePercent = computed(() => Math.round(compareSplit.value * 100))
 const activeItem = computed(
   () => props.layout.items.find((item) => item.id === activeImageId.value) ?? null,
 )
@@ -1350,6 +1388,129 @@ function handleResize(): void {
   scheduleRender()
 }
 
+function syncSharpenDraft(): void {
+  sharpenDraft.value = { ...(sharpenTarget.value?.enhance?.sharpen ?? DEFAULT_SHARPEN) }
+}
+
+function toggleSharpenPanel(): void {
+  isSharpenOpen.value = !isSharpenOpen.value
+  if (isSharpenOpen.value) {
+    syncSharpenDraft()
+  }
+}
+
+function clearEnhance(image: StitchImage): void {
+  if (image.enhance) {
+    releaseCanvas(image.enhance.canvas)
+    image.enhance = undefined
+  }
+}
+
+async function runSharpen(image: StitchImage, settings: SharpenSettings): Promise<void> {
+  const token = (sharpenTokens.get(image.id) ?? 0) + 1
+  sharpenTokens.set(image.id, token)
+  if (!image.element) {
+    return
+  }
+  if (isSharpenNoop(settings)) {
+    clearEnhance(image)
+    scheduleRender()
+    return
+  }
+  sharpenRunning.value += 1
+  sharpenProgress.value = 0
+  try {
+    const canvas = await sharpenImage(image.element, image.width, image.height, settings, (fraction) => {
+      if (sharpenTokens.get(image.id) === token) {
+        sharpenProgress.value = fraction
+      }
+    })
+    if (sharpenTokens.get(image.id) !== token) {
+      releaseCanvas(canvas)
+      return
+    }
+    const previous = image.enhance?.canvas
+    image.enhance = { sharpen: { ...settings }, canvas: markRaw(canvas) }
+    releaseCanvas(previous)
+    scheduleRender()
+  } catch (error) {
+    console.error('清晰化失败', error)
+    if (sharpenTokens.get(image.id) === token) {
+      emit('sharpen-failed', error instanceof Error && error.message ? error.message : '清晰化计算失败')
+    }
+  } finally {
+    sharpenRunning.value -= 1
+  }
+}
+
+function onSharpenChange(settings: SharpenSettings): void {
+  const target = sharpenTarget.value
+  if (!target || sharpenDisabledReason.value) {
+    return
+  }
+  sharpenDraft.value = settings
+  window.clearTimeout(sharpenTimer)
+  // 拖滑块时连续触发，停一下再算，避免每一格都算一遍。
+  sharpenTimer = setTimeout(() => void runSharpen(target, settings), 180)
+}
+
+function resetSharpen(): void {
+  const target = sharpenTarget.value
+  window.clearTimeout(sharpenTimer)
+  if (!target) {
+    return
+  }
+  // 让还在算的旧请求作废。
+  sharpenTokens.set(target.id, (sharpenTokens.get(target.id) ?? 0) + 1)
+  clearEnhance(target)
+  syncSharpenDraft()
+  scheduleRender()
+}
+
+function toggleCompare(): void {
+  isComparing.value = !isComparing.value
+}
+
+function compareFromEvent(event: PointerEvent): void {
+  const rect = viewportRef.value?.getBoundingClientRect()
+  if (rect && rect.width > 0) {
+    compareSplit.value = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width))
+  }
+}
+
+function startCompareDrag(event: PointerEvent): void {
+  if (event.button !== 0) {
+    return
+  }
+  event.preventDefault()
+  ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+  compareDrag = { pointerId: event.pointerId }
+}
+
+function moveCompareDrag(event: PointerEvent): void {
+  if (compareDrag?.pointerId === event.pointerId) {
+    compareFromEvent(event)
+  }
+}
+
+function endCompareDrag(event: PointerEvent): void {
+  if (compareDrag?.pointerId === event.pointerId) {
+    compareDrag = null
+  }
+}
+
+function onCompareKeydown(event: KeyboardEvent): void {
+  const step = event.shiftKey ? 0.1 : 0.05
+  if (event.key === 'ArrowLeft') {
+    compareSplit.value = Math.max(0, compareSplit.value - step)
+  } else if (event.key === 'ArrowRight') {
+    compareSplit.value = Math.min(1, compareSplit.value + step)
+  } else {
+    return
+  }
+  event.preventDefault()
+}
+
 function renderPreview(): void {
   const canvas = canvasRef.value
   const viewport = viewportRef.value
@@ -1407,6 +1568,7 @@ function renderPreview(): void {
     offset: offset.value,
     dpr: Math.min(window.devicePixelRatio || 1, PREVIEW_MAX_DPR),
     background: props.background,
+    compareSplit: isComparing.value ? compareSplit.value : null,
     hiddenAnnotationId: textDraft.value?.editingId ?? null,
   })
   if (!isHoldingActiveImage) {
@@ -1422,6 +1584,9 @@ function scheduleRender(): void {
 watch(() => props.layout, scheduleRender, { flush: 'post' })
 watch(zoom, scheduleRender, { flush: 'post' })
 watch(() => props.background, scheduleRender)
+watch([isComparing, compareSplit], scheduleRender)
+// 换了作用的图片（切换单图、拼接里选中另一张），面板里的参数跟着换成那张的。
+watch(() => sharpenTarget.value?.id ?? null, syncSharpenDraft)
 // 开始 / 结束修改已有文字时重画：原文字在编辑期间隐藏。
 watch(() => textDraft.value?.editingId ?? null, scheduleRender)
 watch(activeImageId, (id) => {
@@ -1454,6 +1619,9 @@ watch(
     }
     commitText()
     annotationTool.value = 'select'
+    // 开关在工具栏上，工具栏收起后看不到，一并关掉。
+    isSharpenOpen.value = false
+    isComparing.value = false
   },
 )
 
@@ -1647,7 +1815,44 @@ defineExpose({ focusImage })
         >
           <Redo2 :size="14" :stroke-width="1.9" />
         </button>
+        <span class="annotation-separator" aria-hidden="true" />
+        <button
+          v-tooltip="'清晰化：让发软的图片更清楚'"
+          class="annotation-tool"
+          :class="{ 'is-active': isSharpenOpen }"
+          type="button"
+          aria-label="清晰化"
+          :aria-pressed="isSharpenOpen"
+          @click="toggleSharpenPanel"
+        >
+          <Sparkles :size="14" :stroke-width="1.9" />
+        </button>
+        <button
+          v-tooltip="isComparing ? '关闭前后对比' : '前后对比：左边原图，右边处理后'"
+          class="annotation-tool"
+          :class="{ 'is-active': isComparing }"
+          type="button"
+          aria-label="前后对比"
+          :aria-pressed="isComparing"
+          @click="toggleCompare"
+        >
+          <Columns2 :size="14" :stroke-width="1.9" />
+        </button>
       </FloatingToolbar>
+
+      <SharpenPanel
+        v-if="isSharpenOpen && images.length > 0 && !annotationToolbar.collapsed"
+        class="sharpen-popover"
+        :target-name="sharpenTarget?.name ?? null"
+        :disabled-reason="sharpenDisabledReason"
+        :settings="sharpenDraft"
+        :applied="Boolean(sharpenTarget?.enhance)"
+        :busy="sharpenRunning > 0"
+        :progress="sharpenProgress"
+        @change="onSharpenChange"
+        @reset="resetSharpen"
+        @close="isSharpenOpen = false"
+      />
 
       <div class="preview-stage" :class="{ 'is-file-dragging': isFileDragging }">
         <div
@@ -1697,6 +1902,31 @@ defineExpose({ focusImage })
               @pointerup="endBlankResize"
               @pointercancel="endBlankResize"
             />
+          </div>
+
+          <div v-if="isComparing" class="preview-compare">
+            <span class="compare-label compare-label--before">原图</span>
+            <span class="compare-label compare-label--after">处理后</span>
+            <div class="compare-divider" :style="{ left: `${comparePercent}%` }">
+              <button
+                class="compare-handle"
+                type="button"
+                role="slider"
+                aria-label="对比位置：左边原图，右边处理后"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                :aria-valuenow="comparePercent"
+                :aria-valuetext="`${comparePercent}%`"
+                @pointerdown.stop="startCompareDrag"
+                @pointermove.stop="moveCompareDrag"
+                @pointerup.stop="endCompareDrag"
+                @pointercancel.stop="endCompareDrag"
+                @dblclick.stop
+                @keydown.stop="onCompareKeydown"
+              >
+                <span aria-hidden="true">‹ ›</span>
+              </button>
+            </div>
           </div>
 
           <div
@@ -2178,12 +2408,29 @@ defineExpose({ focusImage })
 
 /* 画布列：上方是固定的标注栏，下方是点状画布；缩略图在这一列之外。 */
 .preview-main {
+  position: relative;
   display: flex;
   min-width: 0;
   min-height: 0;
   flex: 1;
   flex-direction: column;
   gap: 8px;
+}
+
+/* 清晰化面板贴在标注栏下方、浮在画布左上角。 */
+.sharpen-popover {
+  position: absolute;
+  z-index: 6;
+  top: 43px;
+  left: 0;
+}
+
+/* 前后对比的中线层铺满视口，只有把手接收指针，画布上的工具照常可用。 */
+.preview-compare {
+  position: absolute;
+  z-index: 3;
+  inset: 0;
+  pointer-events: none;
 }
 
 /* 外观由 FloatingToolbar（docked）负责；z-index 让粗细预览浮在画布之上。 */

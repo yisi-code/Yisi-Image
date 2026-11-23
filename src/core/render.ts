@@ -1,5 +1,6 @@
 import { drawAnnotations } from './annotations'
 import type { DrawAnnotationsOptions } from './annotations'
+import { getImageSource } from './image'
 import { getPreviewFit } from './preview'
 import type { PreviewOffset } from './preview'
 import { DEFAULT_BACKGROUND, TRANSPARENT_BACKGROUND } from './background'
@@ -23,6 +24,8 @@ export interface ViewportRenderOptions {
   background?: StitchBackground
   /** 正在编辑、由输入框代为显示的文字标注 */
   hiddenAnnotationId?: string | null
+  /** 前后对比：中线在视口宽度的比例（0–1），左边画原图；null 不对比 */
+  compareSplit?: number | null
 }
 
 /** 透明背景在预览里的棋盘格，格子按屏幕像素算，缩放时大小不变；导出对比预览也用它。 */
@@ -58,12 +61,20 @@ function paintStitchImage(
   width: number,
   height: number,
   annotationOptions: DrawAnnotationsOptions = {},
+  /** 只画原图：不用清晰化结果，也不画标注和修瑕，供前后对比的左半边使用 */
+  original = false,
 ): void {
   if (image.kind === 'blank') {
     context.fillStyle = image.backgroundColor ?? '#ffffff'
     context.fillRect(x, y, width, height)
-  } else if (image.element) {
-    context.drawImage(image.element, x, y, width, height)
+  } else {
+    const source = original ? image.element : getImageSource(image)
+    if (source) {
+      context.drawImage(source, x, y, width, height)
+    }
+  }
+  if (original) {
+    return
   }
 
   context.save()
@@ -200,6 +211,29 @@ export function renderStitchView(
     })
   }
   context.restore()
+
+  // 对比：中线左边重新铺底，只画原图（不含清晰化、修瑕和标注）。
+  if (options.compareSplit !== null && options.compareSplit !== undefined) {
+    const splitX = viewportWidth * Math.min(1, Math.max(0, options.compareSplit))
+    context.save()
+    context.beginPath()
+    context.rect(0, 0, splitX, viewportHeight)
+    context.clip()
+    context.fillStyle =
+      background === TRANSPARENT_BACKGROUND ? getCheckerPattern(context) : background
+    context.fillRect(left, top, contentWidth, contentHeight)
+    context.translate(left, top)
+    context.scale(contentWidth / layout.width, contentHeight / layout.height)
+    context.imageSmoothingEnabled = true
+    context.imageSmoothingQuality = 'high'
+    for (const item of layout.items) {
+      const image = imageById.get(item.id)
+      if (image) {
+        paintStitchImage(context, image, item.x, item.y, item.width, item.height, {}, true)
+      }
+    }
+    context.restore()
+  }
 
   return target
 }

@@ -544,6 +544,10 @@ function onHealFailed(message: string): void {
   push({ tone: 'error', title: '修瑕失败', message: `${message}。这次涂抹已撤回，可以缩小范围后重试。` })
 }
 
+function onSharpenFailed(message: string): void {
+  push({ tone: 'error', title: '清晰化失败', message: `${message}。可以换小一点的强度或半径再试。` })
+}
+
 function onHealNotice(message: string): void {
   push({ tone: 'info', title: '修瑕', message })
 }
@@ -890,6 +894,7 @@ function onExported(summary: ExportSummary): void {
           @heal-failed="onHealFailed"
           @heal-notice="onHealNotice"
           @busy-change="isPreviewBusy = $event"
+          @sharpen-failed="onSharpenFailed"
         />
 
         <StitchControls

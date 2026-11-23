@@ -1,3 +1,5 @@
+import type { SharpenSettings } from './sharpen'
+
 export type StitchDirection = 'vertical' | 'horizontal'
 export type StitchImageKind = 'image' | 'blank'
 
@@ -61,6 +63,17 @@ export interface StitchImage {
   element?: HTMLImageElement
   backgroundColor?: string
   annotations: StitchAnnotation[]
+  /** 清晰化结果：与原图同尺寸的画布；没有处理过时为空 */
+  enhance?: ImageEnhance
+}
+
+/**
+ * 对原图做的整体处理（目前只有清晰化）。结果画布替代原图参与预览、导出和修瑕取样，
+ * 原图文件不变；对比视图里「原图」一侧仍画 element。
+ */
+export interface ImageEnhance {
+  sharpen: SharpenSettings
+  canvas: HTMLCanvasElement
 }
 
 export interface LayoutItem {
