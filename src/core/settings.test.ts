@@ -14,6 +14,7 @@ const CUSTOM_SETTINGS: ToolSettings = {
   thumbnailSize: 'small',
   thumbnailFit: 'fill',
   gap: 48,
+  background: 'transparent',
   annotationToolbar: {
     collapsed: true,
     position: { x: 'right', y: 'top', dx: 20, dy: 12 },
@@ -56,6 +57,7 @@ describe('normalizeSettings', () => {
         thumbnailSize: 'huge',
         thumbnailFit: 'stretch',
         gap: '40',
+        background: 'red',
         annotationToolbar: { collapsed: 'yes', position: { x: 'middle' } },
         zoomToolbar: 'hidden',
         blankPanel: { collapsed: 1 },
@@ -69,6 +71,14 @@ describe('normalizeSettings', () => {
     expect(normalizeSettings({ gap: 999 }).gap).toBe(200)
     expect(normalizeSettings({ gap: -3 }).gap).toBe(0)
     expect(normalizeSettings({ gap: 12.4 }).gap).toBe(12)
+  })
+
+  it('背景只接受透明与 #rrggbb，颜色统一成小写', () => {
+    expect(normalizeSettings({ background: 'transparent' }).background).toBe('transparent')
+    expect(normalizeSettings({ background: '#1A2B3C' }).background).toBe('#1a2b3c')
+    expect(normalizeSettings({ background: '#fff' }).background).toBe('#ffffff')
+    expect(normalizeSettings({ background: 'rgba(0,0,0,0)' }).background).toBe('#ffffff')
+    expect(normalizeSettings({ background: 0 }).background).toBe('#ffffff')
   })
 
   it('每次返回新的工具栏对象，不共享默认值引用', () => {

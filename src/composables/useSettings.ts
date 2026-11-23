@@ -142,7 +142,7 @@ export function useSettings(initial: InitialSettings) {
     update({ [key]: state })
   }
 
-  /** 恢复全部默认值（缩略图、间距、面板位置与显示状态）；配置目录不变。 */
+  /** 恢复全部默认值（缩略图、间距、背景、面板位置与显示状态）；配置目录不变。 */
   function reset(): void {
     settings.value = normalizeSettings(null)
   }

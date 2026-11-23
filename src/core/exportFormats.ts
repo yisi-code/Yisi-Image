@@ -1,3 +1,6 @@
+import { DEFAULT_BACKGROUND, TRANSPARENT_BACKGROUND } from './settings'
+import type { StitchBackground } from './settings'
+
 export type ExportFormat = 'png' | 'jpeg' | 'webp'
 
 export interface ExportFormatOption {
@@ -7,6 +10,8 @@ export interface ExportFormatOption {
   mime: string
   extension: string
   supportsQuality: boolean
+  /** 能否保留透明通道；JPEG 不能，透明背景导出时改用白底 */
+  supportsAlpha: boolean
   description: string
 }
 
@@ -20,6 +25,7 @@ export const EXPORT_FORMATS: readonly ExportFormatOption[] = [
     mime: 'image/png',
     extension: 'png',
     supportsQuality: false,
+    supportsAlpha: true,
     description: 'PNG 图片',
   },
   {
@@ -29,6 +35,7 @@ export const EXPORT_FORMATS: readonly ExportFormatOption[] = [
     mime: 'image/jpeg',
     extension: 'jpg',
     supportsQuality: true,
+    supportsAlpha: false,
     description: 'JPEG 图片',
   },
   {
@@ -38,6 +45,7 @@ export const EXPORT_FORMATS: readonly ExportFormatOption[] = [
     mime: 'image/webp',
     extension: 'webp',
     supportsQuality: true,
+    supportsAlpha: true,
     description: 'WebP 图片',
   },
 ]
@@ -46,6 +54,25 @@ export const DEFAULT_EXPORT_FORMAT: ExportFormat = 'png'
 
 export function getExportFormat(value: ExportFormat): ExportFormatOption {
   return EXPORT_FORMATS.find((format) => format.value === value) ?? EXPORT_FORMATS[0]
+}
+
+/** 透明背景遇到不支持透明的格式时会被改成白底。 */
+export function isTransparencyDropped(
+  background: StitchBackground,
+  format: ExportFormatOption,
+): boolean {
+  return background === TRANSPARENT_BACKGROUND && !format.supportsAlpha
+}
+
+/** 导出画布的底色；null 表示不填充、保留透明。 */
+export function getExportBackground(
+  background: StitchBackground,
+  format: ExportFormatOption,
+): string | null {
+  if (background !== TRANSPARENT_BACKGROUND) {
+    return background
+  }
+  return format.supportsAlpha ? null : DEFAULT_BACKGROUND
 }
 
 export function getSaveTypes(format: ExportFormatOption): Array<{

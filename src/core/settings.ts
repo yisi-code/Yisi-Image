@@ -8,6 +8,14 @@ export type ThumbnailSize = 'small' | 'medium' | 'large'
 export type ThumbnailFit = 'contain' | 'cover' | 'fill'
 /** 局部修瑕的补全方式：经典算法（默认，无需下载）或某个 AI 模型。 */
 export type HealEngine = 'classic' | AiModelId
+/**
+ * 拼接画布的背景：图片大小不一时露出的空位与间距都用它填充。
+ * 取值为 `transparent` 或小写 `#rrggbb`；空白页有自己的白底，不跟随。
+ */
+export type StitchBackground = string
+
+export const TRANSPARENT_BACKGROUND = 'transparent'
+export const DEFAULT_BACKGROUND: StitchBackground = '#ffffff'
 
 /**
  * 预览区面板（标注栏、缩放栏、空白页尺寸面板、缩略图）的显示状态。
@@ -25,6 +33,8 @@ export interface ToolSettings {
   thumbnailFit: ThumbnailFit
   /** 拼接间距，与底部控制条同步。 */
   gap: number
+  /** 拼接背景，与底部控制条同步。 */
+  background: StitchBackground
   annotationToolbar: PanelState
   zoomToolbar: PanelState
   blankPanel: PanelState
@@ -153,6 +163,7 @@ export const DEFAULT_SETTINGS: Readonly<ToolSettings> = Object.freeze({
   thumbnailSize: 'medium',
   thumbnailFit: 'contain',
   gap: DEFAULT_GAP,
+  background: DEFAULT_BACKGROUND,
   annotationToolbar: DEFAULT_PANEL_STATE,
   zoomToolbar: DEFAULT_PANEL_STATE,
   blankPanel: DEFAULT_PANEL_STATE,
@@ -180,6 +191,17 @@ function normalizeGap(value: unknown): number {
   return typeof value === 'number' ? clampGap(value) : DEFAULT_GAP
 }
 
+/** 只接受 `transparent` 与 `#rrggbb`（统一成小写），其余回退白色。 */
+export function normalizeBackground(value: unknown): StitchBackground {
+  if (value === TRANSPARENT_BACKGROUND) {
+    return TRANSPARENT_BACKGROUND
+  }
+  if (typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value)) {
+    return value.toLowerCase()
+  }
+  return DEFAULT_BACKGROUND
+}
+
 export function normalizePanelState(value: unknown): PanelState {
   const parsed = (value ?? {}) as Partial<Record<keyof PanelState, unknown>>
   return {
@@ -202,6 +224,7 @@ export function normalizeSettings(value: unknown): ToolSettings {
       ? parsed.thumbnailFit
       : DEFAULT_SETTINGS.thumbnailFit,
     gap: normalizeGap(parsed.gap),
+    background: normalizeBackground(parsed.background),
     annotationToolbar: normalizePanelState(parsed.annotationToolbar),
     zoomToolbar: normalizePanelState(parsed.zoomToolbar),
     blankPanel: normalizePanelState(parsed.blankPanel),

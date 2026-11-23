@@ -31,9 +31,11 @@ import {
   DEFAULT_EXPORT_FORMAT,
   EXPORT_QUALITY,
   buildExportFileName,
+  getExportBackground,
   getExportFormat,
   getSaveTypes,
   getSupportedExportFormats,
+  isTransparencyDropped,
 } from './core/exportFormats'
 import type { ExportFormat } from './core/exportFormats'
 import { IS_DESKTOP_APP } from './core/appInfo'
@@ -104,6 +106,11 @@ const direction = ref<StitchDirection>('vertical')
 const gap = computed({
   get: () => settings.value.gap,
   set: (value: number) => updateSettings({ gap: value }),
+})
+/** 拼接背景同样随设置保存；预览与导出都按它填充空位和间距。 */
+const background = computed({
+  get: () => settings.value.background,
+  set: (value: string) => updateSettings({ background: value }),
 })
 const exportFormat = ref<ExportFormat>(DEFAULT_EXPORT_FORMAT)
 const supportedFormats = getSupportedExportFormats()
@@ -468,11 +475,14 @@ async function handleExport(): Promise<void> {
 
     const exportLayout = layout.value
     const exportImages = images.value.slice()
+    const exportBackground = background.value
 
     // 先让按钮的“导出中”状态完成一次绘制，再开始同步生成画布。
     await new Promise<void>((resolve) => window.setTimeout(resolve, 30))
 
-    const canvas = renderStitch(document.createElement('canvas'), exportLayout, exportImages)
+    const canvas = renderStitch(document.createElement('canvas'), exportLayout, exportImages, {
+      background: getExportBackground(exportBackground, format),
+    })
     const blob = await canvasToBlob(
       canvas,
       format.mime,
@@ -488,10 +498,13 @@ async function handleExport(): Promise<void> {
     const cleared = clearImages()
     const locationText = target ? '已保存到所选位置' : '已下载到默认下载目录'
     const restoreText = cleared > 0 ? `；队列已清空，可恢复 ${cleared} 张` : ''
+    const backgroundText = isTransparencyDropped(exportBackground, format)
+      ? ' · JPG 不支持透明，已按白底导出'
+      : ''
     push({
       tone: 'success',
       title: '图片已导出',
-      message: `${formatDimensions(exportLayout.width, exportLayout.height)} px · ${format.longLabel} · ${locationText}${restoreText}`,
+      message: `${formatDimensions(exportLayout.width, exportLayout.height)} px · ${format.longLabel}${backgroundText} · ${locationText}${restoreText}`,
       // 导出结果需要用户看清格式、尺寸和恢复入口，不自动消失。
       duration: 0,
     })
@@ -683,6 +696,7 @@ async function handleExport(): Promise<void> {
           :zoom-toolbar="settings.zoomToolbar"
           :blank-panel="settings.blankPanel"
           :thumbnail-panel="settings.thumbnailPanel"
+          :background="background"
           :heal-engine="healEngineChoice"
           @pick="openFilePicker"
           @add="handleAdd"
@@ -696,6 +710,7 @@ async function handleExport(): Promise<void> {
         <StitchControls
           v-model:direction="direction"
           v-model:gap="gap"
+          v-model:background="background"
           v-model:format="exportFormat"
           :formats="supportedFormats"
           :disabled="isExporting"

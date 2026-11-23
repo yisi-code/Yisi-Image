@@ -2,10 +2,13 @@ import { drawAnnotations } from './annotations'
 import type { DrawAnnotationsOptions } from './annotations'
 import { getPreviewFit } from './preview'
 import type { PreviewOffset } from './preview'
+import { DEFAULT_BACKGROUND, TRANSPARENT_BACKGROUND } from './settings'
+import type { StitchBackground } from './settings'
 import type { StitchImage, StitchLayout } from './types'
 
 export interface RenderOptions {
   scale?: number
+  /** 画布底色；null 不填充，保留透明 */
   background?: string | null
 }
 
@@ -16,9 +19,35 @@ export interface ViewportRenderOptions {
   zoom: number
   offset: PreviewOffset
   dpr?: number
-  background?: string
+  /** 拼接背景；透明时在内容区画棋盘格，方便看出哪里是透明的 */
+  background?: StitchBackground
   /** 正在编辑、由输入框代为显示的文字标注 */
   hiddenAnnotationId?: string | null
+}
+
+/** 透明背景在预览里的棋盘格，格子按屏幕像素算，缩放时大小不变。 */
+const CHECKER_CELL = 8
+const CHECKER_LIGHT = '#ffffff'
+const CHECKER_DARK = '#e3e8e6'
+let checkerTile: HTMLCanvasElement | null = null
+
+function getCheckerPattern(context: CanvasRenderingContext2D): CanvasPattern | string {
+  if (!checkerTile) {
+    const tile = document.createElement('canvas')
+    tile.width = CHECKER_CELL * 2
+    tile.height = CHECKER_CELL * 2
+    const tileContext = tile.getContext('2d')
+    if (!tileContext) {
+      return CHECKER_LIGHT
+    }
+    tileContext.fillStyle = CHECKER_LIGHT
+    tileContext.fillRect(0, 0, tile.width, tile.height)
+    tileContext.fillStyle = CHECKER_DARK
+    tileContext.fillRect(CHECKER_CELL, 0, CHECKER_CELL, CHECKER_CELL)
+    tileContext.fillRect(0, CHECKER_CELL, CHECKER_CELL, CHECKER_CELL)
+    checkerTile = tile
+  }
+  return context.createPattern(checkerTile, 'repeat') ?? CHECKER_LIGHT
 }
 
 function paintStitchImage(
@@ -51,7 +80,7 @@ export function renderStitch(
   options: RenderOptions = {},
 ): HTMLCanvasElement {
   const scale = options.scale ?? 1
-  const background = options.background === undefined ? '#ffffff' : options.background
+  const background = options.background === undefined ? DEFAULT_BACKGROUND : options.background
   const width = Math.max(1, Math.round(layout.width * scale))
   const height = Math.max(1, Math.round(layout.height * scale))
 
@@ -139,7 +168,7 @@ export function renderStitchView(
   context.setTransform(backingScale, 0, 0, backingScale, 0, 0)
   context.clearRect(0, 0, viewportWidth, viewportHeight)
 
-  // 图片没有铺满视口时给白色画布加一层轻阴影；放大到边缘超出视口时不再计算阴影。
+  // 图片没有铺满视口时给画布加一层轻阴影；放大到边缘超出视口时不再计算阴影。
   const contentOverflows = contentWidth > viewportWidth + 40 || contentHeight > viewportHeight + 40
   context.save()
   if (!contentOverflows) {
@@ -147,7 +176,9 @@ export function renderStitchView(
     context.shadowBlur = 28
     context.shadowOffsetY = 10
   }
-  context.fillStyle = options.background ?? '#ffffff'
+  const background = options.background ?? DEFAULT_BACKGROUND
+  context.fillStyle =
+    background === TRANSPARENT_BACKGROUND ? getCheckerPattern(context) : background
   context.fillRect(left, top, contentWidth, contentHeight)
   context.restore()
 

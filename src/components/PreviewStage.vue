@@ -53,6 +53,7 @@ import type {
   ThumbnailSize,
   PanelKey,
   PanelState,
+  StitchBackground,
 } from '../core/settings'
 import { vTooltip } from '../directives/tooltip'
 import type {
@@ -79,6 +80,8 @@ const props = defineProps<{
   zoomToolbar: PanelState
   blankPanel: PanelState
   thumbnailPanel: PanelState
+  /** 拼接背景；透明时预览画棋盘格 */
+  background: StitchBackground
   /** 这次修瑕用经典算法还是 AI 模型（由 App 按设置与模型下载状态算出） */
   healEngine: HealEngineChoice
 }>()
@@ -1398,6 +1401,7 @@ function renderPreview(): void {
     zoom: zoom.value,
     offset: offset.value,
     dpr: Math.min(window.devicePixelRatio || 1, PREVIEW_MAX_DPR),
+    background: props.background,
     hiddenAnnotationId: textDraft.value?.editingId ?? null,
   })
   if (!isHoldingActiveImage) {
@@ -1412,6 +1416,7 @@ function scheduleRender(): void {
 
 watch(() => props.layout, scheduleRender, { flush: 'post' })
 watch(zoom, scheduleRender, { flush: 'post' })
+watch(() => props.background, scheduleRender)
 // 开始 / 结束修改已有文字时重画：原文字在编辑期间隐藏。
 watch(() => textDraft.value?.editingId ?? null, scheduleRender)
 watch(activeImageId, (id) => {

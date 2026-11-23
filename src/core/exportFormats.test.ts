@@ -3,8 +3,10 @@ import {
   EXPORT_FORMATS,
   EXPORT_QUALITY,
   buildExportFileName,
+  getExportBackground,
   getExportFormat,
   getSaveTypes,
+  isTransparencyDropped,
 } from './exportFormats'
 
 describe('export formats', () => {
@@ -20,6 +22,19 @@ describe('export formats', () => {
     expect(getExportFormat('jpeg').supportsQuality).toBe(true)
     expect(getExportFormat('webp').supportsQuality).toBe(true)
     expect(EXPORT_QUALITY).toBe(0.92)
+  })
+
+  it('keeps transparency only for formats with an alpha channel', () => {
+    const png = getExportFormat('png')
+    const jpeg = getExportFormat('jpeg')
+    const webp = getExportFormat('webp')
+    expect(getExportBackground('transparent', png)).toBeNull()
+    expect(getExportBackground('transparent', webp)).toBeNull()
+    expect(getExportBackground('transparent', jpeg)).toBe('#ffffff')
+    expect(getExportBackground('#123456', jpeg)).toBe('#123456')
+    expect(isTransparencyDropped('transparent', jpeg)).toBe(true)
+    expect(isTransparencyDropped('transparent', png)).toBe(false)
+    expect(isTransparencyDropped('#000000', jpeg)).toBe(false)
   })
 
   it('builds a timestamped file name with the selected extension', () => {
