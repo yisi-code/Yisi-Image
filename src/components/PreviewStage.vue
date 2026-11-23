@@ -1554,364 +1554,367 @@ defineExpose({ focusImage })
       </nav>
     </aside>
 
-    <div class="preview-stage" :class="{ 'is-file-dragging': isFileDragging }">
-      <div
-        v-if="images.length > 0"
-        ref="viewportRef"
-        class="stage-viewport"
-        :class="{
-          'is-panning': isPanning,
-          'is-zoomed': zoom > 1,
-          'is-annotating': annotationTool !== 'select',
-          'is-painting': isPaintingTool,
-          'is-drawing': isDrawing,
-        }"
-        role="region"
-        tabindex="0"
-        aria-label="预览视口，滚轮缩放，放大后可拖动查看，按 0 恢复适应窗口"
-        @wheel="onWheel"
-        @pointerdown="onPointerDown"
-        @pointermove="onPointerMove"
-        @pointerup="onPointerUp"
-        @pointercancel="onPointerUp"
-        @pointerleave="hideToolCursor"
-        @dblclick="resetView"
-        @keydown="onViewportKeydown"
+    <div class="preview-main">
+      <!-- 标注栏固定在画布上方、画布之外，不遮挡图片。 -->
+      <FloatingToolbar
+        v-if="images.length > 0 && !annotationToolbar.collapsed"
+        class="annotation-toolbar"
+        docked
+        label="标注工具栏"
+        :state="annotationToolbar"
+        @update:state="emit('update-panel', 'annotationToolbar', $event)"
       >
-        <canvas
-          ref="canvasRef"
-          class="preview-canvas"
-          role="img"
-          :aria-label="previewLabel"
-        />
-
-        <div
-          v-if="activeBlank && blankSelectionStyle"
-          class="blank-selection"
-          :style="blankSelectionStyle"
-          aria-hidden="true"
+        <button
+          v-for="tool in ANNOTATION_TOOLS"
+          :key="tool.value"
+          v-tooltip="tool.tip"
+          class="annotation-tool"
+          :class="{ 'is-active': annotationTool === tool.value }"
+          type="button"
+          :aria-label="tool.name"
+          :aria-pressed="annotationTool === tool.value"
+          @click="setTool(tool.value)"
         >
-          <span class="blank-selection-label">空白页</span>
-          <button
-            v-tooltip="'拖动调整空白页大小'"
-            class="blank-resize-handle"
-            type="button"
-            aria-label="拖动调整空白页大小"
-            @pointerdown="startBlankResize"
-            @pointermove="moveBlankResize"
-            @pointerup="endBlankResize"
-            @pointercancel="endBlankResize"
-          />
-        </div>
-
-        <FloatingToolbar
-          v-if="!annotationToolbar.collapsed"
-          class="annotation-toolbar"
-          label="标注工具栏"
-          :state="annotationToolbar"
-          @update:state="emit('update-panel', 'annotationToolbar', $event)"
-        >
-          <button
-            v-for="tool in ANNOTATION_TOOLS"
-            :key="tool.value"
-            v-tooltip="tool.tip"
-            class="annotation-tool"
-            :class="{ 'is-active': annotationTool === tool.value }"
-            type="button"
-            :aria-label="tool.name"
-            :aria-pressed="annotationTool === tool.value"
-            @click="setTool(tool.value)"
-          >
-            <component :is="tool.icon" :size="14" :stroke-width="1.9" />
-          </button>
-          <span class="annotation-separator" aria-hidden="true" />
-          <label v-tooltip="'标注颜色'" class="annotation-color">
-            <input v-model="annotationColor" type="color" aria-label="标注颜色" />
-          </label>
-          <label v-tooltip="'笔触粗细'" class="annotation-size">
-            <input
-              v-model.number="annotationWidth"
-              type="range"
-              :min="MIN_BRUSH_WIDTH"
-              :max="MAX_BRUSH_WIDTH"
-              step="1"
-              aria-label="笔触粗细"
-              @pointerdown="startWidthAdjust"
-            />
-            <span
-              v-if="isAdjustingWidth"
-              class="annotation-size-preview"
-              :class="{ 'is-above': annotationToolbar.position?.y === 'bottom' }"
-              aria-hidden="true"
-            >
-              <span
-                class="annotation-size-dot"
-                :style="{
-                  width: `${annotationWidth}px`,
-                  height: `${annotationWidth}px`,
-                  background: annotationColor,
-                }"
-              />
-              <span class="tnum">{{ annotationWidth }} px</span>
-            </span>
-          </label>
+          <component :is="tool.icon" :size="14" :stroke-width="1.9" />
+        </button>
+        <span class="annotation-separator" aria-hidden="true" />
+        <label v-tooltip="'标注颜色'" class="annotation-color">
+          <input v-model="annotationColor" type="color" aria-label="标注颜色" />
+        </label>
+        <label v-tooltip="'笔触粗细'" class="annotation-size">
           <input
-            v-tooltip="`笔触粗细，可输入 ${MIN_BRUSH_WIDTH}–${MAX_BRUSH_WIDTH}`"
-            class="annotation-size-input tnum"
-            type="number"
+            v-model.number="annotationWidth"
+            type="range"
             :min="MIN_BRUSH_WIDTH"
             :max="MAX_BRUSH_WIDTH"
             step="1"
-            :value="annotationWidth"
-            aria-label="笔触粗细（像素）"
-            @input="onWidthInput"
-            @change="commitWidthInput"
+            aria-label="笔触粗细"
+            @pointerdown="startWidthAdjust"
           />
-          <span class="annotation-separator" aria-hidden="true" />
-          <button
-            v-tooltip="'撤销标注（Ctrl+Z）'"
-            class="annotation-tool"
-            type="button"
-            :disabled="!canUndo"
-            aria-label="撤销标注"
-            @click="undo"
-          >
-            <Undo2 :size="14" :stroke-width="1.9" />
-          </button>
-          <button
-            v-tooltip="'重做标注（Ctrl+Shift+Z）'"
-            class="annotation-tool"
-            type="button"
-            :disabled="!canRedo"
-            aria-label="重做标注"
-            @click="redo"
-          >
-            <Redo2 :size="14" :stroke-width="1.9" />
-          </button>
-        </FloatingToolbar>
-
-        <div
-          v-if="activeBlank && !blankPanel.collapsed"
-          class="blank-size-panel"
-          @pointerdown.stop
-          @click.stop
-          @dblclick.stop
-          @wheel.stop
-        >
-          <div class="blank-size-head">
-            <strong>空白页</strong>
-            <span class="tnum">{{ blankSizeSummary }}</span>
-            <button
-              v-tooltip="'收起空白页面板（可在预览标题栏重新显示）'"
-              class="blank-size-collapse"
-              type="button"
-              aria-label="收起空白页面板（可在预览标题栏重新显示）"
-              @click="collapsePanel('blankPanel')"
-            >
-              <ChevronsRight :size="14" :stroke-width="1.9" />
-            </button>
-          </div>
-          <div class="blank-size-fields">
-            <label>
-              <span>宽</span>
-              <input
-                type="number"
-                min="40"
-                max="16384"
-                step="10"
-                :value="activeBlank.width"
-                @change="updateBlankSize('width', $event)"
-              />
-            </label>
-            <label>
-              <span>高</span>
-              <input
-                type="number"
-                min="40"
-                max="16384"
-                step="10"
-                :value="activeBlank.height"
-                @change="updateBlankSize('height', $event)"
-              />
-            </label>
-          </div>
-          <div class="blank-size-presets">
-            <button type="button" @click="applyBlankPreset(800, 800)">1:1</button>
-            <button type="button" @click="applyBlankPreset(1200, 800)">3:2</button>
-            <button type="button" @click="applyBlankPreset(1920, 1080)">16:9</button>
-          </div>
-          <span class="blank-size-hint">也可拖动右下角调整</span>
-        </div>
-
-        <span
-          v-if="toolCursorStyle"
-          class="tool-cursor"
-          :class="`tool-cursor--${annotationTool}`"
-          :style="toolCursorStyle"
-          aria-hidden="true"
-        />
-
-        <div
-          v-if="textDraft && textEditorLayout"
-          class="text-editor"
-          :style="textEditorLayout.box"
-          @pointerdown.stop
-          @click.stop
-          @dblclick.stop
-          @wheel.stop
-        >
           <span
-            v-tooltip="'拖动移动文字'"
-            class="text-editor__grip"
+            v-if="isAdjustingWidth"
+            class="annotation-size-preview"
             aria-hidden="true"
-            @pointerdown="startTextDrag"
-            @pointermove="moveTextDrag"
-            @pointerup="endTextDrag"
-            @pointercancel="endTextDrag"
           >
-            <GripVertical :size="13" :stroke-width="1.9" />
+            <span
+              class="annotation-size-dot"
+              :style="{
+                width: `${annotationWidth}px`,
+                height: `${annotationWidth}px`,
+                background: annotationColor,
+              }"
+            />
+            <span class="tnum">{{ annotationWidth }} px</span>
           </span>
-          <input
-            ref="textInputRef"
-            v-model="textDraft.value"
-            class="text-editor__input"
-            type="text"
-            maxlength="120"
-            placeholder="输入文字"
-            :style="textEditorLayout.input"
-            :aria-label="textDraft.editingId ? '修改标注文字' : '标注文字'"
-            @keydown.enter.prevent="commitText"
-            @keydown.esc.prevent="cancelText"
-          />
-          <span class="text-editor__actions">
-            <button v-tooltip="'确认文字（回车）'" type="button" aria-label="确认文字" @click="commitText">
-              <Check :size="14" :stroke-width="2" />
-            </button>
-            <button v-tooltip="'取消（Esc）'" type="button" aria-label="取消文字" @click="cancelText">
-              <X :size="14" :stroke-width="2" />
-            </button>
-          </span>
-        </div>
-      </div>
-
-      <div v-else-if="isImporting" class="stage-loading" role="status">
-        <span class="loading-mark">
-          <Loader2 class="spin" :size="24" :stroke-width="1.8" />
-        </span>
-        <p>正在读取图片</p>
-        <span class="loading-count tnum">{{ progress.done }} / {{ progress.total }}</span>
-      </div>
-
-      <div v-else class="stage-empty">
-        <div class="empty-art" aria-hidden="true">
-          <span class="empty-sheet empty-sheet--back" />
-          <span class="empty-sheet empty-sheet--mid" />
-          <span class="empty-sheet empty-sheet--front">
-            <ImagePlus :size="27" :stroke-width="1.6" />
-          </span>
-        </div>
-
-        <h2>添加图片，开始拼接</h2>
-        <p>把多张图片放进队列，纵向或横向拼成一张。可以拖动调整顺序，间距也能随时修改。</p>
-
-        <button class="button button-primary empty-action" type="button" @click="emit('pick')">
-          <ImagePlus :size="16" :stroke-width="1.9" />
-          <span>选择图片</span>
-        </button>
-
-        <span class="empty-drop-hint">
-          <UploadCloud :size="13" :stroke-width="1.8" />
-          也可以把图片拖到这里
-        </span>
-      </div>
-
-      <FloatingToolbar
-        v-if="images.length > 0 && !zoomToolbar.collapsed"
-        class="zoom-toolbar"
-        label="缩放栏"
-        :state="zoomToolbar"
-        @update:state="emit('update-panel', 'zoomToolbar', $event)"
-      >
+        </label>
+        <input
+          v-tooltip="`笔触粗细，可输入 ${MIN_BRUSH_WIDTH}–${MAX_BRUSH_WIDTH}`"
+          class="annotation-size-input tnum"
+          type="number"
+          :min="MIN_BRUSH_WIDTH"
+          :max="MAX_BRUSH_WIDTH"
+          step="1"
+          :value="annotationWidth"
+          aria-label="笔触粗细（像素）"
+          @input="onWidthInput"
+          @change="commitWidthInput"
+        />
+        <span class="annotation-separator" aria-hidden="true" />
         <button
-          v-tooltip="'缩小预览'"
-          class="zoom-button"
+          v-tooltip="'撤销标注（Ctrl+Z）'"
+          class="annotation-tool"
           type="button"
-          :disabled="zoom <= MIN_ZOOM + 0.001"
-          aria-label="缩小预览"
-          @click="zoomBy(0.8)"
+          :disabled="!canUndo"
+          aria-label="撤销标注"
+          @click="undo"
         >
-          <Minus :size="14" :stroke-width="2" />
+          <Undo2 :size="14" :stroke-width="1.9" />
         </button>
         <button
-          v-tooltip="'恢复到适应窗口'"
-          class="zoom-value tnum"
+          v-tooltip="'重做标注（Ctrl+Shift+Z）'"
+          class="annotation-tool"
           type="button"
-          :aria-label="`当前缩放 ${zoomPercent}，点击恢复适应窗口`"
-          @click="resetView"
+          :disabled="!canRedo"
+          aria-label="重做标注"
+          @click="redo"
         >
-          {{ zoomPercent }}
+          <Redo2 :size="14" :stroke-width="1.9" />
         </button>
-        <button
-          v-tooltip="`放大预览（最大 ${maxZoomPercent}）`"
-          class="zoom-button"
-          type="button"
-          :disabled="zoom >= maxZoom - 0.001"
-          :aria-label="`放大预览，最大 ${maxZoomPercent}`"
-          @click="zoomBy(1.25)"
-        >
-          <Plus :size="14" :stroke-width="2" />
-        </button>
-        <span class="zoom-separator" aria-hidden="true" />
-        <button
-          v-tooltip="'恢复适应窗口'"
-          class="zoom-fit"
-          type="button"
-          @click="resetView"
-        >
-          <Maximize2 :size="13" :stroke-width="1.9" />
-          <span>适应</span>
-        </button>
-        <span class="zoom-hint" aria-hidden="true">滚轮缩放 · 拖动查看</span>
       </FloatingToolbar>
 
-      <div v-if="healChoice" class="stage-busy heal-choice" role="status">
-        <Wand2 :size="13" :stroke-width="1.9" />
-        <span>已用「{{ healChoice.current }}」补全</span>
-        <button
-          v-tooltip="'结构优先适合栏杆、窗格等直线重复的结构；平滑优先适合天空、渐变、曲面。两种结果都已算好，可随时换回'"
-          class="heal-choice__switch"
-          type="button"
-          @click="swapHealFill"
+      <div class="preview-stage" :class="{ 'is-file-dragging': isFileDragging }">
+        <div
+          v-if="images.length > 0"
+          ref="viewportRef"
+          class="stage-viewport"
+          :class="{
+            'is-panning': isPanning,
+            'is-zoomed': zoom > 1,
+            'is-annotating': annotationTool !== 'select',
+            'is-painting': isPaintingTool,
+            'is-drawing': isDrawing,
+          }"
+          role="region"
+          tabindex="0"
+          aria-label="预览视口，滚轮缩放，放大后可拖动查看，按 0 恢复适应窗口"
+          @wheel="onWheel"
+          @pointerdown="onPointerDown"
+          @pointermove="onPointerMove"
+          @pointerup="onPointerUp"
+          @pointercancel="onPointerUp"
+          @pointerleave="hideToolCursor"
+          @dblclick="resetView"
+          @keydown="onViewportKeydown"
         >
-          换成{{ healChoice.other }}
-        </button>
-        <button
-          v-tooltip="'关闭'"
-          class="heal-choice__close"
-          type="button"
-          aria-label="关闭补法切换"
-          @click="lastHealed = null"
+          <canvas
+            ref="canvasRef"
+            class="preview-canvas"
+            role="img"
+            :aria-label="previewLabel"
+          />
+
+          <div
+            v-if="activeBlank && blankSelectionStyle"
+            class="blank-selection"
+            :style="blankSelectionStyle"
+            aria-hidden="true"
+          >
+            <span class="blank-selection-label">空白页</span>
+            <button
+              v-tooltip="'拖动调整空白页大小'"
+              class="blank-resize-handle"
+              type="button"
+              aria-label="拖动调整空白页大小"
+              @pointerdown="startBlankResize"
+              @pointermove="moveBlankResize"
+              @pointerup="endBlankResize"
+              @pointercancel="endBlankResize"
+            />
+          </div>
+
+          <div
+            v-if="activeBlank && !blankPanel.collapsed"
+            class="blank-size-panel"
+            @pointerdown.stop
+            @click.stop
+            @dblclick.stop
+            @wheel.stop
+          >
+            <div class="blank-size-head">
+              <strong>空白页</strong>
+              <span class="tnum">{{ blankSizeSummary }}</span>
+              <button
+                v-tooltip="'收起空白页面板（可在预览标题栏重新显示）'"
+                class="blank-size-collapse"
+                type="button"
+                aria-label="收起空白页面板（可在预览标题栏重新显示）"
+                @click="collapsePanel('blankPanel')"
+              >
+                <ChevronsRight :size="14" :stroke-width="1.9" />
+              </button>
+            </div>
+            <div class="blank-size-fields">
+              <label>
+                <span>宽</span>
+                <input
+                  type="number"
+                  min="40"
+                  max="16384"
+                  step="10"
+                  :value="activeBlank.width"
+                  @change="updateBlankSize('width', $event)"
+                />
+              </label>
+              <label>
+                <span>高</span>
+                <input
+                  type="number"
+                  min="40"
+                  max="16384"
+                  step="10"
+                  :value="activeBlank.height"
+                  @change="updateBlankSize('height', $event)"
+                />
+              </label>
+            </div>
+            <div class="blank-size-presets">
+              <button type="button" @click="applyBlankPreset(800, 800)">1:1</button>
+              <button type="button" @click="applyBlankPreset(1200, 800)">3:2</button>
+              <button type="button" @click="applyBlankPreset(1920, 1080)">16:9</button>
+            </div>
+            <span class="blank-size-hint">也可拖动右下角调整</span>
+          </div>
+
+          <span
+            v-if="toolCursorStyle"
+            class="tool-cursor"
+            :class="`tool-cursor--${annotationTool}`"
+            :style="toolCursorStyle"
+            aria-hidden="true"
+          />
+
+          <div
+            v-if="textDraft && textEditorLayout"
+            class="text-editor"
+            :style="textEditorLayout.box"
+            @pointerdown.stop
+            @click.stop
+            @dblclick.stop
+            @wheel.stop
+          >
+            <span
+              v-tooltip="'拖动移动文字'"
+              class="text-editor__grip"
+              aria-hidden="true"
+              @pointerdown="startTextDrag"
+              @pointermove="moveTextDrag"
+              @pointerup="endTextDrag"
+              @pointercancel="endTextDrag"
+            >
+              <GripVertical :size="13" :stroke-width="1.9" />
+            </span>
+            <input
+              ref="textInputRef"
+              v-model="textDraft.value"
+              class="text-editor__input"
+              type="text"
+              maxlength="120"
+              placeholder="输入文字"
+              :style="textEditorLayout.input"
+              :aria-label="textDraft.editingId ? '修改标注文字' : '标注文字'"
+              @keydown.enter.prevent="commitText"
+              @keydown.esc.prevent="cancelText"
+            />
+            <span class="text-editor__actions">
+              <button v-tooltip="'确认文字（回车）'" type="button" aria-label="确认文字" @click="commitText">
+                <Check :size="14" :stroke-width="2" />
+              </button>
+              <button v-tooltip="'取消（Esc）'" type="button" aria-label="取消文字" @click="cancelText">
+                <X :size="14" :stroke-width="2" />
+              </button>
+            </span>
+          </div>
+        </div>
+
+        <div v-else-if="isImporting" class="stage-loading" role="status">
+          <span class="loading-mark">
+            <Loader2 class="spin" :size="24" :stroke-width="1.8" />
+          </span>
+          <p>正在读取图片</p>
+          <span class="loading-count tnum">{{ progress.done }} / {{ progress.total }}</span>
+        </div>
+
+        <div v-else class="stage-empty">
+          <div class="empty-art" aria-hidden="true">
+            <span class="empty-sheet empty-sheet--back" />
+            <span class="empty-sheet empty-sheet--mid" />
+            <span class="empty-sheet empty-sheet--front">
+              <ImagePlus :size="27" :stroke-width="1.6" />
+            </span>
+          </div>
+
+          <h2>添加图片，开始拼接</h2>
+          <p>把多张图片放进队列，纵向或横向拼成一张。可以拖动调整顺序，间距也能随时修改。</p>
+
+          <button class="button button-primary empty-action" type="button" @click="emit('pick')">
+            <ImagePlus :size="16" :stroke-width="1.9" />
+            <span>选择图片</span>
+          </button>
+
+          <span class="empty-drop-hint">
+            <UploadCloud :size="13" :stroke-width="1.8" />
+            也可以把图片拖到这里
+          </span>
+        </div>
+
+        <FloatingToolbar
+          v-if="images.length > 0 && !zoomToolbar.collapsed"
+          class="zoom-toolbar"
+          label="缩放栏"
+          :state="zoomToolbar"
+          @update:state="emit('update-panel', 'zoomToolbar', $event)"
         >
-          <X :size="12" :stroke-width="2" />
-        </button>
-      </div>
+          <button
+            v-tooltip="'缩小预览'"
+            class="zoom-button"
+            type="button"
+            :disabled="zoom <= MIN_ZOOM + 0.001"
+            aria-label="缩小预览"
+            @click="zoomBy(0.8)"
+          >
+            <Minus :size="14" :stroke-width="2" />
+          </button>
+          <button
+            v-tooltip="'恢复到适应窗口'"
+            class="zoom-value tnum"
+            type="button"
+            :aria-label="`当前缩放 ${zoomPercent}，点击恢复适应窗口`"
+            @click="resetView"
+          >
+            {{ zoomPercent }}
+          </button>
+          <button
+            v-tooltip="`放大预览（最大 ${maxZoomPercent}）`"
+            class="zoom-button"
+            type="button"
+            :disabled="zoom >= maxZoom - 0.001"
+            :aria-label="`放大预览，最大 ${maxZoomPercent}`"
+            @click="zoomBy(1.25)"
+          >
+            <Plus :size="14" :stroke-width="2" />
+          </button>
+          <span class="zoom-separator" aria-hidden="true" />
+          <button
+            v-tooltip="'恢复适应窗口'"
+            class="zoom-fit"
+            type="button"
+            @click="resetView"
+          >
+            <Maximize2 :size="13" :stroke-width="1.9" />
+            <span>适应</span>
+          </button>
+          <span class="zoom-hint" aria-hidden="true">滚轮缩放 · 拖动查看</span>
+        </FloatingToolbar>
 
-      <div v-if="isHealing" class="stage-busy" role="status">
-        <Loader2 class="spin" :size="13" :stroke-width="2" />
-        <span class="tnum">{{ healEngineLabel ? `正在用 ${healEngineLabel} 修瑕` : '正在修瑕' }} {{ healPercent }}</span>
-      </div>
+        <div v-if="healChoice" class="stage-busy heal-choice" role="status">
+          <Wand2 :size="13" :stroke-width="1.9" />
+          <span>已用「{{ healChoice.current }}」补全</span>
+          <button
+            v-tooltip="'结构优先适合栏杆、窗格等直线重复的结构；平滑优先适合天空、渐变、曲面。两种结果都已算好，可随时换回'"
+            class="heal-choice__switch"
+            type="button"
+            @click="swapHealFill"
+          >
+            换成{{ healChoice.other }}
+          </button>
+          <button
+            v-tooltip="'关闭'"
+            class="heal-choice__close"
+            type="button"
+            aria-label="关闭补法切换"
+            @click="lastHealed = null"
+          >
+            <X :size="12" :stroke-width="2" />
+          </button>
+        </div>
 
-      <div v-if="isImporting && images.length > 0" class="stage-busy" role="status">
-        <Loader2 class="spin" :size="13" :stroke-width="2" />
-        <span class="tnum">正在添加 {{ progress.done }}/{{ progress.total }}</span>
-      </div>
+        <div v-if="isHealing" class="stage-busy" role="status">
+          <Loader2 class="spin" :size="13" :stroke-width="2" />
+          <span class="tnum">{{ healEngineLabel ? `正在用 ${healEngineLabel} 修瑕` : '正在修瑕' }} {{ healPercent }}</span>
+        </div>
 
-      <div v-if="isFileDragging" class="stage-drop-overlay" aria-hidden="true">
-        <span class="stage-drop-icon">
-          <UploadCloud :size="24" :stroke-width="1.7" />
-        </span>
-        <strong>松开以添加图片</strong>
-        <span>支持一次拖入多张</span>
+        <div v-if="isImporting && images.length > 0" class="stage-busy" role="status">
+          <Loader2 class="spin" :size="13" :stroke-width="2" />
+          <span class="tnum">正在添加 {{ progress.done }}/{{ progress.total }}</span>
+        </div>
+
+        <div v-if="isFileDragging" class="stage-drop-overlay" aria-hidden="true">
+          <span class="stage-drop-icon">
+            <UploadCloud :size="24" :stroke-width="1.7" />
+          </span>
+          <strong>松开以添加图片</strong>
+          <span>支持一次拖入多张</span>
+        </div>
       </div>
     </div>
   </div>
@@ -2160,11 +2163,21 @@ defineExpose({ focusImage })
   cursor: inherit;
 }
 
-/* 外观与拖动由 FloatingToolbar 负责，这里只给未拖动过时的默认位置。 */
+/* 画布列：上方是固定的标注栏，下方是点状画布；缩略图在这一列之外。 */
+.preview-main {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 外观由 FloatingToolbar（docked）负责；z-index 让粗细预览浮在画布之上。 */
 .annotation-toolbar {
   z-index: 4;
-  top: 10px;
-  left: 10px;
+  flex: 0 0 auto;
+  align-self: flex-start;
 }
 
 .annotation-tool {
@@ -2271,11 +2284,6 @@ defineExpose({ focusImage })
   box-shadow: var(--shadow-float);
   pointer-events: none;
   transform: translateX(-50%);
-}
-
-.annotation-size-preview.is-above {
-  top: auto;
-  bottom: calc(100% + 8px);
 }
 
 .annotation-size-dot {
@@ -2863,11 +2871,6 @@ defineExpose({ focusImage })
 
   .preview-thumbnails {
     gap: 4px;
-  }
-
-  .annotation-toolbar {
-    top: 8px;
-    left: 8px;
   }
 
   .annotation-tool {

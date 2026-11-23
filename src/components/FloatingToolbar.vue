@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { ChevronsLeft, ChevronsRight, GripVertical } from 'lucide-vue-next'
+import { ChevronsLeft, ChevronsRight, ChevronsUp, GripVertical } from 'lucide-vue-next'
 import {
   anchorFloatingPosition,
   clampFloatingBox,
@@ -15,11 +15,14 @@ import { vTooltip } from '../directives/tooltip'
  * 默认位置由使用方的 class 决定（如左上、左下）；拖动后改为贴最近两条边的内联位置，
  * 在所在定位容器（offsetParent）内限制范围。工具栏内容通过默认插槽传入。
  * 收起后整个工具栏从画布隐去（由使用方 v-if 卸载），从预览标题栏的「显示」开关恢复，不在画布里留按钮。
+ * docked 时固定在画布外的文档流里：没有拖动手柄、不读写位置，只保留收起按钮。
  */
 const props = defineProps<{
   /** 工具栏名称，如「标注工具栏」；用于 aria-label 和提示文字 */
   label: string
   state: PanelState
+  /** 固定在画布外（不浮动、不可拖动） */
+  docked?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -46,6 +49,9 @@ const collapseLabel = computed(() => `收起${props.label}（可在预览标题�
 const isAnchoredRight = computed(() => props.state.position?.x === 'right')
 
 const positionStyle = computed<Record<string, string> | undefined>(() => {
+  if (props.docked) {
+    return undefined
+  }
   if (dragBox.value) {
     return {
       left: `${dragBox.value.left}px`,
@@ -175,6 +181,9 @@ function collapse(): void {
 }
 
 onMounted(() => {
+  if (props.docked) {
+    return
+  }
   measure()
   resizeObserver = new ResizeObserver(measure)
   if (rootRef.value) {
@@ -196,7 +205,7 @@ onBeforeUnmount(() => {
   <div
     ref="rootRef"
     class="floating-toolbar"
-    :class="{ 'is-dragging': dragBox !== null }"
+    :class="{ 'is-dragging': dragBox !== null, 'is-docked': docked }"
     :style="positionStyle"
     role="toolbar"
     :aria-label="label"
@@ -206,6 +215,7 @@ onBeforeUnmount(() => {
     @wheel.stop
   >
     <span
+      v-if="!docked"
       v-tooltip="'拖动移动 · 双击复位'"
       class="floating-toolbar__grip"
       aria-hidden="true"
@@ -226,7 +236,8 @@ onBeforeUnmount(() => {
       :aria-label="collapseLabel"
       @click="collapse"
     >
-      <ChevronsRight v-if="isAnchoredRight" :size="14" :stroke-width="1.9" />
+      <ChevronsUp v-if="docked" :size="14" :stroke-width="1.9" />
+      <ChevronsRight v-else-if="isAnchoredRight" :size="14" :stroke-width="1.9" />
       <ChevronsLeft v-else :size="14" :stroke-width="1.9" />
     </button>
   </div>
@@ -245,6 +256,16 @@ onBeforeUnmount(() => {
   box-shadow: var(--shadow-xs);
   backdrop-filter: blur(8px);
   user-select: none;
+}
+
+/* 固定在画布外：放进文档流，宽度不够时换行，不压到画布上。 */
+.floating-toolbar.is-docked {
+  position: relative;
+  max-width: 100%;
+  flex-wrap: wrap;
+  padding: 3px 4px;
+  background: var(--surface);
+  backdrop-filter: none;
 }
 
 .floating-toolbar.is-dragging {
