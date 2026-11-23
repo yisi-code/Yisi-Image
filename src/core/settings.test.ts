@@ -90,6 +90,11 @@ describe('normalizeSettings', () => {
     expect(normalizeSettings({ sharpenModel: '../evil' }).sharpenModel).toBe('realesrgan')
   })
 
+  it('修瑕方式接受自定义模型编号，格式不对时回退经典算法', () => {
+    expect(normalizeSettings({ healEngine: 'custom-0123456789ab' }).healEngine).toBe('custom-0123456789ab')
+    expect(normalizeSettings({ healEngine: 'custom-../evil' }).healEngine).toBe('classic')
+  })
+
   it('间距超出范围时限制到 0–200', () => {
     expect(normalizeSettings({ gap: 999 }).gap).toBe(200)
     expect(normalizeSettings({ gap: -3 }).gap).toBe(0)

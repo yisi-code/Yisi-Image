@@ -5,7 +5,7 @@ import type { CustomModel } from '../core/modelApi'
 import { formatFileSize } from '../core/image'
 
 /**
- * 设置页里一个自定义清晰化模型：名称（可就地改名）、大小与 SHA-256 前几位、能不能用，
+ * 设置页里一个自定义模型（清晰化或局部修瑕）：名称（可就地改名）、大小与 SHA-256 前几位、能不能用，
  * 以及设为默认、删除。行的样式与内置模型行共用（base.css 的 model-row）。
  */
 const props = defineProps<{
@@ -15,6 +15,8 @@ const props = defineProps<{
   stateError: boolean
   selected: boolean
   busy: boolean
+  /** 「设为默认」的说明，按用途写 */
+  selectTitle: string
 }>()
 
 const emit = defineEmits<{
@@ -77,7 +79,7 @@ function cancelEdit(): void {
         class="button button-secondary"
         type="button"
         :disabled="busy"
-        title="清晰化面板选 AI 时默认用这个模型"
+        :title="selectTitle"
         @click="emit('select', model.id)"
       >
         设为默认

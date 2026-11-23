@@ -42,7 +42,15 @@ import type { ConfigDirStatus, SettingsStorage } from '../composables/useSetting
 import type { ConfigLocation } from '../core/configApi'
 import { formatFileSize } from '../core/image'
 import { isModelBusy } from '../core/modelApi'
-import type { CustomModel, HealModelId, ModelId, ModelStatus, ModelsSnapshot } from '../core/modelApi'
+import { isCustomModelKey } from '../core/modelApi'
+import type {
+  CustomModel,
+  CustomModelKind,
+  HealModelId,
+  ModelId,
+  ModelStatus,
+  ModelsSnapshot,
+} from '../core/modelApi'
 import { BUILTIN_SHARPEN_MODELS, findBuiltinSharpenModel } from '../core/sharpenModels'
 import {
   HEAL_ENGINE_OPTIONS,
@@ -89,7 +97,7 @@ const emit = defineEmits<{
   'change-models-dir': []
   'reset-models-dir': []
   'open-models-dir': []
-  'import-custom-model': []
+  'import-custom-model': [kind: CustomModelKind]
   'rename-custom-model': [id: string, name: string]
   'delete-custom-model': [id: string]
 }>()
@@ -180,8 +188,9 @@ const pendingDownload = ref<ModelId | null>(null)
 const pendingDelete = ref<ModelId | null>(null)
 const pendingCustomDelete = ref<CustomModel | null>(null)
 
+/** 内置的 AI 修瑕模型（有下载状态、有说明卡片）；自定义模型另算。 */
 function isAiEngine(value: HealEngine): value is HealModelId {
-  return value !== 'classic'
+  return value === 'migan' || value === 'lama'
 }
 
 function isHealModel(id: ModelId): id is HealModelId {
@@ -189,7 +198,15 @@ function isHealModel(id: ModelId): id is HealModelId {
 }
 
 function engineLabel(value: HealEngine): string {
+  if (isCustomModelKey(value)) {
+    const model = customModelsOf('heal').find((item) => item.id === value)
+    return model ? `AI · 自定义 · ${model.name}` : '自定义修瑕模型'
+  }
   return HEAL_ENGINE_OPTIONS.find((option) => option.value === value)?.label ?? value
+}
+
+function customModelsOf(kind: CustomModelKind): CustomModel[] {
+  return props.models?.custom.filter((model) => model.kind === kind) ?? []
 }
 
 function modelLabel(id: ModelId): string {
@@ -200,7 +217,7 @@ function modelLabel(id: ModelId): string {
 function sharpenModelLabel(key: string): string {
   return (
     findBuiltinSharpenModel(key)?.label ??
-    props.models?.custom.find((model) => model.id === key)?.name ??
+    customModelsOf('sharpen').find((model) => model.id === key)?.name ??
     '未选择'
   )
 }
@@ -213,7 +230,13 @@ function customStateText(model: CustomModel): { text: string; error: boolean } {
   if (!props.models?.runtimeReady) {
     return { text: '缺 AI 运行库：先下载上面的内置模型，运行库会一起下载', error: true }
   }
-  return { text: '可以使用，第一次用时会自动识别放大倍数', error: false }
+  return model.kind === 'heal'
+    ? { text: '可以使用，第一次修瑕时会自动识别输入格式', error: false }
+    : { text: '可以使用，第一次用时会自动识别放大倍数', error: false }
+}
+
+function isCustomUsable(model: CustomModel | undefined): boolean {
+  return Boolean(model?.available && props.models?.runtimeReady)
 }
 
 /** 模型用在哪：修瑕或清晰化；提示文案按它说。 */
@@ -263,6 +286,10 @@ function modelStateText(status: ModelStatus | null): string {
 
 const healSummary = computed(() => {
   const engine = props.settings.healEngine
+  if (isCustomModelKey(engine)) {
+    const model = customModelsOf('heal').find((item) => item.id === engine)
+    return isCustomUsable(model) ? engineLabel(engine) : `${engineLabel(engine)}（暂不能用，暂用经典算法）`
+  }
   if (!isAiEngine(engine)) {
     return engineLabel(engine)
   }
@@ -373,12 +400,24 @@ function selectSharpenModel(key: string): void {
   emit('update', { sharpenEngine: 'ai', sharpenModel: key })
 }
 
+/** 导入的修瑕模型设为补全方式。 */
+function selectHealCustom(key: string): void {
+  if (isCustomModelKey(key)) {
+    emit('update', { healEngine: key })
+  }
+}
+
 const customDeletePrompt = computed(() => {
   const model = pendingCustomDelete.value
   if (!model) {
     return { title: '', description: '' }
   }
-  const inUse = props.settings.sharpenModel === model.id ? '它是当前的默认模型，删除后改用内置模型。' : ''
+  let inUse = ''
+  if (model.kind === 'heal' && props.settings.healEngine === model.id) {
+    inUse = '它是当前的补全方式，删除后修瑕改用经典算法。'
+  } else if (model.kind === 'sharpen' && props.settings.sharpenModel === model.id) {
+    inUse = '它是当前的默认模型，删除后改用内置模型。'
+  }
   return {
     title: `删除自定义模型「${model.name}」？`,
     description: `将删除导入时复制到模型目录的文件（${formatFileSize(model.size)}），你原来的文件不受影响。${inUse}`,
@@ -391,7 +430,10 @@ function confirmCustomDelete(): void {
   if (!model) {
     return
   }
-  if (props.settings.sharpenModel === model.id) {
+  if (model.kind === 'heal' && props.settings.healEngine === model.id) {
+    emit('update', { healEngine: 'classic' })
+  }
+  if (model.kind === 'sharpen' && props.settings.sharpenModel === model.id) {
     emit('update', { sharpenModel: BUILTIN_SHARPEN_MODELS[0].id })
   }
   emit('delete-custom-model', model.id)
@@ -645,7 +687,7 @@ defineExpose({ focusTitle })
       <div class="setting-block">
         <div class="setting-label">
           <h4>补全方式</h4>
-          <p>三种方式各有长处和代价，可按画面选择，随时可以换。选了 AI 但模型还没下完时，修瑕先用经典算法。</p>
+          <p>三种方式各有长处和代价，可按画面选择，随时可以换；也可以在下面导入自己的修瑕模型并设为默认。选了 AI 但模型还不能用时，修瑕先用经典算法。</p>
         </div>
         <div class="settings-choices settings-choices--three" role="group" aria-label="局部修瑕补全方式">
           <button
@@ -693,8 +735,8 @@ defineExpose({ focusTitle })
 
       <div class="setting-block">
         <div class="setting-label">
-          <h4>AI 模型下载</h4>
-          <p>由本机程序下载，可暂停后接着下；下完按 SHA-256 校验，内容与官方发布一致才会启用。</p>
+          <h4>AI 模型</h4>
+          <p>内置模型由本机程序下载，可暂停后接着下，下完按 SHA-256 校验；也可以导入自己找的 ONNX 修瑕模型。</p>
         </div>
         <div v-if="modelsAvailable" class="model-list">
           <ModelRow
@@ -708,6 +750,33 @@ defineExpose({ focusTitle })
             @pause="emit('pause-model', $event)"
             @delete="pendingDelete = $event"
           />
+          <CustomModelRow
+            v-for="model in customModelsOf('heal')"
+            :key="model.id"
+            :model="model"
+            :state-text="customStateText(model).text"
+            :state-error="customStateText(model).error"
+            :selected="settings.healEngine === model.id"
+            :busy="modelsBusy"
+            select-title="局部修瑕用这个模型补全"
+            @select="selectHealCustom"
+            @rename="(id, name) => emit('rename-custom-model', id, name)"
+            @delete="pendingCustomDelete = models?.custom.find((item) => item.id === $event) ?? null"
+          />
+          <div class="custom-import">
+            <button
+              class="button button-secondary"
+              type="button"
+              :disabled="modelsBusy"
+              @click="emit('import-custom-model', 'heal')"
+            >
+              <FolderInput :size="14" :stroke-width="1.9" />
+              导入模型…
+            </button>
+            <p class="config-note">
+              支持修瑕（inpainting）类的 ONNX 模型：两个输入——3 通道图像 [1, 3, 高, 宽] 与 1 通道遮罩 [1, 1, 高, 宽]，float32（图像取值 0–1）或 uint8（0–255）；输出同尺寸的 [1, 3, 高, 宽] 图像。输入尺寸固定（如 512 × 512）或不固定都可以，遮罩用 1 还是 0 表示要补、输出取值范围会自动识别。不符合时修瑕会提示原因并改用经典算法。注意查看模型的许可证。
+            </p>
+          </div>
         </div>
         <p v-else class="config-note">
           当前以浏览器页面运行。AI 模型由免安装 EXE 版的本机程序下载和提供，在这里只能使用经典算法。
@@ -860,13 +929,14 @@ defineExpose({ focusTitle })
             @select="selectSharpenModel"
           />
           <CustomModelRow
-            v-for="model in models?.custom ?? []"
+            v-for="model in customModelsOf('sharpen')"
             :key="model.id"
             :model="model"
             :state-text="customStateText(model).text"
             :state-error="customStateText(model).error"
             :selected="settings.sharpenModel === model.id"
             :busy="modelsBusy"
+            select-title="清晰化面板选 AI 时默认用这个模型"
             @select="selectSharpenModel"
             @rename="(id, name) => emit('rename-custom-model', id, name)"
             @delete="pendingCustomDelete = models?.custom.find((item) => item.id === $event) ?? null"
@@ -876,7 +946,7 @@ defineExpose({ focusTitle })
               class="button button-secondary"
               type="button"
               :disabled="modelsBusy"
-              @click="emit('import-custom-model')"
+              @click="emit('import-custom-model', 'sharpen')"
             >
               <FolderInput :size="14" :stroke-width="1.9" />
               导入模型…

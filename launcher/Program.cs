@@ -954,10 +954,13 @@ namespace Yisi.ImageTool
                     }
                     else
                     {
+                        // 先校验用途再弹窗，免得选完文件才报错。
+                        string kind = CustomModelStore.NormalizeKind(ReadOptionalStringField(request.Body, "kind"));
                         string selected = picker(null);
                         json = selected == null
                             ? "{\"canceled\":true," + ModelStore.DescribeJson().Substring(1)
-                            : "{\"imported\":" + new JavaScriptSerializer().Serialize(CustomModelStore.Import(selected)) +
+                            : "{\"imported\":" +
+                                new JavaScriptSerializer().Serialize(CustomModelStore.Import(selected, kind)) +
                                 "," + ModelStore.DescribeJson().Substring(1);
                     }
                 }
@@ -1078,6 +1081,22 @@ namespace Yisi.ImageTool
         }
 
         /// <summary>解析 {"id": "..."} 这类只有一个字符串字段的请求体。</summary>
+        /// <summary>读一个可以省略的字符串字段；没有、或不是字符串时返回 null。</summary>
+        private static string ReadOptionalStringField(byte[] body, string name)
+        {
+            try
+            {
+                Dictionary<string, object> parsed = new JavaScriptSerializer().DeserializeObject(
+                    Encoding.UTF8.GetString(body)) as Dictionary<string, object>;
+                object value;
+                return parsed != null && parsed.TryGetValue(name, out value) ? value as string : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         private static string ReadStringField(byte[] body, string name)
         {
             Dictionary<string, object> parsed = null;

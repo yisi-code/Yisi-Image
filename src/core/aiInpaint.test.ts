@@ -2,11 +2,17 @@ import { describe, expect, it } from 'vitest'
 import {
   LAMA_CONTEXT,
   LAMA_SIZE,
+  detectOutputRange,
+  encodeInpaintImage,
+  encodeInpaintMask,
+  holeChange,
+  inpaintProbeImage,
   lamaCrop,
   lamaFeeds,
   lamaResult,
   miganFeeds,
   miganResult,
+  outputToByte,
 } from './aiInpaint'
 
 function gradient(width: number, height: number): Uint8ClampedArray {
@@ -108,5 +114,46 @@ describe('LaMa 裁剪与换算', () => {
     expect(result[(250 * width + 290) * 4]).toBe(77)
     expect(result[(10 * width + 10) * 4]).toBe(rgba[(10 * width + 10) * 4])
     expect(result[(240 * width + 279) * 4]).toBe(rgba[(240 * width + 279) * 4])
+  })
+})
+
+describe('自定义修瑕模型的换算与试算', () => {
+  it('其他边长按比例留上下文：256 边长留 64', () => {
+    const width = 1000
+    const height = 1000
+    const mask = new Uint8Array(width * height)
+    for (let y = 400; y < 600; y += 1) {
+      for (let x = 450; x < 550; x += 1) {
+        mask[y * width + x] = 1
+      }
+    }
+    // 洞长边 200 + 两侧各 64 = 328 > 256
+    expect(lamaCrop(width, height, mask, 256)).toEqual({ x: 336, y: 336, width: 328, height: 328 })
+  })
+
+  it('uint8 图像乘 255；遮罩按约定取 1 / 255 或反过来', () => {
+    expect(Array.from(encodeInpaintImage(new Float32Array([0, 0.5, 1]), 'uint8'))).toEqual([0, 128, 255])
+    const hole = new Float32Array([1, 0])
+    expect(Array.from(encodeInpaintMask(hole, 'float32', true))).toEqual([1, 0])
+    expect(Array.from(encodeInpaintMask(hole, 'uint8', false))).toEqual([0, 255])
+  })
+
+  it('按输出值判断取值范围并换成 0–255', () => {
+    expect(detectOutputRange(new Uint8Array([3, 4]), 'uint8')).toBe('byte')
+    expect(detectOutputRange([0, 200], 'float32')).toBe('byte')
+    expect(detectOutputRange([-0.9, 0.8], 'float32')).toBe('signed')
+    expect(detectOutputRange([0, 0.8], 'float32')).toBe('unit')
+    expect(Array.from(outputToByte([-1, 1], 'signed'))).toEqual([0, 255])
+    expect(Array.from(outputToByte([0.5], 'unit'))).toEqual([127.5])
+  })
+
+  it('洞还是洋红时变化接近 0，补成灰色时明显变大', () => {
+    const size = 64
+    const { image, box } = inpaintProbeImage(size)
+    const untouched = outputToByte(image, 'unit')
+    expect(holeChange(untouched, size, box)).toBeCloseTo(0, 5)
+    const filled = new Float32Array(untouched)
+    filled.fill(128)
+    expect(holeChange(filled, size, box)).toBeGreaterThan(0.2)
   })
 })

@@ -1,7 +1,7 @@
 import type { HealJob } from './heal'
 import { callAi } from './aiWorkerClient'
 import { WorkerClient } from './workerClient'
-import type { HealModelId } from './modelApi'
+import type { CustomModelKey, HealModelId } from './modelApi'
 import type { HealFill } from './types'
 
 export interface HealFillResult {
@@ -19,12 +19,18 @@ export interface HealResult {
 }
 
 /**
- * 这次修瑕用哪种方式。AI 模型只有在启动器确认已下载完时才会是 ai；
+ * 这次修瑕用哪种方式。AI 模型（内置或导入的自定义模型）只有在启动器确认能用时才会是 ai；
  * 设置选了 AI 但模型还不能用时是 classic，并带上要提示用户的 notice。
  */
 export type HealEngineChoice =
   | { kind: 'classic'; notice?: string }
-  | { kind: 'ai'; model: HealModelId; label: string; modelUrl: string; runtimeUrl: string }
+  | {
+      kind: 'ai'
+      model: HealModelId | CustomModelKey
+      label: string
+      modelUrl: string
+      runtimeUrl: string
+    }
 
 /**
  * 修瑕引擎入口：经典算法与 AI 模型各在自己的 Web Worker 里跑，

@@ -5,13 +5,14 @@ import type { ExportOptions } from './exportOptions'
 import { normalizeFloatingPosition } from './floating'
 import type { FloatingPosition } from './floating'
 import { DEFAULT_GAP, clampGap } from './layout'
-import type { HealModelId } from './modelApi'
+import { isCustomModelKey } from './modelApi'
+import type { CustomModelKey, HealModelId } from './modelApi'
 
 export type ThumbnailOrientation = 'auto' | 'horizontal' | 'vertical'
 export type ThumbnailSize = 'small' | 'medium' | 'large'
 export type ThumbnailFit = 'contain' | 'cover' | 'fill'
-/** 局部修瑕的补全方式：经典算法（默认，无需下载）或某个 AI 模型。 */
-export type HealEngine = 'classic' | HealModelId
+/** 局部修瑕的补全方式：经典算法（默认，无需下载）、内置 AI 模型，或导入的自定义模型（custom-…）。 */
+export type HealEngine = 'classic' | HealModelId | CustomModelKey
 /** 清晰化方式：经典锐化（默认，无需下载）或 AI 模型（具体用哪个见 sharpenModel）。 */
 export type SharpenEngine = 'classic' | 'ai'
 /** AI 清晰化默认用的模型：内置模型编号，或自定义模型编号（custom-…） */
@@ -231,7 +232,7 @@ function isFit(value: unknown): value is ThumbnailFit {
 }
 
 function isHealEngine(value: unknown): value is HealEngine {
-  return value === 'classic' || value === 'migan' || value === 'lama'
+  return value === 'classic' || value === 'migan' || value === 'lama' || isCustomModelKey(value)
 }
 
 function normalizeGap(value: unknown): number {

@@ -12,7 +12,7 @@ import {
   pauseModel,
   pickModelsDir,
 } from '../core/modelApi'
-import type { ModelId, ModelStatus, ModelsSnapshot } from '../core/modelApi'
+import type { CustomModelKind, ModelId, ModelStatus, ModelsSnapshot } from '../core/modelApi'
 import type { ConfigDirStatus } from './useSettings'
 
 /** 下载进行中时轮询进度的间隔。 */
@@ -77,6 +77,8 @@ export function useModels(enabled: boolean) {
       actionStatus.value = await action()
     } catch (error) {
       actionStatus.value = { tone: 'error', text: messageOf(error) }
+      // 操作在本机程序那边可能已经做完、只是页面没收到回应（例如删除）：重新读一次，列表与实际一致。
+      void refresh()
     } finally {
       isBusy.value = false
     }
@@ -125,15 +127,17 @@ export function useModels(enabled: boolean) {
     })
   }
 
-  function importCustom(): Promise<void> {
+  function importCustom(kind: CustomModelKind): Promise<void> {
     return run('请在弹出的窗口中选择 .onnx 模型文件…', async () => {
-      const result = await importCustomModel()
+      const result = await importCustomModel(kind)
       apply(result.snapshot)
       if (!result.imported) {
         return null
       }
       const name = result.snapshot.custom.find((item) => item.id === result.imported)?.name ?? '模型'
-      return { tone: 'success', text: `已导入「${name}」，第一次使用时会自动识别放大倍数` }
+      const next =
+        kind === 'heal' ? '第一次修瑕时会自动识别输入格式' : '第一次使用时会自动识别放大倍数'
+      return { tone: 'success', text: `已导入「${name}」，${next}` }
     })
   }
 

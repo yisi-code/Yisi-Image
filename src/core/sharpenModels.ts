@@ -31,7 +31,3 @@ export const CUSTOM_MODEL_MULTIPLE = 16
 export function findBuiltinSharpenModel(id: string): BuiltinSharpenModel | null {
   return BUILTIN_SHARPEN_MODELS.find((model) => model.id === id) ?? null
 }
-
-export function isCustomModelKey(key: string): boolean {
-  return key.startsWith('custom-')
-}

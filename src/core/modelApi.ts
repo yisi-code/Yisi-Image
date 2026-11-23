@@ -16,6 +16,17 @@ export type ModelId = HealModelId | SharpenModelId
 
 export const MODEL_IDS: readonly ModelId[] = ['migan', 'lama', 'realesrgan']
 
+/** 自定义模型的用途：清晰化或局部修瑕 */
+export type CustomModelKind = 'sharpen' | 'heal'
+/** 自定义模型编号：custom- 加 SHA-256 前 12 位 */
+export type CustomModelKey = `custom-${string}`
+
+const CUSTOM_KEY_PATTERN = /^custom-[0-9a-f]{12}$/
+
+export function isCustomModelKey(value: unknown): value is CustomModelKey {
+  return typeof value === 'string' && CUSTOM_KEY_PATTERN.test(value)
+}
+
 /**
  * missing：没有下载过；queued：排队等前一个下完；downloading / verifying：下载中 / 校验中；
  * paused：下了一部分（暂停或程序关闭）；ready：可以使用；error：上次下载失败，error 字段是原因。
@@ -46,10 +57,10 @@ export interface ModelStatus {
   modelUrl: string
 }
 
-/** 用户导入的清晰化模型（只在 EXE 版里，由启动器保存在模型目录的 custom 文件夹） */
+/** 用户导入的 AI 模型（只在 EXE 版里，由启动器保存在模型目录的 custom 文件夹） */
 export interface CustomModel {
-  /** custom-SHA-256 前 12 位 */
-  id: string
+  id: CustomModelKey
+  kind: CustomModelKind
   name: string
   size: number
   sha256: string
@@ -126,7 +137,7 @@ function toStatus(value: unknown): ModelStatus | null {
 function toCustom(value: unknown): CustomModel | null {
   const item = (value ?? {}) as Record<string, unknown>
   if (
-    typeof item.id !== 'string' ||
+    !isCustomModelKey(item.id) ||
     typeof item.name !== 'string' ||
     typeof item.modelUrl !== 'string' ||
     typeof item.size !== 'number'
@@ -135,6 +146,8 @@ function toCustom(value: unknown): CustomModel | null {
   }
   return {
     id: item.id,
+    // 旧版启动器不返回用途，当时只能导入清晰化模型。
+    kind: item.kind === 'heal' ? 'heal' : 'sharpen',
     name: item.name,
     size: item.size,
     sha256: typeof item.sha256 === 'string' ? item.sha256 : '',
@@ -204,9 +217,11 @@ export async function moveModelsDir(
   return { snapshot: toSnapshot(body), moved: body.moved === true }
 }
 
-/** 弹出系统「打开文件」窗口导入一个 ONNX 模型；取消时 imported 为 null。 */
-export async function importCustomModel(): Promise<{ snapshot: ModelsSnapshot; imported: string | null }> {
-  const body = await post('/api/models/custom/import')
+/** 弹出系统「打开文件」窗口导入一个 ONNX 模型作为 kind 用途；取消时 imported 为 null。 */
+export async function importCustomModel(
+  kind: CustomModelKind,
+): Promise<{ snapshot: ModelsSnapshot; imported: string | null }> {
+  const body = await post('/api/models/custom/import', { kind })
   return { snapshot: toSnapshot(body), imported: typeof body.imported === 'string' ? body.imported : null }
 }
 

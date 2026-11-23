@@ -2,13 +2,15 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Web.Script.Serialization;
 
 namespace Yisi.ImageTool
 {
     /// <summary>
-    /// 用户自己导入的清晰化模型（ONNX）。文件复制到模型目录下的 custom 文件夹，
-    /// 以「custom-SHA-256 前 12 位.onnx」保存，清单 custom-models.json 记名称、大小与 SHA-256。
+    /// 用户自己导入的 AI 模型（ONNX），用途是清晰化（sharpen）或局部修瑕（heal）。
+    /// 文件复制到模型目录下的 custom 文件夹，以「custom-SHA-256 前 12 位.onnx」保存，
+    /// 清单 custom-models.json 记用途、名称、大小与 SHA-256（早期没有用途字段的条目按清晰化处理）。
     /// 页面通过 /models/custom/文件名 读取；只认清单里且大小一致的文件。
     /// 运行库与内置模型共用（模型目录里的 ort-wasm 文件）。
     /// </summary>
@@ -18,12 +20,17 @@ namespace Yisi.ImageTool
         private const string ManifestName = "custom-models.json";
         private const long MaxModelBytes = 1024L * 1024 * 1024;
         private const int MaxNameLength = 60;
+        internal const string KindSharpen = "sharpen";
+        internal const string KindHeal = "heal";
+        private static readonly Regex IdPattern = new Regex("^custom-[0-9a-f]{12}$");
 
         private static readonly object Sync = new object();
 
         private sealed class CustomModel
         {
             public string Id { get; set; }
+            /// <summary>sharpen / heal；旧清单里为 null，按 sharpen 处理</summary>
+            public string Kind { get; set; }
             public string Name { get; set; }
             public long Size { get; set; }
             public string Sha256 { get; set; }
@@ -38,6 +45,30 @@ namespace Yisi.ImageTool
         private static string FileNameOf(string id)
         {
             return id + ".onnx";
+        }
+
+        private static string KindOf(CustomModel model)
+        {
+            return model.Kind == KindHeal ? KindHeal : KindSharpen;
+        }
+
+        private static string PurposeText(string kind)
+        {
+            return kind == KindHeal ? "局部修瑕" : "清晰化";
+        }
+
+        /// <summary>页面传来的用途；缺省为清晰化（兼容只会导入清晰化模型的旧页面）。</summary>
+        internal static string NormalizeKind(string kind)
+        {
+            if (string.IsNullOrEmpty(kind) || kind == KindSharpen)
+            {
+                return KindSharpen;
+            }
+            if (kind == KindHeal)
+            {
+                return KindHeal;
+            }
+            throw new ModelException("模型用途无效");
         }
 
         private static List<CustomModel> Load(string modelsDir)
@@ -96,6 +127,7 @@ namespace Yisi.ImageTool
                     string file = Path.Combine(FolderIn(modelsDir), FileNameOf(model.Id));
                     Dictionary<string, object> item = new Dictionary<string, object>();
                     item["id"] = model.Id;
+                    item["kind"] = KindOf(model);
                     item["name"] = model.Name;
                     item["size"] = model.Size;
                     item["sha256"] = model.Sha256;
@@ -107,8 +139,11 @@ namespace Yisi.ImageTool
             }
         }
 
-        /// <summary>复制并登记一个 ONNX 文件；同一份文件（SHA-256 相同）重复导入时直接返回已有的编号。</summary>
-        internal static string Import(string sourcePath)
+        /// <summary>
+        /// 复制并登记一个 ONNX 文件；同一份文件（SHA-256 相同）以同一用途重复导入时直接返回已有的编号，
+        /// 已作为另一用途导入过时报错（两个用途共用一个文件名，不能各存一份）。
+        /// </summary>
+        internal static string Import(string sourcePath, string kind)
         {
             if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
             {
@@ -133,6 +168,12 @@ namespace Yisi.ImageTool
                 string folder = FolderIn(modelsDir);
                 string target = Path.Combine(folder, FileNameOf(id));
                 CustomModel existing = list.Find(item => item.Id == id);
+                if (existing != null && KindOf(existing) != kind)
+                {
+                    throw new ModelException(
+                        "这个文件已经作为" + PurposeText(KindOf(existing)) + "模型导入过（「" + existing.Name +
+                        "」），要换用途请先在那里删除");
+                }
                 if (existing != null && File.Exists(target) && new FileInfo(target).Length == size)
                 {
                     return id;
@@ -169,6 +210,7 @@ namespace Yisi.ImageTool
                 list.Add(new CustomModel
                 {
                     Id = id,
+                    Kind = kind,
                     Name = CleanName(Path.GetFileNameWithoutExtension(sourcePath)),
                     Size = size,
                     Sha256 = sha,
@@ -195,16 +237,21 @@ namespace Yisi.ImageTool
             }
         }
 
+        /// <summary>
+        /// 删除文件并从清单去掉。清单里已经没有它时当作已删除（只清理可能残留的文件），不报错：
+        /// 上一次删除在服务端已完成、但页面没收到回应时，再点一次删除应当得到最新列表。
+        /// </summary>
         internal static void Delete(string id)
         {
+            if (id == null || !IdPattern.IsMatch(id))
+            {
+                throw new ModelException("自定义模型编号无效");
+            }
             lock (Sync)
             {
                 string modelsDir = ModelStore.CurrentDirectory();
                 List<CustomModel> list = Load(modelsDir);
-                if (list.RemoveAll(item => item.Id == id) == 0)
-                {
-                    throw new ModelException("没有这个自定义模型");
-                }
+                bool listed = list.RemoveAll(item => item.Id == id) > 0;
                 string file = Path.Combine(FolderIn(modelsDir), FileNameOf(id));
                 try
                 {
@@ -217,7 +264,10 @@ namespace Yisi.ImageTool
                 {
                     throw new ModelException("删除模型文件失败：" + ex.Message, ex);
                 }
-                Save(modelsDir, list);
+                if (listed)
+                {
+                    Save(modelsDir, list);
+                }
             }
         }
 

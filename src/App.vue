@@ -49,7 +49,7 @@ import {
 import { calculateStitchLayout, inspectOutputSize } from './core/layout'
 import { renderStitch } from './core/render'
 import { getSavePicker } from './core/save'
-import { isModelBusy } from './core/modelApi'
+import { isCustomModelKey, isModelBusy } from './core/modelApi'
 import { HEAL_ENGINE_OPTIONS, THUMBNAIL_SIZE_PX } from './core/settings'
 import type { PanelKey, PanelState, WorkMode } from './core/settings'
 import type { StitchDirection, StitchImage } from './core/types'
@@ -83,6 +83,9 @@ const healEngineChoice = computed<HealEngineChoice>(() => {
   if (engine === 'classic') {
     return { kind: 'classic' }
   }
+  if (isCustomModelKey(engine)) {
+    return customHealChoice(engine)
+  }
   const label = HEAL_ENGINE_OPTIONS.find((option) => option.value === engine)?.label ?? engine
   if (!models.isAvailable) {
     return { kind: 'classic', notice: `${label} 只能在免安装 EXE 版里使用，这次用经典算法` }
@@ -99,6 +102,33 @@ const healEngineChoice = computed<HealEngineChoice>(() => {
   }
   return { kind: 'classic', notice: `${label} ${reason}，这次用经典算法；可在「设置 · 局部修瑕」里查看下载` }
 })
+
+/** 导入的修瑕模型：要在 EXE 版、清单里还有它、文件还在、共用运行库已下载。 */
+function customHealChoice(key: `custom-${string}`): HealEngineChoice {
+  const snapshot = models.snapshot.value
+  const model = snapshot?.custom.find((item) => item.id === key && item.kind === 'heal')
+  const label = model ? `自定义 · ${model.name}` : '自定义修瑕模型'
+  const fallback = (reason: string): HealEngineChoice => ({
+    kind: 'classic',
+    notice: `${label} ${reason}，这次用经典算法`,
+  })
+  if (!models.isAvailable) {
+    return fallback('只能在免安装 EXE 版里使用')
+  }
+  if (!snapshot) {
+    return fallback('读不到模型状态')
+  }
+  if (!model) {
+    return fallback('已不在模型目录里；可在「设置 · 局部修瑕」里重新导入')
+  }
+  if (!model.available) {
+    return fallback('的文件不见了；可在「设置 · 局部修瑕」里重新导入')
+  }
+  if (!snapshot.runtimeReady) {
+    return fallback('缺 AI 运行库；在「设置 · 局部修瑕」下载 MI-GAN 时会一起下载')
+  }
+  return { kind: 'ai', model: key, label, modelUrl: model.modelUrl, runtimeUrl: snapshot.runtimeUrl }
+}
 
 const EXE_ONLY_REASON = 'AI 清晰化只能在免安装 EXE 版里使用，浏览器页面请用经典锐化。'
 
@@ -160,11 +190,13 @@ const aiModelChoices = computed<AiModelChoice[]>(() => [
     label: model.label,
     state: builtinSharpenState(model),
   })),
-  ...(models.snapshot.value?.custom ?? []).map((model) => ({
-    key: model.id,
-    label: `自定义 · ${model.name}`,
-    state: customSharpenState(model),
-  })),
+  ...(models.snapshot.value?.custom ?? [])
+    .filter((model) => model.kind === 'sharpen')
+    .map((model) => ({
+      key: model.id,
+      label: `自定义 · ${model.name}`,
+      state: customSharpenState(model),
+    })),
 ])
 /** 设置里选的模型不见了（例如自定义模型被删）时用第一个。 */
 const aiModelKey = computed(() =>

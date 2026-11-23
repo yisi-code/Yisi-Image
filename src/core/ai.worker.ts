@@ -1,6 +1,22 @@
 import * as ort from 'onnxruntime-web/wasm'
 import ortGlueUrl from 'onnxruntime-web/ort-wasm-simd-threaded.mjs?url'
-import { LAMA_SIZE, lamaCrop, lamaFeeds, lamaResult, miganFeeds, miganResult } from './aiInpaint'
+import {
+  CUSTOM_INPAINT_SIZE,
+  LAMA_SIZE,
+  PROBE_INPAINT_SIZE,
+  detectOutputRange,
+  encodeInpaintImage,
+  encodeInpaintMask,
+  holeChange,
+  inpaintProbeImage,
+  lamaCrop,
+  lamaFeeds,
+  lamaResult,
+  miganFeeds,
+  miganResult,
+  outputToByte,
+} from './aiInpaint'
+import type { CustomInpaintSpec, InpaintTensorType } from './aiInpaint'
 import { UPSCALE_FACTOR, planTiles, tileToTensor, writeTileResult } from './aiUpscale'
 
 /**
@@ -16,7 +32,7 @@ interface AiRequest {
   id: number
   /** inpaint：修瑕（默认）；upscale：清晰化；probe：读一个陌生模型的输入要求并试算放大倍数 */
   kind?: 'inpaint' | 'upscale' | 'probe'
-  /** 修瑕时是 migan / lama；清晰化时是内置或自定义模型的编号，只用来区分 */
+  /** 修瑕时是 migan / lama 或自定义模型编号（custom-…）；清晰化时是内置或自定义模型的编号 */
   model: string
   modelUrl: string
   runtimeUrl: string
@@ -55,6 +71,11 @@ interface InputMetadata {
 }
 
 const PROBE_SIZE = 32
+/** 试算时洞里与洋红的平均差超过它，才算模型「补了洞」 */
+const HOLE_FILLED_THRESHOLD = 0.2
+
+/** 自定义修瑕模型试算出的约定，按模型地址缓存（会话释放后也不用重新试算）。 */
+const inpaintSpecs = new Map<string, CustomInpaintSpec>()
 
 const scope = self as unknown as {
   onmessage: ((event: MessageEvent<AiRequest>) => void) | null
@@ -154,6 +175,133 @@ async function probe(session: ort.InferenceSession): Promise<ProbeResult> {
   }
 }
 
+function tensorTypeOf(type: string | undefined, label: string): InpaintTensorType {
+  if (type === undefined || type === 'float32') {
+    return 'float32'
+  }
+  if (type === 'uint8') {
+    return 'uint8'
+  }
+  throw new Error(`模型的${label}输入是 ${type}，只支持 float32 或 uint8`)
+}
+
+function inpaintFeeds(
+  spec: CustomInpaintSpec,
+  size: number,
+  image: Float32Array,
+  hole: Float32Array,
+): Record<string, ort.Tensor> {
+  return {
+    [spec.imageName]: new ort.Tensor(spec.imageType, encodeInpaintImage(image, spec.imageType), [1, 3, size, size]),
+    [spec.maskName]: new ort.Tensor(spec.maskType, encodeInpaintMask(hole, spec.maskType, spec.holeHigh), [
+      1,
+      1,
+      size,
+      size,
+    ]),
+  }
+}
+
+/**
+ * 读自定义修瑕模型的输入要求，并用一张「渐变底 + 洋红洞」的图试算，判断遮罩里哪个值表示要补、
+ * 输出取值范围。要求：两个输入（3 通道图像、1 通道遮罩，float32 或 uint8），输出与输入同尺寸的 [1,3,高,宽]。
+ */
+async function inpaintSpecOf(session: ort.InferenceSession, key: string): Promise<CustomInpaintSpec> {
+  const cached = inpaintSpecs.get(key)
+  if (cached) {
+    return cached
+  }
+  if (session.inputNames.length !== 2) {
+    throw new Error(`这个模型有 ${session.inputNames.length} 个输入，修瑕模型需要图像和遮罩两个输入`)
+  }
+  const metadata = (session as unknown as { inputMetadata?: InputMetadata[] }).inputMetadata ?? []
+  const inputs = session.inputNames.map((name, index) => {
+    const shape = metadata[index]?.shape
+    return {
+      name,
+      type: metadata[index]?.type,
+      shape,
+      channels: typeof shape?.[1] === 'number' ? shape[1] : null,
+    }
+  })
+  const mask =
+    inputs.find((input) => input.channels === 1) ?? inputs.find((input) => /mask/i.test(input.name))
+  const image = inputs.find((input) => input !== mask)
+  if (!mask || !image || image.channels === 1) {
+    throw new Error('认不出哪个输入是遮罩：需要一个 3 通道图像输入和一个 1 通道遮罩输入')
+  }
+  if (image.channels !== null && image.channels !== 3) {
+    throw new Error(`图像输入是 ${image.channels} 通道，只支持 3 通道 RGB`)
+  }
+  const fixedHeight = typeof image.shape?.[2] === 'number' && image.shape[2] > 0 ? image.shape[2] : null
+  const fixedWidth = typeof image.shape?.[3] === 'number' && image.shape[3] > 0 ? image.shape[3] : null
+  if (fixedWidth !== null && fixedHeight !== null && fixedWidth !== fixedHeight) {
+    throw new Error(`模型只收 ${fixedWidth} × ${fixedHeight} 的输入，目前只支持方形或不固定尺寸`)
+  }
+  const fixed = fixedWidth ?? fixedHeight
+  const draft: CustomInpaintSpec = {
+    imageName: image.name,
+    maskName: mask.name,
+    imageType: tensorTypeOf(image.type, '图像'),
+    maskType: tensorTypeOf(mask.type, '遮罩'),
+    size: fixed ?? CUSTOM_INPAINT_SIZE,
+    holeHigh: true,
+    outputRange: 'unit',
+  }
+
+  const testSize = fixed ?? PROBE_INPAINT_SIZE
+  const test = inpaintProbeImage(testSize)
+  const attempt = async (holeHigh: boolean): Promise<{ change: number; range: CustomInpaintSpec['outputRange'] }> => {
+    const result = await session.run(inpaintFeeds({ ...draft, holeHigh }, testSize, test.image, test.hole))
+    const output = result[session.outputNames[0]]
+    const dims = output.dims.map(Number)
+    if (dims.length !== 4 || dims[1] !== 3 || dims[2] !== testSize || dims[3] !== testSize) {
+      throw new Error(`模型输出是 [${dims.join(', ')}]，需要与输入同尺寸的 [1, 3, 高, 宽] 图像`)
+    }
+    const data = output.data as ArrayLike<number>
+    const range = detectOutputRange(data, output.type)
+    return { change: holeChange(outputToByte(data, range), testSize, test.box), range }
+  }
+
+  // 先按「1 / 255 表示要补」（LaMa 的约定）试；没补上再按「0 表示要补」（MI-GAN 的约定）试。
+  let found: { holeHigh: boolean; range: CustomInpaintSpec['outputRange'] } | null = null
+  for (const holeHigh of [true, false]) {
+    const { change, range } = await attempt(holeHigh)
+    if (change > HOLE_FILLED_THRESHOLD) {
+      found = { holeHigh, range }
+      break
+    }
+  }
+  if (!found) {
+    throw new Error('试算时模型没有补上遮罩区域，可能不是修瑕（inpainting）模型')
+  }
+  const spec = { ...draft, holeHigh: found.holeHigh, outputRange: found.range }
+  inpaintSpecs.set(key, spec)
+  return spec
+}
+
+/** 自定义修瑕模型：与 LaMa 一样裁剪、缩放到模型边长计算，结果贴回洞内。 */
+async function customInpaint(
+  session: ort.InferenceSession,
+  request: AiRequest,
+  mask: Uint8Array,
+): Promise<AiResult> {
+  const { width, height, rgba } = request
+  const spec = await inpaintSpecOf(session, absolute(request.modelUrl))
+  const crop = lamaCrop(width, height, mask, spec.size)
+  if (!crop) {
+    return { rgba: new Uint8ClampedArray(rgba), width, height }
+  }
+  const feeds = lamaFeeds(width, rgba, mask, crop, spec.size)
+  const result = await session.run(inpaintFeeds(spec, spec.size, feeds.image, feeds.mask))
+  const output = result[session.outputNames[0]].data as ArrayLike<number>
+  return {
+    rgba: lamaResult(outputToByte(output, spec.outputRange), width, height, rgba, mask, crop, spec.size),
+    width,
+    height,
+  }
+}
+
 /** 清晰化：分块送进模型，每块只取中间部分，缩到 outputFactor 倍后拼回结果。 */
 async function upscale(
   session: ort.InferenceSession,
@@ -214,6 +362,10 @@ async function run(request: AiRequest, report: (fraction: number) => void): Prom
       width,
       height,
     }
+  }
+
+  if (request.model !== 'lama') {
+    return customInpaint(session, request, mask)
   }
 
   const crop = lamaCrop(width, height, mask)
