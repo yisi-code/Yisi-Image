@@ -1,3 +1,5 @@
+import type { AiSharpenLevel } from './aiUpscale'
+import type { SharpenEngine } from './settings'
 import type { SharpenSettings } from './sharpen'
 
 export type StitchDirection = 'vertical' | 'horizontal'
@@ -72,7 +74,12 @@ export interface StitchImage {
  * 原图文件不变；对比视图里「原图」一侧仍画 element。
  */
 export interface ImageEnhance {
+  /** 用哪种方式清晰化的 */
+  engine: SharpenEngine
+  /** 经典锐化的参数（AI 时记下面板上的经典参数，切回经典时沿用） */
   sharpen: SharpenSettings
+  /** AI 清晰化的等级；经典锐化时为空 */
+  aiLevel?: AiSharpenLevel
   canvas: HTMLCanvasElement
 }
 

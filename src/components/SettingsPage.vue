@@ -1,7 +1,7 @@
 <script lang="ts">
 import { ref } from 'vue'
 
-type SettingsCategory = 'thumbnail' | 'heal' | 'config'
+type SettingsCategory = 'thumbnail' | 'heal' | 'sharpen' | 'config'
 
 /**
  * 当前选中的设置分类。放在模块级：返回拼接时设置页会卸载，再进设置仍停在上次看的分类；
@@ -19,7 +19,6 @@ import {
   ArrowUpDown,
   Brain,
   Crop,
-  Download,
   Expand,
   FileCog,
   FolderCog,
@@ -28,30 +27,31 @@ import {
   GalleryThumbnails,
   Loader2,
   Maximize2,
-  Pause,
-  Play,
   RefreshCw,
   RotateCcw,
   Settings2,
-  Trash2,
+  Sparkles,
   Undo2,
   Wand2,
   Zap,
 } from 'lucide-vue-next'
 import ConfirmDialog from './ConfirmDialog.vue'
+import ModelRow from './ModelRow.vue'
 import type { ConfigDirStatus, SettingsStorage } from '../composables/useSettings'
 import type { ConfigLocation } from '../core/configApi'
 import { formatFileSize } from '../core/image'
 import { isModelBusy } from '../core/modelApi'
-import type { AiModelId, ModelStatus, ModelsSnapshot } from '../core/modelApi'
+import type { HealModelId, ModelId, ModelStatus, ModelsSnapshot, SharpenModelId } from '../core/modelApi'
 import {
   HEAL_ENGINE_OPTIONS,
+  SHARPEN_ENGINE_OPTIONS,
   THUMBNAIL_FIT_OPTIONS,
   THUMBNAIL_ORIENTATION_OPTIONS,
   THUMBNAIL_SIZE_OPTIONS,
 } from '../core/settings'
 import type {
   HealEngine,
+  SharpenEngine,
   ThumbnailFit,
   ThumbnailOrientation,
   ThumbnailSize,
@@ -81,9 +81,9 @@ const emit = defineEmits<{
   'change-dir': []
   'reset-dir': []
   'open-dir': []
-  'download-model': [id: AiModelId]
-  'pause-model': [id: AiModelId]
-  'delete-model': [id: AiModelId]
+  'download-model': [id: ModelId]
+  'pause-model': [id: ModelId]
+  'delete-model': [id: ModelId]
   'change-models-dir': []
   'reset-models-dir': []
   'open-models-dir': []
@@ -95,6 +95,7 @@ const titleRef = ref<HTMLElement | null>(null)
 const categories: { key: SettingsCategory; label: string; icon: Component }[] = [
   { key: 'thumbnail', label: '预览缩略图', icon: GalleryThumbnails },
   { key: 'heal', label: '局部修瑕', icon: Wand2 },
+  { key: 'sharpen', label: '清晰化', icon: Sparkles },
   { key: 'config', label: '配置文件', icon: FileCog },
 ]
 
@@ -162,21 +163,48 @@ const engineIcons: Record<HealEngine, Component> = {
   lama: Brain,
 }
 
+const sharpenIcons: Record<SharpenEngine, Component> = {
+  classic: Sparkles,
+  realesrgan: Brain,
+}
+
 const aiOptions = HEAL_ENGINE_OPTIONS.filter((option) => isAiEngine(option.value))
+const sharpenAiOptions = SHARPEN_ENGINE_OPTIONS.filter((option) => isAiSharpen(option.value))
 
 /** 要用户确认下载 / 删除的模型；null 表示没有打开确认框。 */
-const pendingDownload = ref<AiModelId | null>(null)
-const pendingDelete = ref<AiModelId | null>(null)
+const pendingDownload = ref<ModelId | null>(null)
+const pendingDelete = ref<ModelId | null>(null)
 
-function isAiEngine(value: HealEngine): value is AiModelId {
+function isAiEngine(value: HealEngine): value is HealModelId {
   return value !== 'classic'
+}
+
+function isAiSharpen(value: SharpenEngine): value is SharpenModelId {
+  return value !== 'classic'
+}
+
+function isHealModel(id: ModelId): id is HealModelId {
+  return id === 'migan' || id === 'lama'
 }
 
 function engineLabel(value: HealEngine): string {
   return HEAL_ENGINE_OPTIONS.find((option) => option.value === value)?.label ?? value
 }
 
-function modelStatus(id: AiModelId): ModelStatus | null {
+function sharpenLabel(value: SharpenEngine): string {
+  return SHARPEN_ENGINE_OPTIONS.find((option) => option.value === value)?.label ?? value
+}
+
+function modelLabel(id: ModelId): string {
+  return isHealModel(id) ? engineLabel(id) : sharpenLabel(id)
+}
+
+/** 模型用在哪：修瑕或清晰化；提示文案按它说。 */
+function modelPurpose(id: ModelId): string {
+  return isHealModel(id) ? '修瑕' : '清晰化'
+}
+
+function modelStatus(id: ModelId): ModelStatus | null {
   return props.models?.items.find((item) => item.id === id) ?? null
 }
 
@@ -226,6 +254,16 @@ const healSummary = computed(() => {
     : `${engineLabel(engine)}（模型未就绪，暂用经典算法）`
 })
 
+const sharpenSummary = computed(() => {
+  const engine = props.settings.sharpenEngine
+  if (!isAiSharpen(engine)) {
+    return sharpenLabel(engine)
+  }
+  return modelStatus(engine)?.state === 'ready'
+    ? sharpenLabel(engine)
+    : `${sharpenLabel(engine)}（模型未就绪，暂不能用）`
+})
+
 const modelsDirStatus = computed<ConfigDirStatus | null>(() => {
   if (props.modelsStatus) {
     return props.modelsStatus
@@ -240,7 +278,8 @@ const categoryAlerts = computed<Record<SettingsCategory, boolean>>(() => ({
   thumbnail: false,
   heal:
     modelsDirStatus.value?.tone === 'error' ||
-    (props.models?.items.some((item) => item.state === 'error') ?? false),
+    (props.models?.items.some((item) => isHealModel(item.id) && item.state === 'error') ?? false),
+  sharpen: props.models?.items.some((item) => !isHealModel(item.id) && item.state === 'error') ?? false,
   config: configStatus.value?.tone === 'error',
 }))
 
@@ -250,17 +289,20 @@ const downloadPrompt = computed(() => {
   if (!id || !status) {
     return { title: '', description: '' }
   }
-  const label = engineLabel(id)
+  const label = modelLabel(id)
   const resume = status.modelDownloaded > 0 ? '，会接着上次的进度继续' : ''
   const runtimeReady = status.downloaded - status.modelDownloaded >= status.runtimeSize
   const parts = runtimeReady
     ? `模型 ${formatFileSize(status.modelSize)}；运行库已就绪`
-    : `模型 ${formatFileSize(status.modelSize)}，另需运行库 ${formatFileSize(status.runtimeSize)}，两个 AI 模型共用`
+    : `模型 ${formatFileSize(status.modelSize)}，另需运行库 ${formatFileSize(status.runtimeSize)}，各 AI 模型共用`
+  const meanwhile = isHealModel(id)
+    ? `下载期间修瑕先用经典算法，下完自动改用 ${label}`
+    : `下完就能在清晰化面板里用 ${label}`
   return {
     title: `下载 ${label}？`,
     description:
       `使用 ${label} 需要先下载约 ${formatFileSize(remainingOf(status))}${resume}（${parts}），` +
-      `保存到 ${props.models?.dir ?? '模型目录'}。下载期间修瑕先用经典算法，下完自动改用 ${label}；可随时暂停或删除。`,
+      `保存到 ${props.models?.dir ?? '模型目录'}。${meanwhile}；可随时暂停或删除。`,
   }
 })
 
@@ -270,11 +312,12 @@ const deletePrompt = computed(() => {
   if (!id || !status) {
     return { title: '', description: '' }
   }
-  const label = engineLabel(id)
-  const current = props.settings.healEngine === id ? '当前选用的就是它，删除后修瑕改用经典算法。' : ''
+  const label = modelLabel(id)
+  const inUse = props.settings.healEngine === id || props.settings.sharpenEngine === id
+  const current = inUse ? `当前选用的就是它，删除后${modelPurpose(id)}改用经典方式。` : ''
   return {
     title: `删除 ${label} 模型？`,
-    description: `将删除模型文件 ${formatFileSize(status.modelDownloaded)}（含下了一半的部分；运行库另一个 AI 模型还在用时保留），之后再用需要重新下载。${current}`,
+    description: `将删除模型文件 ${formatFileSize(status.modelDownloaded)}（含下了一半的部分；运行库别的 AI 模型还在用时保留），之后再用需要重新下载。${current}`,
   }
 })
 
@@ -295,13 +338,31 @@ function selectEngine(value: HealEngine): void {
   pendingDownload.value = value
 }
 
+function selectSharpenEngine(value: SharpenEngine): void {
+  if (!isAiSharpen(value)) {
+    emit('update', { sharpenEngine: value })
+    return
+  }
+  if (!props.modelsAvailable) {
+    return
+  }
+  const status = modelStatus(value)
+  if (status && (status.state === 'ready' || isModelBusy(status.state))) {
+    emit('update', { sharpenEngine: value })
+    return
+  }
+  // 模型还没下完：先问是否下载，同意后再切换。
+  pendingDownload.value = value
+}
+
 function confirmDownload(): void {
   const id = pendingDownload.value
   pendingDownload.value = null
-  if (id) {
-    emit('update', { healEngine: id })
-    emit('download-model', id)
+  if (!id) {
+    return
   }
+  emit('update', isHealModel(id) ? { healEngine: id } : { sharpenEngine: id })
+  emit('download-model', id)
 }
 
 function confirmDelete(): void {
@@ -312,6 +373,9 @@ function confirmDelete(): void {
   }
   if (props.settings.healEngine === id) {
     emit('update', { healEngine: 'classic' })
+  }
+  if (props.settings.sharpenEngine === id) {
+    emit('update', { sharpenEngine: 'classic' })
   }
   emit('delete-model', id)
 }
@@ -382,10 +446,10 @@ defineExpose({ focusTitle })
           <span class="settings-pill">仅本机</span>
         </div>
         <p v-if="isFileStorage">
-          按类别调整预览缩略图、局部修瑕的补全方式与 AI 模型，以及配置文件的位置。设置会自动保存到配置文件（默认在程序所在目录），不影响导出的原图。
+          按类别调整预览缩略图、局部修瑕与清晰化的方式和 AI 模型，以及配置文件的位置。设置会自动保存到配置文件（默认在程序所在目录），不影响导出的原图。
         </p>
         <p v-else>
-          按类别调整预览缩略图和局部修瑕的补全方式。设置会自动保存在当前浏览器，不影响导出的原图。
+          按类别调整预览缩略图、局部修瑕与清晰化的方式。设置会自动保存在当前浏览器，不影响导出的原图。
         </p>
       </div>
     </header>
@@ -591,73 +655,17 @@ defineExpose({ focusTitle })
           <p>由本机程序下载，可暂停后接着下；下完按 SHA-256 校验，内容与官方发布一致才会启用。</p>
         </div>
         <div v-if="modelsAvailable" class="model-list">
-          <div v-for="option in aiOptions" :key="option.value" class="model-row">
-            <div class="model-row__info">
-              <span class="model-row__name">{{ option.label }}</span>
-              <span
-                class="model-row__state"
-                :class="{ 'is-error': modelStatus(option.value as AiModelId)?.state === 'error' }"
-              >
-                {{ modelStateText(modelStatus(option.value as AiModelId)) }}
-              </span>
-            </div>
-            <div
-              v-if="(modelStatus(option.value as AiModelId)?.state ?? 'missing') !== 'missing'"
-              class="model-progress"
-              role="progressbar"
-              aria-valuemin="0"
-              aria-valuemax="100"
-              :aria-valuenow="percentOf(modelStatus(option.value as AiModelId))"
-              :aria-label="`${option.label} 下载进度`"
-              :style="{ '--model-progress': `${percentOf(modelStatus(option.value as AiModelId))}%` }"
-            >
-              <span class="model-progress__bar" />
-            </div>
-            <div v-if="modelStatus(option.value as AiModelId)" class="model-row__actions">
-              <template v-for="status in [modelStatus(option.value as AiModelId)!]" :key="status.id">
-                <button
-                  v-if="status.state === 'downloading' || status.state === 'queued'"
-                  class="button button-secondary"
-                  type="button"
-                  :disabled="modelsBusy"
-                  @click="emit('pause-model', status.id)"
-                >
-                  <Pause :size="14" :stroke-width="1.9" />
-                  暂停
-                </button>
-                <button
-                  v-else-if="status.state === 'paused'"
-                  class="button button-secondary"
-                  type="button"
-                  :disabled="modelsBusy"
-                  @click="emit('download-model', status.id)"
-                >
-                  <Play :size="14" :stroke-width="1.9" />
-                  继续下载
-                </button>
-                <button
-                  v-else-if="status.state === 'missing' || status.state === 'error'"
-                  class="button button-secondary"
-                  type="button"
-                  :disabled="modelsBusy"
-                  @click="emit('download-model', status.id)"
-                >
-                  <Download :size="14" :stroke-width="1.9" />
-                  {{ status.state === 'error' ? '重新下载' : '下载' }}
-                </button>
-                <button
-                  v-if="status.modelDownloaded > 0 && status.state !== 'verifying'"
-                  class="button button-secondary"
-                  type="button"
-                  :disabled="modelsBusy"
-                  @click="pendingDelete = status.id"
-                >
-                  <Trash2 :size="14" :stroke-width="1.9" />
-                  删除
-                </button>
-              </template>
-            </div>
-          </div>
+          <ModelRow
+            v-for="option in aiOptions"
+            :key="option.value"
+            :label="option.label"
+            :status="modelStatus(option.value as HealModelId)"
+            :state-text="modelStateText(modelStatus(option.value as HealModelId))"
+            :busy="modelsBusy"
+            @download="emit('download-model', $event)"
+            @pause="emit('pause-model', $event)"
+            @delete="pendingDelete = $event"
+          />
         </div>
         <p v-else class="config-note">
           当前以浏览器页面运行。AI 模型由免安装 EXE 版的本机程序下载和提供，在这里只能使用经典算法。
@@ -726,6 +734,94 @@ defineExpose({ focusTitle })
           </p>
           <p v-else class="config-note">正在读取模型目录…</p>
         </div>
+      </div>
+    </section>
+
+    <section
+      v-show="activeCategory === 'sharpen'"
+      id="settings-panel-sharpen"
+      class="settings-card"
+      role="tabpanel"
+      aria-labelledby="settings-tab-sharpen"
+    >
+      <header class="settings-card__head">
+        <div>
+          <h3 id="sharpen-settings-title">清晰化</h3>
+          <p>在预览标注栏的「清晰化」面板里使用；这里选默认方式、下载 AI 模型。AI 模型下载一次后离线使用，图片不会上传。</p>
+        </div>
+        <span class="settings-summary">{{ sharpenSummary }}</span>
+      </header>
+
+      <div class="setting-block">
+        <div class="setting-label">
+          <h4>清晰化方式</h4>
+          <p>经典锐化加强已有的边缘；AI 按画面内容重建细节。也可以在清晰化面板里随时切换。</p>
+        </div>
+        <div class="settings-choices settings-choices--two" role="group" aria-label="清晰化方式">
+          <button
+            v-for="option in SHARPEN_ENGINE_OPTIONS"
+            :key="option.value"
+            class="settings-choice engine-choice"
+            :class="{ 'is-selected': settings.sharpenEngine === option.value }"
+            type="button"
+            :aria-pressed="settings.sharpenEngine === option.value"
+            :disabled="isAiSharpen(option.value) && !modelsAvailable"
+            @click="selectSharpenEngine(option.value)"
+          >
+            <span class="engine-choice__head">
+              <component :is="sharpenIcons[option.value]" :size="17" :stroke-width="1.8" />
+              <span class="engine-choice__name">{{ option.label }}</span>
+              <span class="engine-choice__tag">{{ option.tag }}</span>
+            </span>
+            <small>{{ option.summary }}</small>
+            <span class="engine-points">
+              <span
+                v-for="point in option.strengths"
+                :key="point"
+                class="engine-point engine-point--strength"
+              >
+                {{ point }}
+              </span>
+              <span
+                v-for="point in option.limits"
+                :key="point"
+                class="engine-point engine-point--limit"
+              >
+                {{ point }}
+              </span>
+            </span>
+            <span
+              v-if="isAiSharpen(option.value)"
+              class="engine-choice__state"
+              :class="{ 'is-ready': modelStatus(option.value)?.state === 'ready' }"
+            >
+              {{ modelStateText(modelStatus(option.value)) }}
+            </span>
+          </button>
+        </div>
+      </div>
+
+      <div class="setting-block setting-block--last">
+        <div class="setting-label">
+          <h4>AI 模型下载</h4>
+          <p>与局部修瑕的模型放在同一个模型目录（在「局部修瑕」里更改），运行库共用一份；下完按 SHA-256 校验。</p>
+        </div>
+        <div v-if="modelsAvailable" class="model-list">
+          <ModelRow
+            v-for="option in sharpenAiOptions"
+            :key="option.value"
+            :label="option.label"
+            :status="modelStatus(option.value as SharpenModelId)"
+            :state-text="modelStateText(modelStatus(option.value as SharpenModelId))"
+            :busy="modelsBusy"
+            @download="emit('download-model', $event)"
+            @pause="emit('pause-model', $event)"
+            @delete="pendingDelete = $event"
+          />
+        </div>
+        <p v-else class="config-note">
+          当前以浏览器页面运行。AI 模型由免安装 EXE 版的本机程序下载和提供，在这里只能使用经典锐化。
+        </p>
       </div>
     </section>
 
@@ -1017,6 +1113,10 @@ defineExpose({ focusTitle })
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.settings-choices--two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .settings-choices--fit {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
@@ -1166,66 +1266,6 @@ defineExpose({ focusTitle })
   min-width: 0;
   flex-direction: column;
   gap: 10px;
-}
-
-.model-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px 14px;
-  padding: 11px 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-subtle);
-}
-
-.model-row__info {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.model-row__name {
-  color: var(--text-strong);
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.model-row__state {
-  color: var(--text-muted);
-  font-size: 11px;
-  overflow-wrap: anywhere;
-}
-
-.model-row__state.is-error {
-  color: var(--danger);
-}
-
-.model-row__actions {
-  display: flex;
-  grid-column: 2;
-  grid-row: 1;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
-}
-
-.model-progress {
-  grid-column: 1 / -1;
-  height: 5px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: var(--border);
-}
-
-.model-progress__bar {
-  display: block;
-  width: var(--model-progress, 0%);
-  height: 100%;
-  border-radius: inherit;
-  background: var(--accent);
-  transition: width 0.3s var(--ease);
 }
 
 .settings-choice--size {
@@ -1449,22 +1489,13 @@ defineExpose({ focusTitle })
   }
 
   .settings-choices--three,
+  .settings-choices--two,
   .settings-choices--fit {
     grid-template-columns: 1fr;
   }
 
   .settings-choice--fit {
     align-items: center;
-  }
-
-  .model-row {
-    grid-template-columns: 1fr;
-  }
-
-  .model-row__actions {
-    grid-column: 1;
-    grid-row: auto;
-    justify-content: flex-start;
   }
 
   .settings-footer {

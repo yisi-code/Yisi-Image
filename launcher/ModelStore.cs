@@ -24,7 +24,7 @@ namespace Yisi.ImageTool
         }
     }
 
-    /// <summary>AI 修瑕要用的一个文件：本地文件名、字节数、SHA-256 和按顺序尝试的下载地址。</summary>
+    /// <summary>AI 模型（修瑕、清晰化）要用的一个文件：本地文件名、字节数、SHA-256 和按顺序尝试的下载地址。</summary>
     internal sealed class ModelFile
     {
         internal readonly string Name;
@@ -110,10 +110,26 @@ namespace Yisi.ImageTool
                 "https://huggingface.co/Carve/LaMa-ONNX/resolve/c3c0c9e468934d62e79c329e35d82dd09ff8c444/lama_fp32.onnx",
             });
 
+        /// <summary>
+        /// Real-ESRGAN General x4v3（SRVGGNetCompact）的 ONNX 导出，用于 AI 清晰化；BSD-3-Clause。
+        /// 输入 float32 [1,3,h,w] RGB 0–1，输出 [1,3,4h,4w]，宽高可变。
+        /// </summary>
+        private static readonly ModelFile RealEsrganFile = new ModelFile(
+            "realesr-general-x4v3.onnx",
+            4866396,
+            "924ebad6532777303582d4ce7811849b88869231a3ae7093e0f21200249df8d5",
+            "application/octet-stream",
+            new string[]
+            {
+                "https://hf-mirror.com/jonathanst29/tinier-upscale-models/resolve/899dc1e4b22bbf1955c2f1739c085edc080cb366/realesr-general-x4v3.onnx",
+                "https://huggingface.co/jonathanst29/tinier-upscale-models/resolve/899dc1e4b22bbf1955c2f1739c085edc080cb366/realesr-general-x4v3.onnx",
+            });
+
         private static readonly ModelEntry[] Entries = new ModelEntry[]
         {
             new ModelEntry("migan", RuntimeFile, MiganFile),
             new ModelEntry("lama", RuntimeFile, LamaFile),
+            new ModelEntry("realesrgan", RuntimeFile, RealEsrganFile),
         };
 
         private static readonly object Sync = new object();
@@ -204,7 +220,7 @@ namespace Yisi.ImageTool
                     item["id"] = entry.Id;
                     item["state"] = state;
                     item["downloaded"] = downloaded;
-                    // 模型文件本身已下的字节；运行库两个模型共用，只有它下好时模型仍算「未下载」。
+                    // 模型文件本身已下的字节；运行库各模型共用，只有它下好时模型仍算「未下载」。
                     item["modelDownloaded"] = modelDownloaded;
                     item["total"] = total;
                     item["modelSize"] = entry.Model.Size;
@@ -263,7 +279,7 @@ namespace Yisi.ImageTool
         }
 
         /// <summary>
-        /// 删除模型文件（含下了一半的）。运行库两个模型共用：另一个模型还有文件时保留。
+        /// 删除模型文件（含下了一半的）。运行库各模型共用：别的模型还有文件时保留。
         /// </summary>
         internal static void Delete(string id)
         {

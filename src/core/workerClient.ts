@@ -26,6 +26,16 @@ export class WorkerClient {
     private readonly failureText: string,
   ) {}
 
+  /** 结束当前 Worker，让所有等待中的请求以 error 失败；下次调用重新创建。 */
+  reset(error: Error): void {
+    this.worker?.terminate()
+    this.worker = null
+    for (const call of this.pending.values()) {
+      call.reject(error)
+    }
+    this.pending.clear()
+  }
+
   call(
     payload: Record<string, unknown>,
     transfer: Transferable[],

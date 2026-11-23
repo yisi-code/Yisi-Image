@@ -1,6 +1,7 @@
 import type { HealJob } from './heal'
+import { callAi } from './aiWorkerClient'
 import { WorkerClient } from './workerClient'
-import type { AiModelId } from './modelApi'
+import type { HealModelId } from './modelApi'
 import type { HealFill } from './types'
 
 export interface HealFillResult {
@@ -23,7 +24,7 @@ export interface HealResult {
  */
 export type HealEngineChoice =
   | { kind: 'classic'; notice?: string }
-  | { kind: 'ai'; model: AiModelId; label: string; modelUrl: string; runtimeUrl: string }
+  | { kind: 'ai'; model: HealModelId; label: string; modelUrl: string; runtimeUrl: string }
 
 /**
  * 修瑕引擎入口：经典算法与 AI 模型各在自己的 Web Worker 里跑，
@@ -34,11 +35,6 @@ export type HealEngineChoice =
 const classicWorker = new WorkerClient(
   () => new Worker(new URL('./inpaint.worker.ts', import.meta.url), { type: 'module' }),
   '修瑕计算失败',
-)
-
-const aiWorker = new WorkerClient(
-  () => new Worker(new URL('./ai.worker.ts', import.meta.url), { type: 'module' }),
-  'AI 修瑕失败',
 )
 
 async function runClassic(job: HealJob, onProgress?: (fraction: number) => void): Promise<HealResult> {
@@ -61,21 +57,22 @@ async function runAi(
   engine: Extract<HealEngineChoice, { kind: 'ai' }>,
   onProgress?: (fraction: number) => void,
 ): Promise<HealResult> {
-  const rgba = new Uint8ClampedArray(job.rgba)
-  const mask = new Uint8Array(job.mask)
-  const message = await aiWorker.call(
-    {
-      model: engine.model,
-      modelUrl: engine.modelUrl,
-      runtimeUrl: engine.runtimeUrl,
-      width: job.width,
-      height: job.height,
-      rgba,
-      mask,
-    },
-    [rgba.buffer, mask.buffer],
-    onProgress,
-  )
+  const message = await callAi(() => {
+    const rgba = new Uint8ClampedArray(job.rgba)
+    const mask = new Uint8Array(job.mask)
+    return {
+      payload: {
+        model: engine.model,
+        modelUrl: engine.modelUrl,
+        runtimeUrl: engine.runtimeUrl,
+        width: job.width,
+        height: job.height,
+        rgba,
+        mask,
+      },
+      transfer: [rgba.buffer, mask.buffer],
+    }
+  }, onProgress)
   if (!(message.rgba instanceof Uint8ClampedArray)) {
     throw new Error('AI 修瑕没有返回结果')
   }

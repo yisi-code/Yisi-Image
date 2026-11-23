@@ -1,12 +1,18 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { CSSProperties } from 'vue'
-import { Loader2, RotateCcw, X } from 'lucide-vue-next'
+import { Loader2, Play, RotateCcw, Square, X } from 'lucide-vue-next'
+import { AI_SHARPEN_LEVELS, formatDuration } from '../core/aiUpscale'
+import type { AiSharpenLevel } from '../core/aiUpscale'
 import { SHARPEN_LIMITS, SHARPEN_PRESETS, isSameSharpen } from '../core/sharpen'
 import type { SharpenSettings } from '../core/sharpen'
+import type { SharpenAiState } from '../core/sharpenEngine'
+import type { SharpenEngine } from '../core/settings'
 
 /**
- * 清晰化面板：预设与强度 / 半径 / 阈值三个滑块，改动即应用到目标图片（由使用方防抖后计算）。
+ * 清晰化面板，两种方式：
+ * - 经典锐化：预设与强度 / 半径 / 阈值滑块，改动即应用（由使用方防抖后计算）；
+ * - AI（Real-ESRGAN）：选等级后点「开始处理」，较慢，显示进度。
  * 拼接时作用于预览里当前选中的那张，单图编辑时作用于正在编辑的那张。
  */
 const props = defineProps<{
@@ -14,9 +20,15 @@ const props = defineProps<{
   targetName: string | null
   /** 不能清晰化的原因（没有选中图片、空白页等）；为空表示可以操作 */
   disabledReason: string
+  engine: SharpenEngine
   settings: SharpenSettings
-  /** 这张图是否已经应用了清晰化 */
-  applied: boolean
+  aiLevel: AiSharpenLevel
+  aiState: SharpenAiState
+  /** 这张图已应用的方式；没处理过为 null */
+  appliedEngine: SharpenEngine | null
+  appliedAiLevel: AiSharpenLevel | null
+  /** 按当前等级估算的 AI 耗时（秒）；没有目标图时为 0 */
+  aiEstimateSeconds: number
   busy: boolean
   /** 0–1 */
   progress: number
@@ -24,6 +36,10 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   change: [settings: SharpenSettings]
+  'update:engine': [engine: SharpenEngine]
+  'update:aiLevel': [level: AiSharpenLevel]
+  'ai-start': []
+  'ai-stop': []
   reset: []
   close: []
 }>()
@@ -36,6 +52,21 @@ const SLIDERS: Array<{ key: SliderKey; label: string; unit: string; title: strin
   { key: 'threshold', label: '阈值', unit: '', title: '小于它的细微起伏不加强，可避免放大噪点' },
 ]
 
+const ENGINES: Array<{ value: SharpenEngine; label: string; title: string }> = [
+  { value: 'classic', label: '经典锐化', title: '加强已有的边缘，几乎立刻完成' },
+  { value: 'realesrgan', label: 'AI', title: 'AI 模型按画面内容重建细节，较慢' },
+]
+
+/** 预计超过这么多秒就提醒换「增强」或经典锐化 */
+const LONG_AI_SECONDS = 90
+
+const isAi = computed(() => props.engine === 'realesrgan')
+const estimateText = computed(() =>
+  props.aiEstimateSeconds > 0 ? `预计${formatDuration(props.aiEstimateSeconds)}` : '',
+)
+const isLongAi = computed(() => props.aiEstimateSeconds > LONG_AI_SECONDS)
+const appliedClassic = computed(() => props.appliedEngine === 'classic')
+
 const activePreset = computed(
   () => SHARPEN_PRESETS.find((preset) => isSameSharpen(preset.settings, props.settings))?.key ?? null,
 )
@@ -44,7 +75,11 @@ const statusText = computed(() => {
   if (props.busy) {
     return `正在处理 ${Math.round(props.progress * 100)}%`
   }
-  return props.applied ? '已应用到这张图' : '还没有清晰化'
+  if (props.appliedEngine === 'realesrgan') {
+    const level = AI_SHARPEN_LEVELS.find((option) => option.value === props.appliedAiLevel)?.label ?? ''
+    return `已应用 AI 清晰化${level ? `（${level}）` : ''}`
+  }
+  return props.appliedEngine === 'classic' ? '已应用经典锐化' : '还没有清晰化'
 })
 
 function sliderStyle(key: SliderKey): CSSProperties {
@@ -91,47 +126,110 @@ function applyPreset(settings: SharpenSettings): void {
     <p v-if="disabledReason" class="sharpen-note">{{ disabledReason }}</p>
 
     <template v-else>
-      <div class="segmented sharpen-presets" role="group" aria-label="清晰化预设">
+      <div class="segmented sharpen-engines" role="group" aria-label="清晰化方式">
         <button
-          v-for="preset in SHARPEN_PRESETS"
-          :key="preset.key"
+          v-for="option in ENGINES"
+          :key="option.value"
           type="button"
           class="segment"
-          :class="{ 'is-active': applied && activePreset === preset.key }"
-          :aria-pressed="applied && activePreset === preset.key"
-          :title="preset.title"
-          @click="applyPreset(preset.settings)"
+          :class="{ 'is-active': engine === option.value }"
+          :aria-pressed="engine === option.value"
+          :disabled="busy"
+          :title="option.title"
+          @click="emit('update:engine', option.value)"
         >
-          {{ preset.label }}
+          {{ option.label }}
         </button>
       </div>
 
-      <div v-for="slider in SLIDERS" :key="slider.key" class="sharpen-row" :title="slider.title">
-        <span class="control-label">{{ slider.label }}</span>
-        <input
-          class="range-slider"
-          type="range"
-          :value="settings[slider.key]"
-          :min="SHARPEN_LIMITS[slider.key].min"
-          :max="SHARPEN_LIMITS[slider.key].max"
-          :step="SHARPEN_LIMITS[slider.key].step"
-          :style="sliderStyle(slider.key)"
-          :aria-label="slider.label"
-          :aria-valuetext="`${formatValue(slider.key)}${slider.unit}`"
-          @input="onSlider($event, slider.key)"
-        />
-        <span class="sharpen-value tnum">{{ formatValue(slider.key) }}{{ slider.unit }}</span>
-      </div>
+      <template v-if="!isAi">
+        <div class="segmented sharpen-presets" role="group" aria-label="清晰化预设">
+          <button
+            v-for="preset in SHARPEN_PRESETS"
+            :key="preset.key"
+            type="button"
+            class="segment"
+            :class="{ 'is-active': appliedClassic && activePreset === preset.key }"
+            :aria-pressed="appliedClassic && activePreset === preset.key"
+            :title="preset.title"
+            @click="applyPreset(preset.settings)"
+          >
+            {{ preset.label }}
+          </button>
+        </div>
+
+        <div v-for="slider in SLIDERS" :key="slider.key" class="sharpen-row" :title="slider.title">
+          <span class="control-label">{{ slider.label }}</span>
+          <input
+            class="range-slider"
+            type="range"
+            :value="settings[slider.key]"
+            :min="SHARPEN_LIMITS[slider.key].min"
+            :max="SHARPEN_LIMITS[slider.key].max"
+            :step="SHARPEN_LIMITS[slider.key].step"
+            :style="sliderStyle(slider.key)"
+            :aria-label="slider.label"
+            :aria-valuetext="`${formatValue(slider.key)}${slider.unit}`"
+            @input="onSlider($event, slider.key)"
+          />
+          <span class="sharpen-value tnum">{{ formatValue(slider.key) }}{{ slider.unit }}</span>
+        </div>
+      </template>
+
+      <template v-else>
+        <div class="sharpen-ai">
+          <span class="control-label">等级</span>
+          <div class="segmented" role="group" aria-label="AI 清晰化等级">
+            <button
+              v-for="level in AI_SHARPEN_LEVELS"
+              :key="level.value"
+              type="button"
+              class="segment"
+              :class="{ 'is-active': aiLevel === level.value }"
+              :aria-pressed="aiLevel === level.value"
+              :disabled="busy"
+              :title="level.title"
+              @click="emit('update:aiLevel', level.value)"
+            >
+              {{ level.label }}
+            </button>
+          </div>
+          <button
+            v-if="busy"
+            class="button button-secondary sharpen-start"
+            type="button"
+            title="停止这次 AI 处理，图片保持原样"
+            @click="emit('ai-stop')"
+          >
+            <Square :size="12" :stroke-width="2.2" />
+            停止
+          </button>
+          <button
+            v-else
+            class="button button-primary sharpen-start"
+            type="button"
+            :disabled="!aiState.ready"
+            @click="emit('ai-start')"
+          >
+            <Play :size="13" :stroke-width="2" />
+            {{ appliedEngine === 'realesrgan' ? '重新处理' : '开始处理' }}
+          </button>
+        </div>
+        <p v-if="!aiState.ready" class="sharpen-warning">{{ aiState.reason }}</p>
+        <p v-else-if="estimateText && !busy" class="sharpen-estimate" :class="{ 'is-long': isLongAi }">
+          {{ estimateText }}<template v-if="isLongAi">；图片较大，可改用「增强」（快约 4 倍）或经典锐化</template>
+        </p>
+      </template>
 
       <footer class="sharpen-footer">
-        <span class="sharpen-status" :class="{ 'is-applied': applied && !busy }" role="status">
+        <span class="sharpen-status" :class="{ 'is-applied': appliedEngine !== null && !busy }" role="status">
           <Loader2 v-if="busy" class="spin" :size="12" :stroke-width="2" />
           {{ statusText }}
         </span>
         <button
           class="button button-secondary sharpen-reset"
           type="button"
-          :disabled="!applied && !busy"
+          :disabled="appliedEngine === null && !busy"
           title="去掉这张图的清晰化，恢复原图"
           @click="emit('reset')"
         >
@@ -140,8 +238,11 @@ function applyPreset(settings: SharpenSettings): void {
         </button>
       </footer>
 
-      <p class="sharpen-note">
+      <p v-if="!isAi" class="sharpen-note">
         能让轻微发软的图更清楚，真正糊掉的细节补不回来；过强会出现白边和噪点。先清晰化再修瑕效果更好，可打开「对比」看前后差别。
+      </p>
+      <p v-else class="sharpen-note">
+        「保真」不缩小直接处理，文字最稳，适合截图；「增强」重建更多，适合模糊照片，但小字会变形。AI 会重画细节，处理完请打开「对比」看前后差别。
       </p>
     </template>
   </section>
@@ -150,7 +251,7 @@ function applyPreset(settings: SharpenSettings): void {
 <style scoped>
 .sharpen-panel {
   display: flex;
-  width: 290px;
+  width: 300px;
   flex-direction: column;
   gap: 11px;
   padding: 12px 14px 13px;
@@ -195,11 +296,17 @@ function applyPreset(settings: SharpenSettings): void {
   flex: 0 0 auto;
 }
 
+.sharpen-engines .segment {
+  height: 28px;
+  flex: 1;
+}
+
 .sharpen-presets {
   align-self: flex-start;
 }
 
-.sharpen-presets .segment {
+.sharpen-presets .segment,
+.sharpen-ai .segment {
   height: 28px;
   padding: 0 14px;
 }
@@ -216,6 +323,35 @@ function applyPreset(settings: SharpenSettings): void {
   font-size: 11.5px;
   font-weight: 650;
   text-align: right;
+}
+
+.sharpen-ai {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.sharpen-start {
+  height: 30px;
+  margin-left: auto;
+  padding: 0 12px;
+  font-size: 11.5px;
+}
+
+.sharpen-estimate {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.sharpen-estimate.is-long {
+  color: var(--warning);
+}
+
+.sharpen-warning {
+  color: var(--warning);
+  font-size: 11px;
+  line-height: 1.6;
 }
 
 .sharpen-footer {

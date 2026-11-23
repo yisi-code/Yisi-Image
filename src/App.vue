@@ -36,6 +36,7 @@ import { getSizeChangePercent } from './core/exportOptions'
 import type { ExportOptions } from './core/exportOptions'
 import { IS_DESKTOP_APP } from './core/appInfo'
 import type { HealEngineChoice } from './core/healEngine'
+import type { SharpenAiState } from './core/sharpenEngine'
 import {
   IMAGE_ACCEPT,
   SUPPORTED_FORMAT_LABEL,
@@ -94,6 +95,24 @@ const healEngineChoice = computed<HealEngineChoice>(() => {
     reason = `模型还在下载（${Math.floor((status.downloaded / status.total) * 100)}%）`
   }
   return { kind: 'classic', notice: `${label} ${reason}，这次用经典算法；可在「设置 · 局部修瑕」里查看下载` }
+})
+
+/** AI 清晰化能不能用：只在 EXE 版、且 Real-ESRGAN 模型下好时可用，否则说明原因。 */
+const sharpenAiState = computed<SharpenAiState>(() => {
+  if (!models.isAvailable) {
+    return { ready: false, reason: 'AI 清晰化只能在免安装 EXE 版里使用，浏览器页面请用经典锐化。' }
+  }
+  const status = models.statusOf('realesrgan')
+  if (status?.state === 'ready') {
+    return { ready: true, files: { modelUrl: status.modelUrl, runtimeUrl: status.runtimeUrl } }
+  }
+  let reason = '模型还没下载'
+  if (!status) {
+    reason = '读不到模型状态'
+  } else if (isModelBusy(status.state) && status.total > 0) {
+    reason = `模型还在下载（${Math.floor((status.downloaded / status.total) * 100)}%）`
+  }
+  return { ready: false, reason: `${reason}，可在「设置 · 清晰化」里下载（约 19 MB）。` }
 })
 
 const direction = ref<StitchDirection>('vertical')
@@ -885,6 +904,8 @@ function onExported(summary: ExportSummary): void {
           :thumbnail-panel="settings.thumbnailPanel"
           :background="exportBackground"
           :single-image="!isStitchMode"
+          :sharpen-engine="settings.sharpenEngine"
+          :sharpen-ai="sharpenAiState"
           :heal-engine="healEngineChoice"
           @pick="openFilePicker"
           @add="handleAdd"
@@ -895,6 +916,7 @@ function onExported(summary: ExportSummary): void {
           @heal-notice="onHealNotice"
           @busy-change="isPreviewBusy = $event"
           @sharpen-failed="onSharpenFailed"
+          @update-sharpen-engine="updateSettings({ sharpenEngine: $event })"
         />
 
         <StitchControls

@@ -9,7 +9,7 @@ import {
   pauseModel,
   pickModelsDir,
 } from '../core/modelApi'
-import type { AiModelId, ModelStatus, ModelsSnapshot } from '../core/modelApi'
+import type { ModelId, ModelStatus, ModelsSnapshot } from '../core/modelApi'
 import type { ConfigDirStatus } from './useSettings'
 
 /** 下载进行中时轮询进度的间隔。 */
@@ -59,7 +59,7 @@ export function useModels(enabled: boolean) {
     }
   }
 
-  function statusOf(id: AiModelId): ModelStatus | null {
+  function statusOf(id: ModelId): ModelStatus | null {
     return snapshot.value?.items.find((item) => item.id === id) ?? null
   }
 
@@ -79,21 +79,21 @@ export function useModels(enabled: boolean) {
     }
   }
 
-  function download(id: AiModelId): Promise<void> {
+  function download(id: ModelId): Promise<void> {
     return run('', async () => {
       apply(await downloadModel(id))
       return null
     })
   }
 
-  function pause(id: AiModelId): Promise<void> {
+  function pause(id: ModelId): Promise<void> {
     return run('', async () => {
       apply(await pauseModel(id))
       return null
     })
   }
 
-  function remove(id: AiModelId): Promise<void> {
+  function remove(id: ModelId): Promise<void> {
     return run('正在删除…', async () => {
       apply(await deleteModel(id))
       return { tone: 'success', text: '模型已删除' }

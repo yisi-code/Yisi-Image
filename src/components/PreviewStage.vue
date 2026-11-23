@@ -27,9 +27,13 @@ import {
 import FloatingToolbar from './FloatingToolbar.vue'
 import SharpenPanel from './SharpenPanel.vue'
 import { releaseCanvas } from '../core/exportJob'
+import { DEFAULT_AI_SHARPEN_LEVEL } from '../core/aiUpscale'
+import type { AiSharpenLevel } from '../core/aiUpscale'
 import { DEFAULT_SHARPEN, isSharpenNoop } from '../core/sharpen'
 import type { SharpenSettings } from '../core/sharpen'
-import { sharpenImage } from '../core/sharpenEngine'
+import { AiCanceledError, cancelAiJobs } from '../core/aiWorkerClient'
+import { aiSharpenImage, estimateAiSharpenSeconds, sharpenImage } from '../core/sharpenEngine'
+import type { SharpenAiState } from '../core/sharpenEngine'
 import { useFileDrop } from '../composables/useFileDrop'
 import {
   cloneAnnotations,
@@ -60,6 +64,7 @@ import type {
   ThumbnailSize,
   PanelKey,
   PanelState,
+  SharpenEngine,
   StitchBackground,
 } from '../core/settings'
 import { vTooltip } from '../directives/tooltip'
@@ -71,6 +76,7 @@ import type {
   StitchImage,
   StitchLayout,
   HealFill,
+  ImageEnhance,
   StrokeAnnotation,
   TextAnnotation,
 } from '../core/types'
@@ -91,6 +97,10 @@ const props = defineProps<{
   background: StitchBackground
   /** 单图编辑：只放当前这一张，不显示缩略图条，文案按单图说 */
   singleImage?: boolean
+  /** 清晰化面板默认用的方式（随设置保存） */
+  sharpenEngine: SharpenEngine
+  /** AI 清晰化能不能用（由 App 按模型下载状态算出） */
+  sharpenAi: SharpenAiState
   /** 这次修瑕用经典算法还是 AI 模型（由 App 按设置与模型下载状态算出） */
   healEngine: HealEngineChoice
 }>()
@@ -107,6 +117,7 @@ const emit = defineEmits<{
   /** 修瑕计算开始 / 结束；单图模式据此暂时禁止切换图片，免得结果写不回去 */
   'busy-change': [busy: boolean]
   'sharpen-failed': [message: string]
+  'update-sharpen-engine': [engine: SharpenEngine]
 }>()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
@@ -143,6 +154,9 @@ const healProgress = ref(0)
 /** 清晰化面板是否打开、面板里显示的参数、正在计算的张数与进度 */
 const isSharpenOpen = ref(false)
 const sharpenDraft = ref<SharpenSettings>({ ...DEFAULT_SHARPEN })
+const aiSharpenLevel = ref<AiSharpenLevel>(DEFAULT_AI_SHARPEN_LEVEL)
+/** 每跑完一次 AI 清晰化就 +1，让预计耗时按新测的速度重算 */
+const aiSpeedVersion = ref(0)
 const sharpenRunning = ref(0)
 const sharpenProgress = ref(0)
 /** 前后对比：打开后画布上出现中线，左边画原图 */
@@ -279,6 +293,11 @@ const sharpenDisabledReason = computed(() => {
   return ''
 })
 const comparePercent = computed(() => Math.round(compareSplit.value * 100))
+const aiEstimateSeconds = computed(() => {
+  void aiSpeedVersion.value
+  const target = sharpenTarget.value
+  return target?.element ? estimateAiSharpenSeconds(target.width, target.height, aiSharpenLevel.value) : 0
+})
 const activeItem = computed(
   () => props.layout.items.find((item) => item.id === activeImageId.value) ?? null,
 )
@@ -1389,7 +1408,9 @@ function handleResize(): void {
 }
 
 function syncSharpenDraft(): void {
-  sharpenDraft.value = { ...(sharpenTarget.value?.enhance?.sharpen ?? DEFAULT_SHARPEN) }
+  const enhance = sharpenTarget.value?.enhance
+  sharpenDraft.value = { ...(enhance?.sharpen ?? DEFAULT_SHARPEN) }
+  aiSharpenLevel.value = enhance?.aiLevel ?? aiSharpenLevel.value
 }
 
 function toggleSharpenPanel(): void {
@@ -1406,21 +1427,21 @@ function clearEnhance(image: StitchImage): void {
   }
 }
 
-async function runSharpen(image: StitchImage, settings: SharpenSettings): Promise<void> {
+/**
+ * 算出清晰化结果并挂到图片上（经典与 AI 共用）：每张图只认最新一次请求，旧结果到了直接丢掉；
+ * 结果画布替换旧的并释放旧画布，然后重画预览。
+ */
+async function applyEnhance(
+  image: StitchImage,
+  meta: Omit<ImageEnhance, 'canvas'>,
+  compute: (report: (fraction: number) => void) => Promise<HTMLCanvasElement>,
+): Promise<void> {
   const token = (sharpenTokens.get(image.id) ?? 0) + 1
   sharpenTokens.set(image.id, token)
-  if (!image.element) {
-    return
-  }
-  if (isSharpenNoop(settings)) {
-    clearEnhance(image)
-    scheduleRender()
-    return
-  }
   sharpenRunning.value += 1
   sharpenProgress.value = 0
   try {
-    const canvas = await sharpenImage(image.element, image.width, image.height, settings, (fraction) => {
+    const canvas = await compute((fraction) => {
       if (sharpenTokens.get(image.id) === token) {
         sharpenProgress.value = fraction
       }
@@ -1430,23 +1451,72 @@ async function runSharpen(image: StitchImage, settings: SharpenSettings): Promis
       return
     }
     const previous = image.enhance?.canvas
-    image.enhance = { sharpen: { ...settings }, canvas: markRaw(canvas) }
+    image.enhance = { ...meta, canvas: markRaw(canvas) }
     releaseCanvas(previous)
     scheduleRender()
   } catch (error) {
+    // 用户点了「停止」：图片保持原样，不当作失败提示。
+    if (error instanceof AiCanceledError) {
+      return
+    }
     console.error('清晰化失败', error)
     if (sharpenTokens.get(image.id) === token) {
       emit('sharpen-failed', error instanceof Error && error.message ? error.message : '清晰化计算失败')
     }
   } finally {
     sharpenRunning.value -= 1
+    aiSpeedVersion.value += 1
   }
+}
+
+async function runSharpen(image: StitchImage, settings: SharpenSettings): Promise<void> {
+  const element = image.element
+  if (!element) {
+    return
+  }
+  if (isSharpenNoop(settings)) {
+    sharpenTokens.set(image.id, (sharpenTokens.get(image.id) ?? 0) + 1)
+    clearEnhance(image)
+    scheduleRender()
+    return
+  }
+  await applyEnhance(image, { engine: 'classic', sharpen: { ...settings } }, (report) =>
+    sharpenImage(element, image.width, image.height, settings, report),
+  )
+}
+
+function startAiSharpen(): void {
+  const target = sharpenTarget.value
+  const state = props.sharpenAi
+  const element = target?.element
+  if (!target || !element || !state.ready || sharpenDisabledReason.value) {
+    return
+  }
+  window.clearTimeout(sharpenTimer)
+  const level = aiSharpenLevel.value
+  void applyEnhance(
+    target,
+    { engine: 'realesrgan', sharpen: { ...sharpenDraft.value }, aiLevel: level },
+    (report) => aiSharpenImage(element, target.width, target.height, level, state.files, report),
+  )
+}
+
+function stopAiSharpen(): void {
+  const target = sharpenTarget.value
+  if (target) {
+    sharpenTokens.set(target.id, (sharpenTokens.get(target.id) ?? 0) + 1)
+  }
+  cancelAiJobs()
 }
 
 function onSharpenChange(settings: SharpenSettings): void {
   const target = sharpenTarget.value
   if (!target || sharpenDisabledReason.value) {
     return
+  }
+  // 拖经典滑块就是要用经典锐化，顺手把方式切回经典。
+  if (props.sharpenEngine !== 'classic') {
+    emit('update-sharpen-engine', 'classic')
   }
   sharpenDraft.value = settings
   window.clearTimeout(sharpenTimer)
@@ -1845,11 +1915,20 @@ defineExpose({ focusImage })
         class="sharpen-popover"
         :target-name="sharpenTarget?.name ?? null"
         :disabled-reason="sharpenDisabledReason"
+        :engine="sharpenEngine"
         :settings="sharpenDraft"
-        :applied="Boolean(sharpenTarget?.enhance)"
+        :ai-level="aiSharpenLevel"
+        :ai-state="sharpenAi"
+        :applied-engine="sharpenTarget?.enhance?.engine ?? null"
+        :applied-ai-level="sharpenTarget?.enhance?.aiLevel ?? null"
+        :ai-estimate-seconds="aiEstimateSeconds"
         :busy="sharpenRunning > 0"
         :progress="sharpenProgress"
         @change="onSharpenChange"
+        @update:engine="emit('update-sharpen-engine', $event)"
+        @update:ai-level="aiSharpenLevel = $event"
+        @ai-start="startAiSharpen"
+        @ai-stop="stopAiSharpen"
         @reset="resetSharpen"
         @close="isSharpenOpen = false"
       />

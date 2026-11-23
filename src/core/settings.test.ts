@@ -23,6 +23,7 @@ const CUSTOM_SETTINGS: ToolSettings = {
   blankPanel: { collapsed: true, position: null },
   thumbnailPanel: { collapsed: true, position: null },
   healEngine: 'migan',
+  sharpenEngine: 'realesrgan',
   workMode: 'single',
   exportOptions: {
     format: 'webp',
@@ -73,6 +74,7 @@ describe('normalizeSettings', () => {
         blankPanel: { collapsed: 1 },
         thumbnailPanel: null,
         healEngine: 'gpt',
+        sharpenEngine: 'waifu2x',
         workMode: 'batch',
         exportOptions: { format: 'tiff', quality: 'high', compressBy: 'size', resize: 'fit' },
       }),

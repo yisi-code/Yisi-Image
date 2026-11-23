@@ -1,5 +1,5 @@
 /**
- * EXE 启动器的 AI 修瑕模型接口：查看状态、下载 / 暂停 / 删除、选择与移动模型目录。
+ * EXE 启动器的 AI 模型（修瑕、清晰化）接口：查看状态、下载 / 暂停 / 删除、选择与移动模型目录。
  * 下载在启动器里进行（断点续传、SHA-256 校验），页面只发指令、轮询进度；
  * 下载好的文件由启动器在 /models/文件名 下提供给页面。
  */
@@ -7,9 +7,14 @@
 import { ConfigApiError, launcherRequest } from './configApi'
 import type { LauncherResponse } from './configApi'
 
-export type AiModelId = 'migan' | 'lama'
+/** 修瑕用的 AI 模型 */
+export type HealModelId = 'migan' | 'lama'
+/** 清晰化用的 AI 模型 */
+export type SharpenModelId = 'realesrgan'
+/** 启动器能下载的全部模型 */
+export type ModelId = HealModelId | SharpenModelId
 
-export const AI_MODEL_IDS: readonly AiModelId[] = ['migan', 'lama']
+export const MODEL_IDS: readonly ModelId[] = ['migan', 'lama', 'realesrgan']
 
 /**
  * missing：没有下载过；queued：排队等前一个下完；downloading / verifying：下载中 / 校验中；
@@ -25,7 +30,7 @@ export type ModelState =
   | 'error'
 
 export interface ModelStatus {
-  id: AiModelId
+  id: ModelId
   state: ModelState
   /** 已下载字节数（运行库 + 模型，含下了一半的部分） */
   downloaded: number
@@ -34,7 +39,7 @@ export interface ModelStatus {
   /** 模型文件本身已下载的字节数（不含共用的运行库）；为 0 时没有可删除的模型文件 */
   modelDownloaded: number
   modelSize: number
-  /** wasm 运行库的大小；两个模型共用一份 */
+  /** wasm 运行库的大小；各模型共用一份 */
   runtimeSize: number
   error: string
   runtimeUrl: string
@@ -75,7 +80,7 @@ interface ModelsResponse extends LauncherResponse {
 function toStatus(value: unknown): ModelStatus | null {
   const item = (value ?? {}) as Record<string, unknown>
   if (
-    !AI_MODEL_IDS.includes(item.id as AiModelId) ||
+    !MODEL_IDS.includes(item.id as ModelId) ||
     !MODEL_STATES.includes(item.state as ModelState) ||
     typeof item.downloaded !== 'number' ||
     typeof item.total !== 'number' ||
@@ -85,7 +90,7 @@ function toStatus(value: unknown): ModelStatus | null {
     return null
   }
   return {
-    id: item.id as AiModelId,
+    id: item.id as ModelId,
     state: item.state as ModelState,
     downloaded: item.downloaded,
     total: item.total,
@@ -124,17 +129,17 @@ export async function fetchModels(): Promise<ModelsSnapshot> {
 }
 
 /** 开始或继续下载（已在下载或排队时不重复）。 */
-export async function downloadModel(id: AiModelId): Promise<ModelsSnapshot> {
+export async function downloadModel(id: ModelId): Promise<ModelsSnapshot> {
   return toSnapshot(await post('/api/models/download', { id }))
 }
 
 /** 暂停：已下载的部分保留，之后可继续。 */
-export async function pauseModel(id: AiModelId): Promise<ModelsSnapshot> {
+export async function pauseModel(id: ModelId): Promise<ModelsSnapshot> {
   return toSnapshot(await post('/api/models/pause', { id }))
 }
 
 /** 删除模型文件（含下了一半的）；运行库还有另一个模型在用时保留。 */
-export async function deleteModel(id: AiModelId): Promise<ModelsSnapshot> {
+export async function deleteModel(id: ModelId): Promise<ModelsSnapshot> {
   return toSnapshot(await post('/api/models/delete', { id }))
 }
 
