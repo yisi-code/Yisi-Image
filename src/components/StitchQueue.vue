@@ -14,13 +14,24 @@ import { useFileDrop } from '../composables/useFileDrop'
 import { SUPPORTED_FORMAT_LABEL, formatDimensions, formatFileSize } from '../core/image'
 import type { ImportProgress, StitchImage } from '../core/types'
 
-const props = defineProps<{
-  images: StitchImage[]
-  isImporting: boolean
-  progress: ImportProgress
-  clearedCount: number
-  activeId?: string | null
-}>()
+const props = withDefaults(
+  defineProps<{
+    images: StitchImage[]
+    isImporting: boolean
+    progress: ImportProgress
+    clearedCount: number
+    activeId?: string | null
+    /** stitch：拼接队列，可排序、可插空白页；single：单图编辑的图片列表，点卡片切换编辑 */
+    mode?: 'stitch' | 'single'
+    /** 单图模式下正在修瑕等计算，暂时不能切换图片 */
+    selectLocked?: boolean
+  }>(),
+  {
+    activeId: null,
+    mode: 'stitch',
+    selectLocked: false,
+  },
+)
 
 const emit = defineEmits<{
   pick: []
@@ -38,6 +49,9 @@ const dropTarget = ref<{ index: number; position: 'before' | 'after' } | null>(n
 
 const { isFileDragging, dropHandlers } = useFileDrop((files) => emit('add', files))
 
+const isStitch = computed(() => props.mode === 'stitch')
+const canReorder = computed(() => isStitch.value && !props.isImporting && props.images.length > 1)
+
 const progressLabel = computed(
   () => `正在读取 ${props.progress.done}/${props.progress.total}`,
 )
@@ -48,8 +62,15 @@ function openFilePicker(): void {
   }
 }
 
+function cardLabel(image: StitchImage, index: number): string {
+  const base = `第 ${index + 1} 张，${image.name}，${formatDimensions(image.width, image.height)} 像素。`
+  return isStitch.value
+    ? `${base}点击定位并放大到预览，按 Alt 加上下方向键调整顺序`
+    : `${base}点击切换到这张编辑`
+}
+
 function onDragStart(event: DragEvent, index: number): void {
-  if (props.isImporting || props.images.length < 2) {
+  if (!canReorder.value) {
     event.preventDefault()
     return
   }
@@ -149,7 +170,7 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
     return
   }
 
-  if (!event.altKey) {
+  if (!event.altKey || !isStitch.value) {
     return
   }
 
@@ -168,13 +189,13 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
 <template>
   <aside
     class="queue-panel"
-    :class="{ 'is-file-dragging': isFileDragging }"
-    aria-label="图片拼接队列"
+    :class="{ 'is-file-dragging': isFileDragging, 'queue-panel--single': !isStitch }"
+    :aria-label="isStitch ? '图片拼接队列' : '单图编辑图片列表'"
     v-on="dropHandlers"
   >
     <header class="queue-header">
       <div class="queue-heading">
-        <h2>拼接队列</h2>
+        <h2>{{ isStitch ? '拼接队列' : '图片列表' }}</h2>
         <span class="queue-count">{{ images.length }} 张</span>
       </div>
       <button
@@ -182,7 +203,7 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
         class="queue-clear"
         type="button"
         :disabled="isImporting"
-        :title="isImporting ? '读取图片时不能清空' : '清空队列'"
+        :title="isImporting ? '读取图片时不能清空' : isStitch ? '清空队列' : '清空列表'"
         @click="emit('clear')"
       >
         清空
@@ -216,15 +237,23 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
           class="queue-card"
           :class="{
             'is-active': image.id === activeId,
+            'is-locked': !isStitch && selectLocked && image.id !== activeId,
             'is-dragging': draggingIndex === index,
             'drop-before': dropTarget?.index === index && dropTarget.position === 'before',
             'drop-after': dropTarget?.index === index && dropTarget.position === 'after',
           }"
-          :draggable="!isImporting && images.length > 1"
+          :draggable="canReorder"
           tabindex="0"
-          :aria-label="`第 ${index + 1} 张，${image.name}，${formatDimensions(image.width, image.height)} 像素。点击定位并放大到预览，按 Alt 加上下方向键调整顺序`"
-          aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
-          title="点击定位并放大到预览中的这张图片"
+          :aria-label="cardLabel(image, index)"
+          :aria-current="!isStitch && image.id === activeId ? 'true' : undefined"
+          :aria-keyshortcuts="isStitch ? 'Alt+ArrowUp Alt+ArrowDown' : undefined"
+          :title="
+            isStitch
+              ? '点击定位并放大到预览中的这张图片'
+              : selectLocked && image.id !== activeId
+                ? '正在处理当前图片，完成后再切换'
+                : '点击切换到这张编辑'
+          "
           @click="onCardClick($event, index)"
           @dragstart="onDragStart($event, index)"
           @dragend="resetDrag"
@@ -233,7 +262,7 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
           @drop="onDrop($event, index)"
           @keydown="onCardKeydown($event, index)"
         >
-          <span class="drag-handle" aria-hidden="true">
+          <span v-if="isStitch" class="drag-handle" aria-hidden="true">
             <GripVertical :size="14" :stroke-width="1.8" />
           </span>
 
@@ -295,6 +324,7 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
           <span v-if="!isImporting" class="queue-add-hint">拖入也可</span>
         </button>
         <button
+          v-if="isStitch"
           class="queue-blank-button"
           type="button"
           :disabled="isImporting"
@@ -306,7 +336,10 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
         </button>
       </div>
 
-      <p v-if="images.length > 1" class="queue-tip">
+      <p v-if="!isStitch && images.length > 0" class="queue-tip">
+        点击图片切换编辑；导出时可转格式、压缩，或一次导出全部
+      </p>
+      <p v-else-if="images.length > 1" class="queue-tip">
         拖动卡片调整顺序，或选中后按 <kbd>Alt</kbd> + <kbd>↑</kbd> / <kbd>↓</kbd>
       </p>
       <p v-else class="queue-tip">支持 {{ SUPPORTED_FORMAT_LABEL }}</p>
@@ -502,6 +535,16 @@ function onCardKeydown(event: KeyboardEvent, index: number): void {
 .queue-card.is-active {
   border-color: var(--accent-line-strong);
   background: var(--surface-accent);
+}
+
+/* 单图列表没有拖动手柄，左边距与右边对称。 */
+.queue-panel--single .queue-card {
+  padding-left: 8px;
+}
+
+.queue-card.is-locked {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .queue-card:focus-visible {

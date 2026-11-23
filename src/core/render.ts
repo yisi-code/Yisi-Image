@@ -2,8 +2,8 @@ import { drawAnnotations } from './annotations'
 import type { DrawAnnotationsOptions } from './annotations'
 import { getPreviewFit } from './preview'
 import type { PreviewOffset } from './preview'
-import { DEFAULT_BACKGROUND, TRANSPARENT_BACKGROUND } from './settings'
-import type { StitchBackground } from './settings'
+import { DEFAULT_BACKGROUND, TRANSPARENT_BACKGROUND } from './background'
+import type { StitchBackground } from './background'
 import type { StitchImage, StitchLayout } from './types'
 
 export interface RenderOptions {
@@ -25,13 +25,13 @@ export interface ViewportRenderOptions {
   hiddenAnnotationId?: string | null
 }
 
-/** 透明背景在预览里的棋盘格，格子按屏幕像素算，缩放时大小不变。 */
+/** 透明背景在预览里的棋盘格，格子按屏幕像素算，缩放时大小不变；导出对比预览也用它。 */
 const CHECKER_CELL = 8
 const CHECKER_LIGHT = '#ffffff'
 const CHECKER_DARK = '#e3e8e6'
 let checkerTile: HTMLCanvasElement | null = null
 
-function getCheckerPattern(context: CanvasRenderingContext2D): CanvasPattern | string {
+export function getCheckerPattern(context: CanvasRenderingContext2D): CanvasPattern | string {
   if (!checkerTile) {
     const tile = document.createElement('canvas')
     tile.width = CHECKER_CELL * 2

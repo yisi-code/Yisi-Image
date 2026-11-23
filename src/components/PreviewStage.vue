@@ -82,6 +82,8 @@ const props = defineProps<{
   thumbnailPanel: PanelState
   /** 拼接背景；透明时预览画棋盘格 */
   background: StitchBackground
+  /** 单图编辑：只放当前这一张，不显示缩略图条，文案按单图说 */
+  singleImage?: boolean
   /** 这次修瑕用经典算法还是 AI 模型（由 App 按设置与模型下载状态算出） */
   healEngine: HealEngineChoice
 }>()
@@ -95,6 +97,8 @@ const emit = defineEmits<{
   'heal-failed': [message: string]
   /** 修瑕成功但需要告诉用户的说明，例如 AI 模型不可用、这次改用了经典算法 */
   'heal-notice': [message: string]
+  /** 修瑕计算开始 / 结束；单图模式据此暂时禁止切换图片，免得结果写不回去 */
+  'busy-change': [busy: boolean]
 }>()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
@@ -228,9 +232,10 @@ const thumbStyle = computed<Record<string, string>>(() => {
   }
 })
 
-const previewLabel = computed(
-  () =>
-    `拼接效果预览，共 ${props.images.length} 张图片，输出尺寸 ${formatDimensions(props.layout.width, props.layout.height)} 像素`,
+const previewLabel = computed(() =>
+  props.singleImage
+    ? `单图编辑预览：${props.images[0]?.name ?? ''}，${formatDimensions(props.layout.width, props.layout.height)} 像素`
+    : `拼接效果预览，共 ${props.images.length} 张图片，输出尺寸 ${formatDimensions(props.layout.width, props.layout.height)} 像素`,
 )
 
 const activeImage = computed(
@@ -1435,6 +1440,8 @@ watch(
   { flush: 'post' },
 )
 
+watch(isHealing, (busy) => emit('busy-change', busy))
+
 // 收起标注栏后看不到当前工具，回到「选择」，避免点一下画布就画上一笔。
 watch(
   () => props.annotationToolbar.collapsed,
@@ -1513,7 +1520,7 @@ defineExpose({ focusImage })
     v-on="dropHandlers"
   >
     <aside
-      v-if="images.length > 0 && !thumbnailPanel.collapsed"
+      v-if="images.length > 0 && !thumbnailPanel.collapsed && !singleImage"
       class="thumb-panel"
       aria-label="图片缩略图"
     >
@@ -1813,8 +1820,14 @@ defineExpose({ focusImage })
             </span>
           </div>
 
-          <h2>添加图片，开始拼接</h2>
-          <p>把多张图片放进队列，纵向或横向拼成一张。可以拖动调整顺序，间距也能随时修改。</p>
+          <template v-if="singleImage">
+            <h2>添加图片，逐张编辑</h2>
+            <p>可以一次放进多张，逐张标注、修瑕；导出时能转换格式、压缩，也能按同样设置一次导出全部。</p>
+          </template>
+          <template v-else>
+            <h2>添加图片，开始拼接</h2>
+            <p>把多张图片放进队列，纵向或横向拼成一张。可以拖动调整顺序，间距也能随时修改。</p>
+          </template>
 
           <button class="button button-primary empty-action" type="button" @click="emit('pick')">
             <ImagePlus :size="16" :stroke-width="1.9" />

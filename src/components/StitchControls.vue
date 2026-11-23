@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue'
 import type { CSSProperties } from 'vue'
 import { AlertTriangle, Columns3, Rows3 } from 'lucide-vue-next'
 import { getExportFormat, isTransparencyDropped } from '../core/exportFormats'
-import type { ExportFormat, ExportFormatOption } from '../core/exportFormats'
+import type { ExportFormat } from '../core/exportFormats'
 import { MAX_GAP, MIN_GAP, clampGap } from '../core/layout'
 import { TRANSPARENT_BACKGROUND, normalizeBackground } from '../core/settings'
 import type { StitchBackground } from '../core/settings'
@@ -30,8 +30,8 @@ const props = withDefaults(
     direction: StitchDirection
     gap: number
     background: StitchBackground
+    /** 导出对话框里选的格式，只用来提示 JPG 不支持透明 */
     format: ExportFormat
-    formats: readonly ExportFormatOption[]
     disabled?: boolean
   }>(),
   {
@@ -43,7 +43,6 @@ const emit = defineEmits<{
   'update:direction': [value: StitchDirection]
   'update:gap': [value: number]
   'update:background': [value: StitchBackground]
-  'update:format': [value: ExportFormat]
 }>()
 
 const gapPercent = computed(
@@ -90,12 +89,6 @@ const backgroundHint = computed(() => {
 function setDirection(value: StitchDirection): void {
   if (value !== props.direction) {
     emit('update:direction', value)
-  }
-}
-
-function setFormat(value: ExportFormat): void {
-  if (!props.disabled && value !== props.format) {
-    emit('update:format', value)
   }
 }
 
@@ -181,7 +174,7 @@ function onRangeInput(event: Event): void {
     <div class="control-group gap-group">
       <div class="gap-heading">
         <label class="control-label" for="stitch-gap">间距</label>
-        <span class="gap-number">
+        <span class="number-field">
           <input
             type="number"
             :value="gap"
@@ -198,7 +191,7 @@ function onRangeInput(event: Event): void {
       </div>
       <input
         id="stitch-gap"
-        class="gap-slider"
+        class="range-slider"
         type="range"
         :value="gap"
         :min="MIN_GAP"
@@ -265,25 +258,6 @@ function onRangeInput(event: Event): void {
       </div>
     </div>
 
-    <div class="control-group format-group">
-      <span class="control-label">导出格式</span>
-      <div class="segmented" role="group" aria-label="导出格式">
-        <button
-          v-for="option in formats"
-          :key="option.value"
-          type="button"
-          class="segment"
-          :class="{ 'is-active': format === option.value }"
-          :aria-pressed="format === option.value"
-          :disabled="disabled"
-          :title="`导出为 ${option.longLabel}`"
-          @click="setFormat(option.value)"
-        >
-          {{ option.label }}
-        </button>
-      </div>
-    </div>
-
     <span class="control-hint" :class="{ 'is-warning': transparencyDropped }">
       {{ backgroundHint }}
     </span>
@@ -309,21 +283,6 @@ function onRangeInput(event: Event): void {
   gap: 6px;
 }
 
-.control-label {
-  color: var(--text-faint);
-  font-size: 10.5px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  line-height: 1.2;
-}
-
-.control-divider {
-  width: 1px;
-  height: 36px;
-  flex: 0 0 1px;
-  background: var(--border-subtle);
-}
-
 .gap-group {
   min-width: 200px;
   max-width: 520px;
@@ -337,109 +296,7 @@ function onRangeInput(event: Event): void {
   gap: 12px;
 }
 
-.gap-number {
-  display: inline-flex;
-  height: 24px;
-  align-items: center;
-  gap: 4px;
-  color: var(--text-faint);
-  font-size: 10px;
-}
-
-.gap-number input {
-  width: 46px;
-  height: 24px;
-  padding: 0 5px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--surface);
-  color: var(--text);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  font-weight: 600;
-  line-height: 1;
-  text-align: right;
-  -moz-appearance: textfield;
-}
-
-.gap-number input::-webkit-inner-spin-button,
-.gap-number input::-webkit-outer-spin-button {
-  margin: 0;
-  -webkit-appearance: none;
-}
-
-.gap-number input:hover {
-  border-color: var(--border-strong);
-}
-
-.gap-slider {
-  width: 100%;
-  height: 18px;
-  margin: 1px 0 0;
-  padding: 0;
-  appearance: none;
-  background: transparent;
-  cursor: pointer;
-}
-
-.gap-slider::-webkit-slider-runnable-track {
-  width: 100%;
-  height: 4px;
-  border-radius: 999px;
-  background: linear-gradient(
-    to right,
-    var(--accent) 0 var(--range-progress),
-    var(--surface-inset) var(--range-progress) 100%
-  );
-}
-
-.gap-slider::-webkit-slider-thumb {
-  width: 16px;
-  height: 16px;
-  margin-top: -6px;
-  border: 2px solid var(--accent);
-  border-radius: 50%;
-  appearance: none;
-  background: var(--surface);
-  box-shadow: 0 1px 3px rgba(19, 32, 28, 0.18);
-  transition: box-shadow 0.15s var(--ease);
-}
-
-.gap-slider:hover::-webkit-slider-thumb {
-  box-shadow: 0 0 0 4px var(--accent-soft);
-}
-
-.gap-slider:focus-visible {
-  outline: none;
-}
-
-.gap-slider:focus-visible::-webkit-slider-thumb {
-  box-shadow: 0 0 0 4px var(--accent-soft-strong);
-}
-
-.gap-slider::-moz-range-track {
-  height: 4px;
-  border-radius: 999px;
-  background: var(--surface-inset);
-}
-
-.gap-slider::-moz-range-progress {
-  height: 4px;
-  border-radius: 999px;
-  background: var(--accent);
-}
-
-.gap-slider::-moz-range-thumb {
-  width: 12px;
-  height: 12px;
-  border: 2px solid var(--accent);
-  border-radius: 50%;
-  background: var(--surface);
-  box-shadow: 0 1px 3px rgba(19, 32, 28, 0.18);
-}
-
 .direction-group,
-.format-group,
 .background-group {
   flex: 0 0 auto;
 }
@@ -507,11 +364,6 @@ function onRangeInput(event: Event): void {
   cursor: not-allowed;
 }
 
-.format-group .segment {
-  min-width: 40px;
-  padding: 0 8px;
-}
-
 .control-hint {
   margin-left: auto;
   color: var(--text-faint);
@@ -523,8 +375,8 @@ function onRangeInput(event: Event): void {
   color: var(--warning);
 }
 
-/* 加了背景一组后，一行放下提示要约 1440 宽；更窄时只靠透明按钮上的警示图标和导出结果提示。 */
-@media (max-width: 1440px) {
+/* 一行放下提示要约 1240 宽；更窄时只靠透明按钮上的警示图标和导出对话框里的提示。 */
+@media (max-width: 1240px) {
   .control-hint {
     display: none;
   }
@@ -541,13 +393,9 @@ function onRangeInput(event: Event): void {
     order: 1;
   }
 
-  .format-group {
+  .background-group {
     order: 2;
     margin-left: auto;
-  }
-
-  .background-group {
-    order: 4;
   }
 
   .gap-group {
@@ -561,11 +409,11 @@ function onRangeInput(event: Event): void {
     display: none;
   }
 
-  .gap-number {
+  .number-field {
     height: 26px;
   }
 
-  .gap-number input {
+  .number-field input {
     height: 26px;
   }
 }

@@ -25,6 +25,28 @@ export function createImageId(): string {
   return `image-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 }
 
+const FORMAT_LABELS: Array<[RegExp, string]> = [
+  [/png$/i, 'PNG'],
+  [/jpe?g$/i, 'JPG'],
+  [/webp$/i, 'WebP'],
+  [/gif$/i, 'GIF'],
+  [/avif$/i, 'AVIF'],
+  [/bmp$/i, 'BMP'],
+]
+
+/** 按 MIME（没有时按扩展名）给出原图格式的短名；认不出时返回空串。 */
+export function getFormatLabel(mime: string, fileName: string): string {
+  const subtype = mime.toLowerCase().replace(/^image\/(x-ms-)?/, '')
+  const extension = fileName.includes('.') ? fileName.slice(fileName.lastIndexOf('.') + 1) : ''
+  for (const candidate of [subtype, extension]) {
+    const match = FORMAT_LABELS.find(([pattern]) => pattern.test(candidate))
+    if (match) {
+      return match[1]
+    }
+  }
+  return ''
+}
+
 export function isSupportedImage(file: File): boolean {
   return SUPPORTED_MIME.has(file.type.toLowerCase()) || SUPPORTED_EXTENSION.test(file.name)
 }

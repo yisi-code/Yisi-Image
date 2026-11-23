@@ -23,6 +23,16 @@ const CUSTOM_SETTINGS: ToolSettings = {
   blankPanel: { collapsed: true, position: null },
   thumbnailPanel: { collapsed: true, position: null },
   healEngine: 'migan',
+  workMode: 'single',
+  exportOptions: {
+    format: 'webp',
+    quality: 70,
+    compressBy: 'target',
+    targetKb: 300,
+    resize: 'longEdge',
+    percent: 40,
+    longEdge: 1280,
+  },
 }
 
 describe('normalizeSettings', () => {
@@ -63,6 +73,8 @@ describe('normalizeSettings', () => {
         blankPanel: { collapsed: 1 },
         thumbnailPanel: null,
         healEngine: 'gpt',
+        workMode: 'batch',
+        exportOptions: { format: 'tiff', quality: 'high', compressBy: 'size', resize: 'fit' },
       }),
     ).toEqual(DEFAULT_SETTINGS)
   })

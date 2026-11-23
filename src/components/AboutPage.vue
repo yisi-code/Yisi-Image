@@ -10,6 +10,7 @@ import {
   Github,
   GitBranch,
   GripVertical,
+  ImageIcon,
   Images,
   Layers3,
   Mail,
@@ -109,9 +110,14 @@ const features = [
     detail: '方向、大小、显示方式可调，连同间距存入配置文件',
   },
   {
+    icon: ImageIcon,
+    title: '单图编辑',
+    detail: '逐张标注、修瑕，可按同一设置批量导出',
+  },
+  {
     icon: FolderDown,
-    title: '保存与恢复',
-    detail: 'PNG / JPEG / WebP，导出后保留一次恢复快照',
+    title: '格式与压缩',
+    detail: 'PNG / JPG / WebP 互转，质量、尺寸、目标大小可调，导出前对比',
   },
   {
     icon: Download,

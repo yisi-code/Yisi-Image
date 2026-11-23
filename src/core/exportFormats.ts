@@ -1,5 +1,5 @@
-import { DEFAULT_BACKGROUND, TRANSPARENT_BACKGROUND } from './settings'
-import type { StitchBackground } from './settings'
+import { DEFAULT_BACKGROUND, TRANSPARENT_BACKGROUND } from './background'
+import type { StitchBackground } from './background'
 
 export type ExportFormat = 'png' | 'jpeg' | 'webp'
 

@@ -22,10 +22,37 @@ type WindowWithSavePicker = Window & {
   showSaveFilePicker?: SavePicker
 }
 
+export interface SaveDirectoryHandle {
+  getFileHandle(name: string, options?: { create?: boolean }): Promise<SaveFileHandle>
+}
+
+type DirectoryPicker = (options?: { mode?: 'read' | 'readwrite' }) => Promise<SaveDirectoryHandle>
+
+type WindowWithDirectoryPicker = Window & {
+  showDirectoryPicker?: DirectoryPicker
+}
+
 /** 只有 Chromium 系浏览器支持系统保存对话框，其它浏览器回退到下载目录。 */
 export function getSavePicker(): SavePicker | null {
   const picker = (window as WindowWithSavePicker).showSaveFilePicker
   return typeof picker === 'function' ? picker.bind(window) : null
+}
+
+/** 批量导出选文件夹；同样只有 Chromium 系浏览器支持，其它浏览器逐个下载。 */
+export function getDirectoryPicker(): (() => Promise<SaveDirectoryHandle>) | null {
+  const picker = (window as WindowWithDirectoryPicker).showDirectoryPicker
+  return typeof picker === 'function' ? () => picker.call(window, { mode: 'readwrite' }) : null
+}
+
+/** 文件夹里是否已有同名文件；同名的子文件夹也算占用。 */
+export async function hasEntry(directory: SaveDirectoryHandle, name: string): Promise<boolean> {
+  try {
+    await directory.getFileHandle(name)
+    return true
+  } catch (error) {
+    const errorName = (error as { name?: unknown } | null)?.name
+    return errorName === 'TypeMismatchError'
+  }
 }
 
 export function isSaveCanceled(error: unknown): boolean {

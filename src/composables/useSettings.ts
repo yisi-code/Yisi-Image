@@ -142,9 +142,12 @@ export function useSettings(initial: InitialSettings) {
     update({ [key]: state })
   }
 
-  /** 恢复全部默认值（缩略图、间距、背景、面板位置与显示状态）；配置目录不变。 */
+  /**
+   * 恢复全部默认值（缩略图、间距、背景、导出设置、面板位置与显示状态）；配置目录不变。
+   * 当前所在的工作区保留，免得在单图编辑里点恢复默认后被切回拼接。
+   */
   function reset(): void {
-    settings.value = normalizeSettings(null)
+    settings.value = { ...normalizeSettings(null), workMode: settings.value.workMode }
   }
 
   /** 返回 false 表示所选目录就是当前目录，没有移动。 */

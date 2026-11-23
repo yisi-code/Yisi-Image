@@ -1,3 +1,7 @@
+import { DEFAULT_BACKGROUND, normalizeBackground } from './background'
+import type { StitchBackground } from './background'
+import { DEFAULT_EXPORT_OPTIONS, normalizeExportOptions } from './exportOptions'
+import type { ExportOptions } from './exportOptions'
 import { normalizeFloatingPosition } from './floating'
 import type { FloatingPosition } from './floating'
 import { DEFAULT_GAP, clampGap } from './layout'
@@ -8,14 +12,10 @@ export type ThumbnailSize = 'small' | 'medium' | 'large'
 export type ThumbnailFit = 'contain' | 'cover' | 'fill'
 /** 局部修瑕的补全方式：经典算法（默认，无需下载）或某个 AI 模型。 */
 export type HealEngine = 'classic' | AiModelId
-/**
- * 拼接画布的背景：图片大小不一时露出的空位与间距都用它填充。
- * 取值为 `transparent` 或小写 `#rrggbb`；空白页有自己的白底，不跟随。
- */
-export type StitchBackground = string
-
-export const TRANSPARENT_BACKGROUND = 'transparent'
-export const DEFAULT_BACKGROUND: StitchBackground = '#ffffff'
+/** 工作区：多图拼接，或逐张编辑单张图片 */
+export type WorkMode = 'stitch' | 'single'
+export { DEFAULT_BACKGROUND, TRANSPARENT_BACKGROUND, normalizeBackground } from './background'
+export type { StitchBackground } from './background'
 
 /**
  * 预览区面板（标注栏、缩放栏、空白页尺寸面板、缩略图）的显示状态。
@@ -40,6 +40,10 @@ export interface ToolSettings {
   blankPanel: PanelState
   thumbnailPanel: PanelState
   healEngine: HealEngine
+  /** 上次使用的工作区，下次打开沿用 */
+  workMode: WorkMode
+  /** 导出对话框的格式与压缩设置，拼接与单图共用 */
+  exportOptions: ExportOptions
 }
 
 export type PanelKey = 'annotationToolbar' | 'zoomToolbar' | 'blankPanel' | 'thumbnailPanel'
@@ -169,6 +173,8 @@ export const DEFAULT_SETTINGS: Readonly<ToolSettings> = Object.freeze({
   blankPanel: DEFAULT_PANEL_STATE,
   thumbnailPanel: DEFAULT_PANEL_STATE,
   healEngine: 'classic',
+  workMode: 'stitch',
+  exportOptions: DEFAULT_EXPORT_OPTIONS,
 })
 
 function isOrientation(value: unknown): value is ThumbnailOrientation {
@@ -189,17 +195,6 @@ function isHealEngine(value: unknown): value is HealEngine {
 
 function normalizeGap(value: unknown): number {
   return typeof value === 'number' ? clampGap(value) : DEFAULT_GAP
-}
-
-/** 只接受 `transparent` 与 `#rrggbb`（统一成小写），其余回退白色。 */
-export function normalizeBackground(value: unknown): StitchBackground {
-  if (value === TRANSPARENT_BACKGROUND) {
-    return TRANSPARENT_BACKGROUND
-  }
-  if (typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value)) {
-    return value.toLowerCase()
-  }
-  return DEFAULT_BACKGROUND
 }
 
 export function normalizePanelState(value: unknown): PanelState {
@@ -230,6 +225,8 @@ export function normalizeSettings(value: unknown): ToolSettings {
     blankPanel: normalizePanelState(parsed.blankPanel),
     thumbnailPanel: normalizePanelState(parsed.thumbnailPanel),
     healEngine: isHealEngine(parsed.healEngine) ? parsed.healEngine : DEFAULT_SETTINGS.healEngine,
+    workMode: parsed.workMode === 'single' ? 'single' : 'stitch',
+    exportOptions: normalizeExportOptions(parsed.exportOptions),
   }
 }
 

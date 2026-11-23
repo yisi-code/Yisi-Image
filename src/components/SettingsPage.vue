@@ -739,7 +739,7 @@ defineExpose({ focusTitle })
       <header class="settings-card__head">
         <div>
           <h3 id="config-settings-title">配置文件</h3>
-          <p>缩略图设置、拼接间距与背景、修瑕补全方式，以及预览面板（标注栏、缩放栏、空白页面板、缩略图）的位置与显示状态都保存在这里；AI 模型文件放在「局部修瑕」分类的模型目录里。</p>
+          <p>缩略图设置、拼接间距与背景、修瑕补全方式、导出格式与压缩设置、上次用的工作区，以及预览面板（标注栏、缩放栏、空白页面板、缩略图）的位置与显示状态都保存在这里；AI 模型文件放在「局部修瑕」分类的模型目录里。</p>
         </div>
         <span class="settings-summary">{{ configSummary }}</span>
       </header>
@@ -814,10 +814,10 @@ defineExpose({ focusTitle })
 
     <footer class="settings-footer">
       <p v-if="isFileStorage">
-        设置自动保存到配置文件。恢复默认会同时重置拼接间距与背景、修瑕补全方式和预览面板的位置与显示状态，不改变配置目录，也不删除已下载的模型。
+        设置自动保存到配置文件。恢复默认会同时重置拼接间距与背景、修瑕补全方式、导出设置和预览面板的位置与显示状态，不改变配置目录，也不删除已下载的模型。
       </p>
       <p v-else>
-        设置自动保存在本机浏览器，换浏览器或清除站点数据后会恢复默认。恢复默认会同时重置拼接间距与背景和预览面板的位置与显示状态。
+        设置自动保存在本机浏览器，换浏览器或清除站点数据后会恢复默认。恢复默认会同时重置拼接间距与背景、导出设置和预览面板的位置与显示状态。
       </p>
       <button class="button button-secondary" type="button" @click="emit('reset')">
         <RotateCcw :size="14" :stroke-width="1.9" />

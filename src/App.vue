@@ -6,10 +6,10 @@ import {
   ArrowLeft,
   Download,
   FilePlus2,
+  ImageIcon,
   Images,
   Info,
   Layers3,
-  Loader2,
   PenLine,
   Settings,
   ShieldCheck,
@@ -17,6 +17,8 @@ import {
 } from 'lucide-vue-next'
 import AboutPage from './components/AboutPage.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
+import EditControls from './components/EditControls.vue'
+import ExportDialog from './components/ExportDialog.vue'
 import PreviewStage from './components/PreviewStage.vue'
 import SettingsPage from './components/SettingsPage.vue'
 import StitchControls from './components/StitchControls.vue'
@@ -27,33 +29,26 @@ import { useModels } from './composables/useModels'
 import { useSettings } from './composables/useSettings'
 import type { InitialSettings } from './composables/useSettings'
 import { useToasts } from './composables/useToasts'
-import {
-  DEFAULT_EXPORT_FORMAT,
-  EXPORT_QUALITY,
-  buildExportFileName,
-  getExportBackground,
-  getExportFormat,
-  getSaveTypes,
-  getSupportedExportFormats,
-  isTransparencyDropped,
-} from './core/exportFormats'
-import type { ExportFormat } from './core/exportFormats'
+import { TRANSPARENT_BACKGROUND } from './core/background'
+import { getExportFormat, getSupportedExportFormats } from './core/exportFormats'
+import type { ExportItem, ExportSummary } from './core/exportJob'
+import { getSizeChangePercent } from './core/exportOptions'
+import type { ExportOptions } from './core/exportOptions'
 import { IS_DESKTOP_APP } from './core/appInfo'
 import type { HealEngineChoice } from './core/healEngine'
-import { IMAGE_ACCEPT, SUPPORTED_FORMAT_LABEL, formatDimensions } from './core/image'
-import { calculateStitchLayout, inspectOutputSize } from './core/layout'
-import { UnsupportedExportFormatError, canvasToBlob, renderStitch } from './core/render'
 import {
-  downloadBlob,
-  getSavePicker,
-  isSaveCanceled,
-  writeBlobToHandle,
-} from './core/save'
-import type { SaveFileHandle } from './core/save'
+  IMAGE_ACCEPT,
+  SUPPORTED_FORMAT_LABEL,
+  formatDimensions,
+  formatFileSize,
+} from './core/image'
+import { calculateStitchLayout, inspectOutputSize } from './core/layout'
+import { renderStitch } from './core/render'
+import { getSavePicker } from './core/save'
 import { isModelBusy } from './core/modelApi'
 import { HEAL_ENGINE_OPTIONS, THUMBNAIL_SIZE_PX } from './core/settings'
-import type { PanelKey, PanelState } from './core/settings'
-import type { StitchDirection } from './core/types'
+import type { PanelKey, PanelState, WorkMode } from './core/settings'
+import type { StitchDirection, StitchImage } from './core/types'
 import { vTooltip } from './directives/tooltip'
 
 const props = defineProps<{
@@ -112,11 +107,18 @@ const background = computed({
   get: () => settings.value.background,
   set: (value: string) => updateSettings({ background: value }),
 })
-const exportFormat = ref<ExportFormat>(DEFAULT_EXPORT_FORMAT)
+/** 当前工作区随设置保存，下次打开沿用。 */
+const workMode = computed({
+  get: () => settings.value.workMode,
+  set: (value: WorkMode) => updateSettings({ workMode: value }),
+})
+const isStitchMode = computed(() => workMode.value === 'stitch')
 const supportedFormats = getSupportedExportFormats()
-const activeFormat = computed(() => getExportFormat(exportFormat.value))
-const isExporting = ref(false)
+const activeFormat = computed(() => getExportFormat(settings.value.exportOptions.format))
+const isExportDialogOpen = ref(false)
 const isClearDialogOpen = ref(false)
+/** 预览里正在修瑕：期间不能切换模式和单图编辑的当前图片，否则结果写不回去。 */
+const isPreviewBusy = ref(false)
 const activeView = ref<'workspace' | 'about' | 'settings'>('workspace')
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const aboutButtonRef = ref<HTMLButtonElement | null>(null)
@@ -131,16 +133,14 @@ const resolvedThumbOrientation = computed(() =>
     ? direction.value
     : settings.value.thumbnailOrientation,
 )
-// 纵向排列且缩略图展开时，右下角提示要给右侧缩略图面板让位。
+// 纵向排列且缩略图展开时，右下角提示要给右侧缩略图面板让位；单图编辑没有缩略图条。
 const toastRightOffset = computed(() =>
-  resolvedThumbOrientation.value === 'vertical' && !settings.value.thumbnailPanel.collapsed
+  isStitchMode.value &&
+  resolvedThumbOrientation.value === 'vertical' &&
+  !settings.value.thumbnailPanel.collapsed
     ? THUMBNAIL_SIZE_PX[settings.value.thumbnailSize].width + 80
     : 22,
 )
-
-function focusQueueImage(index: number): void {
-  previewStageRef.value?.focusImage(index)
-}
 
 const {
   images,
@@ -155,6 +155,18 @@ const {
   clearImages,
   restoreCleared,
 } = useImageQueue()
+/** 单图编辑有自己的一份列表，与拼接队列互不影响。 */
+const {
+  images: editImages,
+  isImporting: isEditImporting,
+  progress: editProgress,
+  clearedCount: editClearedCount,
+  addFiles: addEditFiles,
+  removeImage: removeEditImage,
+  clearImages: clearEditImages,
+  restoreCleared: restoreEditCleared,
+} = useImageQueue()
+const editActiveId = ref<string | null>(null)
 const { toasts, push, dismiss, dismissAll } = useToasts()
 
 // 配置写不进去时提示一次；之后连续失败不重复弹，恢复正常后再失败才会再提示。
@@ -176,6 +188,24 @@ const activeIndex = computed(() =>
   images.value.findIndex((image) => image.id === activeImageId.value),
 )
 
+/** 单图编辑正在编辑的那张；没选过或被移除时取第一张。 */
+const editCurrent = computed<StitchImage | null>(
+  () => editImages.value.find((image) => image.id === editActiveId.value) ?? editImages.value[0] ?? null,
+)
+
+// 左侧列表、预览、清空与恢复按当前工作区取对应的一份。
+const listImages = computed(() => (isStitchMode.value ? images.value : editImages.value))
+const listImporting = computed(() =>
+  isStitchMode.value ? isImporting.value : isEditImporting.value,
+)
+const listProgress = computed(() => (isStitchMode.value ? progress.value : editProgress.value))
+const listClearedCount = computed(() =>
+  isStitchMode.value ? clearedCount.value : editClearedCount.value,
+)
+const listActiveId = computed(() =>
+  isStitchMode.value ? activeImageId.value : (editCurrent.value?.id ?? null),
+)
+
 interface PanelToggle {
   key: PanelKey
   /** 完整名称，用于提示与无障碍名称 */
@@ -189,10 +219,12 @@ interface PanelToggle {
 const panelToggles = computed<PanelToggle[]>(() => [
   { key: 'annotationToolbar', name: '标注工具栏', label: '标注', icon: PenLine },
   { key: 'zoomToolbar', name: '缩放栏', label: '缩放', icon: ZoomIn },
-  ...(images.value.some((image) => image.kind === 'blank')
+  ...(isStitchMode.value && images.value.some((image) => image.kind === 'blank')
     ? [{ key: 'blankPanel' as const, name: '空白页面板', label: '空白页', icon: FilePlus2 }]
     : []),
-  { key: 'thumbnailPanel', name: '缩略图', label: '缩略图', icon: Images },
+  ...(isStitchMode.value
+    ? [{ key: 'thumbnailPanel' as const, name: '缩略图', label: '缩略图', icon: Images }]
+    : []),
 ])
 const panelToggleRefs = new Map<PanelKey, HTMLButtonElement>()
 
@@ -232,15 +264,30 @@ const outputCheck = computed(() =>
   inspectOutputSize(layout.value.width, layout.value.height),
 )
 
-const canExport = computed(
-  () => images.value.length >= 2 && outputCheck.value.ok && !isExporting.value,
+const previewImages = computed<StitchImage[]>(() => {
+  if (isStitchMode.value) {
+    return images.value
+  }
+  return editCurrent.value ? [editCurrent.value] : []
+})
+const previewLayout = computed(() =>
+  isStitchMode.value ? layout.value : calculateStitchLayout(previewImages.value, 'vertical', 0),
+)
+
+const canExport = computed(() =>
+  isStitchMode.value
+    ? images.value.length >= 2 && outputCheck.value.ok
+    : editCurrent.value !== null && !isEditImporting.value,
 )
 
 const previewStatus = computed(() => {
-  if (images.value.length === 0) {
-    return isImporting.value
-      ? `正在读取 ${progress.value.done}/${progress.value.total}`
+  if (listImages.value.length === 0) {
+    return listImporting.value
+      ? `正在读取 ${listProgress.value.done}/${listProgress.value.total}`
       : '等待添加图片'
+  }
+  if (!isStitchMode.value) {
+    return `导出 ${activeFormat.value.label} · 可预览对比`
   }
   if (!outputCheck.value.ok) {
     return outputCheck.value.reason
@@ -257,6 +304,9 @@ const previewStatus = computed(() => {
 })
 
 const statusTone = computed<'neutral' | 'ready' | 'warning'>(() => {
+  if (!isStitchMode.value) {
+    return editCurrent.value ? 'ready' : 'neutral'
+  }
   if (images.value.length < 2) {
     return 'neutral'
   }
@@ -267,26 +317,68 @@ const statusTone = computed<'neutral' | 'ready' | 'warning'>(() => {
 })
 
 const exportHint = computed(() => {
+  if (!isStitchMode.value) {
+    return editCurrent.value ? '选择格式、压缩并预览对比后保存' : '先添加要编辑的图片'
+  }
   if (images.value.length < 2) {
     return '至少需要两张图片才能导出'
   }
   if (!outputCheck.value.ok) {
     return outputCheck.value.reason
   }
-  if (isExporting.value) {
-    return '正在生成图片'
-  }
-  const qualityNote = activeFormat.value.supportsQuality
-    ? `，质量 ${Math.round(EXPORT_QUALITY * 100)}%`
-    : ''
   return canChooseSaveLocation
-    ? `导出 ${activeFormat.value.longLabel}${qualityNote}，可选择保存位置`
-    : `按原图尺寸导出 ${activeFormat.value.longLabel}${qualityNote}（浏览器默认下载目录）`
+    ? '选择格式、压缩并预览对比后保存，可选择保存位置'
+    : '选择格式、压缩并预览对比后保存（浏览器默认下载目录）'
 })
 
+const clearDialogTitle = computed(() => (isStitchMode.value ? '清空拼接队列？' : '清空图片列表？'))
 const clearDialogDescription = computed(
   () =>
-    `队列中的 ${images.value.length} 张图片会从画布上移除，电脑里的原图不会被删除。`,
+    `${isStitchMode.value ? '队列' : '列表'}中的 ${listImages.value.length} 张图片会从画布上移除，电脑里的原图不会被删除。`,
+)
+const workspaceName = computed(() => (isStitchMode.value ? '拼接' : '编辑'))
+
+/** 导出对话框的内容：拼接是整张拼接图，单图编辑是列表里的每一张。 */
+const exportItems = computed<ExportItem[]>(() => {
+  if (isStitchMode.value) {
+    const stitchLayout = layout.value
+    const stitchImages = images.value.slice()
+    return [
+      {
+        id: 'stitch',
+        name: '',
+        width: stitchLayout.width,
+        height: stitchLayout.height,
+        originalSize: 0,
+        render: (scale, background) =>
+          renderStitch(document.createElement('canvas'), stitchLayout, stitchImages, {
+            scale,
+            background,
+          }),
+      },
+    ]
+  }
+  return editImages.value.map((image) => ({
+    id: image.id,
+    name: image.name,
+    width: image.width,
+    height: image.height,
+    originalSize: image.size,
+    render: (scale: number, background: string | null) =>
+      renderStitch(
+        document.createElement('canvas'),
+        calculateStitchLayout([image], 'vertical', 0),
+        [image],
+        { scale, background },
+      ),
+  }))
+})
+const exportCurrentId = computed(() =>
+  isStitchMode.value ? 'stitch' : (editCurrent.value?.id ?? null),
+)
+// 单图导出保留原图透明（JPG 例外，按白底）；拼接用底栏选的背景。
+const exportBackground = computed(() =>
+  isStitchMode.value ? background.value : TRANSPARENT_BACKGROUND,
 )
 
 function summarize(names: string[]): string {
@@ -322,8 +414,66 @@ async function closeSettings(): Promise<void> {
   settingsButtonRef.value?.focus()
 }
 
+function warnBusy(): void {
+  push({ tone: 'info', title: '正在修瑕', message: '等这次修瑕算完再切换。' })
+}
+
+function switchMode(mode: WorkMode): void {
+  if (mode === workMode.value) {
+    return
+  }
+  if (isPreviewBusy.value) {
+    warnBusy()
+    return
+  }
+  // 上一个工作区的提示（导入结果、导出结果）对新工作区没有意义。
+  dismissAll()
+  workMode.value = mode
+}
+
+function selectEditImage(index: number): void {
+  const target = editImages.value[index]
+  if (!target || target.id === editCurrent.value?.id) {
+    return
+  }
+  if (isPreviewBusy.value) {
+    warnBusy()
+    return
+  }
+  editActiveId.value = target.id
+}
+
+function onQueueFocus(index: number): void {
+  if (isStitchMode.value) {
+    previewStageRef.value?.focusImage(index)
+  } else {
+    selectEditImage(index)
+  }
+}
+
+function onActiveChange(id: string | null): void {
+  // 单图编辑的当前图片由列表决定，预览里的「当前」只在拼接时有意义。
+  if (isStitchMode.value) {
+    activeImageId.value = id
+  }
+}
+
+function removeListImage(id: string): void {
+  if (isStitchMode.value) {
+    removeImage(id)
+    return
+  }
+  // 移除正在编辑的那张时，改编辑它后面一张（没有就前一张）。
+  if (id === editCurrent.value?.id) {
+    const index = editImages.value.findIndex((image) => image.id === id)
+    const next = editImages.value[index + 1] ?? editImages.value[index - 1] ?? null
+    editActiveId.value = next?.id ?? null
+  }
+  removeEditImage(id)
+}
+
 function openFilePicker(): void {
-  if (!isImporting.value) {
+  if (!listImporting.value) {
     fileInputRef.value?.click()
   }
 }
@@ -343,9 +493,10 @@ async function handleAdd(files: File[]): Promise<void> {
   // 新一批图片开始导入后，旧的导出结果提示不再需要保留。
   dismissAll()
 
+  const isStitch = isStitchMode.value
   let report
   try {
-    report = await addFiles(files)
+    report = await (isStitch ? addFiles(files) : addEditFiles(files))
   } catch (error) {    console.error('读取图片失败', error)
     push({
       tone: 'error',
@@ -364,7 +515,11 @@ async function handleAdd(files: File[]): Promise<void> {
     push({
       tone: 'success',
       title: `已添加 ${report.added} 张图片`,
-      message: report.added > 1 ? '可以拖动卡片调整拼接顺序。' : undefined,
+      message: isStitch
+        ? report.added > 1
+          ? '可以拖动卡片调整拼接顺序。'
+          : undefined
+        : '点左侧图片切换编辑，导出时可转换格式、压缩。',
     })
   }
 
@@ -407,7 +562,7 @@ function resizeBlankPage(id: string, width: number, height: number): void {
 }
 
 function requestClear(): void {
-  if (isImporting.value || images.value.length === 0) {
+  if (listImporting.value || listImages.value.length === 0) {
     return
   }
   isClearDialogOpen.value = true
@@ -419,19 +574,19 @@ function cancelClear(): void {
 
 function confirmClear(): void {
   isClearDialogOpen.value = false
-  if (isImporting.value) {
+  if (listImporting.value) {
     return
   }
-  const cleared = clearImages()
+  const cleared = isStitchMode.value ? clearImages() : clearEditImages()
   push({
     tone: 'info',
-    title: '拼接队列已清空',
+    title: isStitchMode.value ? '拼接队列已清空' : '图片列表已清空',
     message: cleared > 0 ? `可在左侧恢复这 ${cleared} 张图片。` : undefined,
   })
 }
 
 function restoreLastCleared(): void {
-  const restored = restoreCleared()
+  const restored = isStitchMode.value ? restoreCleared() : restoreEditCleared()
   if (restored === 0) {
     return
   }
@@ -440,86 +595,84 @@ function restoreLastCleared(): void {
   push({
     tone: 'info',
     title: `已恢复 ${restored} 张图片`,
-    message: '顺序和间距保持不变，可以继续调整或再次导出。',
+    message: isStitchMode.value
+      ? '顺序和间距保持不变，可以继续调整或再次导出。'
+      : '标注和修瑕都保留，可以继续编辑或再次导出。',
   })
 }
 
-async function handleExport(): Promise<void> {
+function openExportDialog(): void {
   if (!canExport.value) {
     return
   }
-
-  const format = activeFormat.value
-  const fileName = buildExportFileName(new Date(), format.value)
-  const picker = getSavePicker()
-  isExporting.value = true
-  // 导出开始后，上一条“已恢复”或旧导出提示已经过时。
+  // 旧的导出结果、恢复提示已经过时。
   dismissAll()
+  isExportDialogOpen.value = true
+}
 
-  try {
-    let target: SaveFileHandle | null = null
-    if (picker) {
-      // 保存对话框必须在点击手势内打开；先选位置，再生成大图。
-      try {
-        target = await picker({
-          suggestedName: fileName,
-          types: getSaveTypes(format),
-        })
-      } catch (error) {
-        if (isSaveCanceled(error)) {
-          return
-        }
-        throw error
-      }
-    }
+function updateExportOptions(options: ExportOptions): void {
+  updateSettings({ exportOptions: options })
+}
 
-    const exportLayout = layout.value
-    const exportImages = images.value.slice()
-    const exportBackground = background.value
+const LOCATION_TEXT: Record<ExportSummary['location'], string> = {
+  file: '已保存到所选位置',
+  folder: '已保存到所选文件夹',
+  download: '已下载到默认下载目录',
+}
 
-    // 先让按钮的“导出中”状态完成一次绘制，再开始同步生成画布。
-    await new Promise<void>((resolve) => window.setTimeout(resolve, 30))
+function describeSizeChange(before: number, after: number): string {
+  const change = getSizeChangePercent(before, after)
+  if (change === null) {
+    return formatFileSize(after)
+  }
+  return `${formatFileSize(before)} → ${formatFileSize(after)}（${change > 0 ? '+' : ''}${change}%）`
+}
 
-    const canvas = renderStitch(document.createElement('canvas'), exportLayout, exportImages, {
-      background: getExportBackground(exportBackground, format),
-    })
-    const blob = await canvasToBlob(
-      canvas,
-      format.mime,
-      format.supportsQuality ? EXPORT_QUALITY : undefined,
-    )
+function onExported(summary: ExportSummary): void {
+  isExportDialogOpen.value = false
+  const format = summary.format
+  const notes = [
+    summary.transparencyDropped ? 'JPG 不支持透明，已按白底导出' : '',
+    summary.unmetTarget > 0
+      ? `${summary.unmetTarget > 1 ? `有 ${summary.unmetTarget} 张` : ''}最低质量仍超过目标大小`
+      : '',
+  ].filter(Boolean)
+  const noteText = notes.length > 0 ? ` · ${notes.join(' · ')}` : ''
 
-    if (target) {
-      await writeBlobToHandle(target, blob)
-    } else {
-      downloadBlob(blob, fileName)
-    }
-
+  if (isStitchMode.value) {
     const cleared = clearImages()
-    const locationText = target ? '已保存到所选位置' : '已下载到默认下载目录'
     const restoreText = cleared > 0 ? `；队列已清空，可恢复 ${cleared} 张` : ''
-    const backgroundText = isTransparencyDropped(exportBackground, format)
-      ? ' · JPG 不支持透明，已按白底导出'
-      : ''
     push({
       tone: 'success',
       title: '图片已导出',
-      message: `${formatDimensions(exportLayout.width, exportLayout.height)} px · ${format.longLabel}${backgroundText} · ${locationText}${restoreText}`,
+      message: `${formatDimensions(summary.width, summary.height)} px · ${format.longLabel} · ${formatFileSize(summary.totalAfter)}${noteText} · ${LOCATION_TEXT[summary.location]}${restoreText}`,
       // 导出结果需要用户看清格式、尺寸和恢复入口，不自动消失。
       duration: 0,
     })
-  } catch (error) {
-    console.error('导出拼接图片失败', error)
-    const unsupported = error instanceof UnsupportedExportFormatError
+    return
+  }
+
+  if (summary.count > 0) {
+    const title = summary.count > 1 ? `已导出 ${summary.count} 张图片` : '图片已导出'
+    const sizeText =
+      summary.count > 1
+        ? `共 ${describeSizeChange(summary.totalBefore, summary.totalAfter)}`
+        : `${formatDimensions(summary.width, summary.height)} px · ${describeSizeChange(summary.totalBefore, summary.totalAfter)}`
+    push({
+      tone: 'success',
+      title: summary.canceled ? `${title}（已停止）` : title,
+      message: `${format.longLabel} · ${sizeText}${noteText} · ${LOCATION_TEXT[summary.location]}`,
+      duration: 0,
+    })
+  } else if (summary.canceled) {
+    push({ tone: 'info', title: '已停止导出', message: '还没有保存任何图片。' })
+  }
+  if (summary.failed.length > 0) {
     push({
       tone: 'error',
-      title: '导出失败',
-      message: unsupported
-        ? '当前浏览器不支持所选格式，请改用 PNG、JPG 或更新浏览器。'
-        : '请稍后重试；如果无法选择保存位置，可以改用浏览器默认下载目录。',
+      title: `${summary.failed.length} 张没有导出`,
+      message: `${summarize(summary.failed)}。可能超出尺寸上限或写入失败，可以单独再试。`,
     })
-  } finally {
-    isExporting.value = false
   }
 }
 </script>
@@ -535,7 +688,33 @@ async function handleExport(): Promise<void> {
           <div class="brand-line">
             <h1 class="brand-name">Yisi 图像工具</h1>
             <span class="brand-divider" aria-hidden="true" />
-            <span class="brand-sub">图片拼接</span>
+            <span v-if="activeView !== 'workspace'" class="brand-sub">
+              {{ isStitchMode ? '图片拼接' : '单图编辑' }}
+            </span>
+            <div v-else class="segmented mode-switch" role="group" aria-label="工作区">
+              <button
+                type="button"
+                class="segment"
+                :class="{ 'is-active': isStitchMode }"
+                :aria-pressed="isStitchMode"
+                title="把多张图片纵向或横向拼成一张"
+                @click="switchMode('stitch')"
+              >
+                <Layers3 :size="14" :stroke-width="1.9" />
+                <span class="mode-switch__label">拼接</span>
+              </button>
+              <button
+                type="button"
+                class="segment"
+                :class="{ 'is-active': !isStitchMode }"
+                :aria-pressed="!isStitchMode"
+                title="逐张标注、修瑕，导出时转换格式与压缩"
+                @click="switchMode('single')"
+              >
+                <ImageIcon :size="14" :stroke-width="1.9" />
+                <span class="mode-switch__label">单图编辑</span>
+              </button>
+            </div>
           </div>
         </div>
 
@@ -576,21 +755,21 @@ async function handleExport(): Promise<void> {
             v-if="activeView === 'about'"
             class="button button-secondary header-page-button"
             type="button"
-            title="返回拼接工作区"
+            :title="`返回${workspaceName}工作区`"
             @click="closeAbout"
           >
             <ArrowLeft :size="14" :stroke-width="1.9" />
-            <span class="header-page-label">返回拼接</span>
+            <span class="header-page-label">返回{{ workspaceName }}</span>
           </button>
           <button
             v-else-if="activeView === 'settings'"
             class="button button-secondary header-page-button"
             type="button"
-            title="返回拼接工作区"
+            :title="`返回${workspaceName}工作区`"
             @click="closeSettings"
           >
             <ArrowLeft :size="14" :stroke-width="1.9" />
-            <span class="header-page-label">返回拼接</span>
+            <span class="header-page-label">返回{{ workspaceName }}</span>
           </button>
 
           <button
@@ -598,20 +777,12 @@ async function handleExport(): Promise<void> {
             class="button button-primary export-button"
             type="button"
             :disabled="!canExport"
-            :title="
-              canExport
-                ? canChooseSaveLocation
-                  ? `导出 ${activeFormat.longLabel}，可选择保存位置`
-                  : `按原图尺寸导出 ${activeFormat.longLabel}（浏览器默认下载目录）`
-                : exportHint
-            "
+            :title="exportHint"
             :aria-describedby="canExport ? undefined : 'export-hint'"
-            :aria-busy="isExporting"
-            @click="handleExport"
+            @click="openExportDialog"
           >
-            <Loader2 v-if="isExporting" class="spin" :size="15" :stroke-width="2" />
-            <Download v-else :size="15" :stroke-width="2" />
-            <span>{{ isExporting ? '导出中' : '导出图片' }}</span>
+            <Download :size="15" :stroke-width="2" />
+            <span>导出图片</span>
           </button>
           <span id="export-hint" class="sr-only">{{ exportHint }}</span>
         </div>
@@ -620,31 +791,43 @@ async function handleExport(): Promise<void> {
 
     <main v-if="activeView === 'workspace'" class="workspace">
       <StitchQueue
-        :images="images"
-        :is-importing="isImporting"
-        :progress="progress"
-        :cleared-count="clearedCount"
-        :active-id="activeImageId"
+        :images="listImages"
+        :is-importing="listImporting"
+        :progress="listProgress"
+        :cleared-count="listClearedCount"
+        :active-id="listActiveId"
+        :mode="workMode"
+        :select-locked="isPreviewBusy"
         @pick="openFilePicker"
         @add="handleAdd"
-        @remove="removeImage"
+        @remove="removeListImage"
         @reorder="moveImage"
         @clear="requestClear"
         @restore="restoreLastCleared"
-        @focus="focusQueueImage"
+        @focus="onQueueFocus"
         @blank="insertBlankPage"
       />
 
-      <section class="preview-panel" aria-label="拼接预览与设置">
+      <section
+        class="preview-panel"
+        :aria-label="isStitchMode ? '拼接预览与设置' : '单图编辑预览'"
+      >
         <header class="preview-header">
           <div class="preview-heading">
-            <h2>拼图预览</h2>
-            <span v-if="images.length > 0" class="preview-meta tnum">
+            <h2>{{ isStitchMode ? '拼图预览' : '单图编辑' }}</h2>
+            <span v-if="isStitchMode && images.length > 0" class="preview-meta tnum">
               {{ images.length }} 张 · {{ formatDimensions(layout.width, layout.height) }} px
+            </span>
+            <span
+              v-else-if="!isStitchMode && editCurrent"
+              class="preview-meta tnum"
+              :title="editCurrent.name"
+            >
+              {{ editCurrent.name }} · {{ formatDimensions(editCurrent.width, editCurrent.height) }} px
             </span>
           </div>
           <div
-            v-if="images.length > 0"
+            v-if="listImages.length > 0"
             class="panel-toggles"
             role="group"
             aria-label="显示或隐藏预览面板"
@@ -685,10 +868,10 @@ async function handleExport(): Promise<void> {
 
         <PreviewStage
           ref="previewStageRef"
-          :images="images"
-          :layout="layout"
-          :is-importing="isImporting"
-          :progress="progress"
+          :images="previewImages"
+          :layout="previewLayout"
+          :is-importing="listImporting"
+          :progress="listProgress"
           :thumb-orientation="settings.thumbnailOrientation"
           :thumb-size="settings.thumbnailSize"
           :thumb-fit="settings.thumbnailFit"
@@ -696,24 +879,32 @@ async function handleExport(): Promise<void> {
           :zoom-toolbar="settings.zoomToolbar"
           :blank-panel="settings.blankPanel"
           :thumbnail-panel="settings.thumbnailPanel"
-          :background="background"
+          :background="exportBackground"
+          :single-image="!isStitchMode"
           :heal-engine="healEngineChoice"
           @pick="openFilePicker"
           @add="handleAdd"
-          @active-change="activeImageId = $event"
+          @active-change="onActiveChange"
           @resize-blank="resizeBlankPage"
           @update-panel="onPanelUpdate"
           @heal-failed="onHealFailed"
           @heal-notice="onHealNotice"
+          @busy-change="isPreviewBusy = $event"
         />
 
         <StitchControls
+          v-if="isStitchMode"
           v-model:direction="direction"
           v-model:gap="gap"
           v-model:background="background"
-          v-model:format="exportFormat"
-          :formats="supportedFormats"
-          :disabled="isExporting"
+          :format="settings.exportOptions.format"
+        />
+        <EditControls
+          v-else
+          :images="editImages"
+          :current="editCurrent"
+          :locked="isPreviewBusy"
+          @select="selectEditImage"
         />
       </section>
     </main>
@@ -766,11 +957,24 @@ async function handleExport(): Promise<void> {
       @dismiss="dismiss"
     />
 
+    <ExportDialog
+      :open="isExportDialogOpen"
+      :mode="workMode"
+      :items="exportItems"
+      :current-id="exportCurrentId"
+      :options="settings.exportOptions"
+      :formats="supportedFormats"
+      :background="exportBackground"
+      @close="isExportDialogOpen = false"
+      @update:options="updateExportOptions"
+      @exported="onExported"
+    />
+
     <ConfirmDialog
       :open="isClearDialogOpen"
-      title="清空拼接队列？"
+      :title="clearDialogTitle"
       :description="clearDialogDescription"
-      confirm-label="清空队列"
+      :confirm-label="isStitchMode ? '清空队列' : '清空列表'"
       cancel-label="保留图片"
       @confirm="confirmClear"
       @cancel="cancelClear"
@@ -859,6 +1063,17 @@ async function handleExport(): Promise<void> {
   color: var(--text-muted);
   font-size: 11px;
   font-weight: 500;
+  white-space: nowrap;
+}
+
+/* 工作区切换：样式沿用底部控制条的分段控件，只是更矮一些放进顶栏。 */
+.mode-switch {
+  flex: 0 0 auto;
+}
+
+.mode-switch .segment {
+  height: 28px;
+  padding: 0 11px;
   white-space: nowrap;
 }
 
@@ -1108,8 +1323,13 @@ async function handleExport(): Promise<void> {
   }
 
   .brand-divider,
-  .brand-sub {
+  .brand-sub,
+  .mode-switch__label {
     display: none;
+  }
+
+  .mode-switch .segment {
+    padding: 0 9px;
   }
 
   .brand-mark {
