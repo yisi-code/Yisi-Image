@@ -214,7 +214,7 @@ defineExpose({ focusTitle })
         </div>
         <div class="about-fact">
           <dt>输出格式</dt>
-          <dd>PNG / JPEG / WebP · 原图尺寸 · 白底</dd>
+          <dd>PNG / JPEG / WebP · 可压缩、缩放 · 背景可选</dd>
         </div>
         <div class="about-fact">
           <dt>更新来源</dt>
