@@ -4,7 +4,8 @@ import { Loader2, Minus, Plus } from 'lucide-vue-next'
 import { getCheckerPattern } from '../core/render'
 
 /**
- * 前后对比视图：左边画「处理前」，右边画「处理后」，中间竖线可拖动。
+ * 前后对比视图：左边画「处理前」，右边画「处理后」，中间竖线可拖动；comparing 为 false 时只显示「处理后」，没有中线。
+ * 工具栏开头的 actions 插槽给使用方放切换按钮等。
  * 可滚轮缩放（以指针处为中心）、按 − / + 逐级缩放，「适应」把整张图缩进视图，「100%」按实际像素显示；
  * 画面比视图大时按住拖动平移，拖中线才改对比位置；双击在适应与 100% 之间切换。
  */
@@ -18,11 +19,14 @@ const props = withDefaults(
     beforeLabel?: string
     afterLabel?: string
     busy?: boolean
+    /** 是否显示前后对比；false 时整幅都是「处理后」 */
+    comparing?: boolean
   }>(),
   {
     beforeLabel: '原图',
     afterLabel: '处理后',
     busy: false,
+    comparing: true,
   },
 )
 
@@ -101,7 +105,7 @@ function draw(): void {
   const contentHeight = props.height * scale.value
   const left = (viewWidth - contentWidth) / 2 + offset.value.x
   const top = (viewHeight - contentHeight) / 2 + offset.value.y
-  const splitX = viewWidth * split.value
+  const splitX = props.comparing ? viewWidth * split.value : 0
 
   context.fillStyle = getCheckerPattern(context)
   context.fillRect(left, top, contentWidth, contentHeight)
@@ -109,7 +113,7 @@ function draw(): void {
   context.imageSmoothingEnabled = scale.value < 1
   context.imageSmoothingQuality = 'high'
 
-  if (props.before) {
+  if (props.before && props.comparing) {
     context.save()
     context.beginPath()
     context.rect(0, 0, splitX, viewHeight)
@@ -211,8 +215,11 @@ function onPointerDown(event: PointerEvent): void {
   const target = event.currentTarget as HTMLElement
   target.setPointerCapture(event.pointerId)
   const onHandle = event.target instanceof HTMLElement && event.target.closest('.compare-handle')
-  // 画面完整放得下时点哪里中线就到哪里；超出视图时拖动画面平移，拖中线才改对比位置。
-  if (onHandle || !canPan.value) {
+  // 画面完整放得下时点哪里中线就到哪里；超出视图时拖动画面平移，拖中线才改对比位置。不对比时只能平移。
+  if (!props.comparing && !canPan.value) {
+    return
+  }
+  if (props.comparing && (onHandle || !canPan.value)) {
     dragState = { kind: 'split', pointerId: event.pointerId }
     split.value = splitFromEvent(event)
   } else {
@@ -267,7 +274,7 @@ function onHandleKeydown(event: KeyboardEvent): void {
 }
 
 watch(
-  () => [props.before, props.after, props.width, props.height],
+  () => [props.before, props.after, props.width, props.height, props.comparing],
   () => {
     offset.value = clampOffset(offset.value)
     scheduleDraw()
@@ -302,9 +309,9 @@ onBeforeUnmount(() => {
       @pointercancel="onPointerUp"
     >
       <canvas ref="canvasRef" class="compare-canvas" aria-hidden="true" />
-      <span class="compare-label compare-label--before">{{ beforeLabel }}</span>
+      <span v-if="comparing" class="compare-label compare-label--before">{{ beforeLabel }}</span>
       <span class="compare-label compare-label--after">{{ afterLabel }}</span>
-      <div class="compare-divider" :style="{ left: `${splitPercent}%` }">
+      <div v-if="comparing" class="compare-divider" :style="{ left: `${splitPercent}%` }">
         <button
           class="compare-handle"
           type="button"
@@ -326,6 +333,7 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="compare-toolbar">
+      <slot name="actions" />
       <div class="compare-zoom-steps" role="group" aria-label="对比视图缩放">
         <button
           class="icon-button compare-zoom-button"
@@ -372,7 +380,10 @@ onBeforeUnmount(() => {
         </button>
       </div>
       <span class="compare-tip">
-        {{ canPan ? '滚轮缩放，拖动画面平移，拖中线对比' : '滚轮缩放，点击或拖动画面移动中线' }}
+        <template v-if="comparing">
+          {{ canPan ? '滚轮缩放，拖动画面平移，拖中线对比' : '滚轮缩放，点击或拖动画面移动中线' }}
+        </template>
+        <template v-else>{{ canPan ? '滚轮缩放，拖动画面平移' : '滚轮缩放' }}</template>
       </span>
     </div>
   </div>

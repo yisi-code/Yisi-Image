@@ -411,6 +411,30 @@ namespace Yisi.ImageTool
             Process.Start("explorer.exe", "\"" + dir + "\"");
         }
 
+        /// <summary>
+        /// 「查看文件」：在资源管理器里打开模型所在的文件夹并选中模型文件。内置模型按编号找、必须已完整下载；
+        /// 自定义模型（custom-…）按清单找。找不到文件时报错，不打开任何东西。
+        /// </summary>
+        internal static void RevealModelFile(string id)
+        {
+            string path = CustomModelStore.IsCustomId(id) ? CustomModelStore.PathOf(id) : CompleteModelPath(id);
+            if (path == null)
+            {
+                throw new ModelException("找不到这个模型的文件，可能还没下载完或已被删除");
+            }
+            Process.Start("explorer.exe", "/select,\"" + path + "\"");
+        }
+
+        private static string CompleteModelPath(string id)
+        {
+            lock (Sync)
+            {
+                ModelEntry entry = Find(id);
+                string path = Path.Combine(CurrentDirectory(), entry.Model.Name);
+                return IsComplete(path, entry.Model) ? path : null;
+            }
+        }
+
         /// <summary>页面请求 /models/文件名 时：只认清单里的文件，且必须已完整下载。返回完整路径与类型，否则 null。</summary>
         internal static string[] ResolveServedFile(string name)
         {

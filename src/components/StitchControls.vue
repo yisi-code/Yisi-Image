@@ -83,7 +83,8 @@ const backgroundHint = computed(() => {
   if (transparencyDropped.value) {
     return 'JPG 不支持透明 · 按白底导出'
   }
-  return `原图尺寸 · ${activePreset.value?.name ?? '自定义底色'}`
+  // 图片可在「调整」里缩放、裁剪，不再写「原图尺寸」。
+  return `底色 · ${activePreset.value?.name ?? '自定义'}`
 })
 
 function setDirection(value: StitchDirection): void {

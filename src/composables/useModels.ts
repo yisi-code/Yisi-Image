@@ -3,6 +3,7 @@ import {
   deleteCustomModel,
   importCustomModel,
   renameCustomModel,
+  revealModelFile,
   deleteModel,
   downloadModel,
   fetchModels,
@@ -162,6 +163,14 @@ export function useModels(enabled: boolean) {
     })
   }
 
+  /** 打开模型所在文件夹；失败时（例如文件已被手动删掉）在设置页显示原因并刷新列表。 */
+  function reveal(id: string): Promise<void> {
+    return run('', async () => {
+      await revealModelFile(id)
+      return null
+    })
+  }
+
   onBeforeUnmount(() => {
     disposed = true
     window.clearTimeout(pollTimer)
@@ -186,5 +195,6 @@ export function useModels(enabled: boolean) {
     importCustom,
     renameCustom,
     removeCustom,
+    reveal,
   }
 }

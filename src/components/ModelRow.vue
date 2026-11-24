@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Check, Download, Pause, Play, Trash2 } from 'lucide-vue-next'
+import { Check, Download, FolderSearch, Pause, Play, Trash2 } from 'lucide-vue-next'
 import type { ModelId, ModelStatus } from '../core/modelApi'
 
 /**
- * 设置页里一个 AI 模型的下载行：名称、状态文字、进度条，以及下载 / 暂停 / 继续 / 删除。
+ * 设置页里一个 AI 模型的下载行：名称、状态文字、进度条，以及下载 / 暂停 / 继续 / 查看文件 / 删除。
  * 局部修瑕与清晰化两个分类共用；清晰化里还能「设为默认」。行的样式在 base.css（与自定义模型行共用）。
  */
 const props = withDefaults(
@@ -28,6 +28,8 @@ const emit = defineEmits<{
   pause: [id: ModelId]
   delete: [id: ModelId]
   select: [id: ModelId]
+  /** 下载完成后打开模型所在文件夹 */
+  reveal: [id: ModelId]
 }>()
 
 const percent = computed(() =>
@@ -101,6 +103,17 @@ const percent = computed(() =>
       >
         <Download :size="14" :stroke-width="1.9" />
         {{ status.state === 'error' ? '重新下载' : '下载' }}
+      </button>
+      <button
+        v-if="status.state === 'ready'"
+        class="button button-secondary"
+        type="button"
+        :disabled="busy"
+        title="在资源管理器里打开模型所在的文件夹"
+        @click="emit('reveal', status.id)"
+      >
+        <FolderSearch :size="14" :stroke-width="1.9" />
+        查看文件
       </button>
       <button
         v-if="status.modelDownloaded > 0 && status.state !== 'verifying'"

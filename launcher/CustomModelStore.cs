@@ -243,7 +243,7 @@ namespace Yisi.ImageTool
         /// </summary>
         internal static void Delete(string id)
         {
-            if (id == null || !IdPattern.IsMatch(id))
+            if (!IsCustomId(id))
             {
                 throw new ModelException("自定义模型编号无效");
             }
@@ -269,6 +269,17 @@ namespace Yisi.ImageTool
                     Save(modelsDir, list);
                 }
             }
+        }
+
+        internal static bool IsCustomId(string id)
+        {
+            return id != null && IdPattern.IsMatch(id);
+        }
+
+        /// <summary>自定义模型文件的完整路径；清单里没有或文件不完整时为 null。</summary>
+        internal static string PathOf(string id)
+        {
+            return IsCustomId(id) ? Resolve(FileNameOf(id)) : null;
         }
 
         /// <summary>/models/custom/文件名：清单里有、且文件大小一致时返回完整路径。</summary>

@@ -1,7 +1,7 @@
 <script lang="ts">
 import { ref } from 'vue'
 
-type SettingsCategory = 'thumbnail' | 'heal' | 'sharpen' | 'config'
+type SettingsCategory = 'thumbnail' | 'heal' | 'sharpen' | 'files'
 
 /**
  * 当前选中的设置分类。放在模块级：返回拼接时设置页会卸载，再进设置仍停在上次看的分类；
@@ -100,16 +100,18 @@ const emit = defineEmits<{
   'import-custom-model': [kind: CustomModelKind]
   'rename-custom-model': [id: string, name: string]
   'delete-custom-model': [id: string]
+  /** 在资源管理器里打开模型所在文件夹并选中文件 */
+  'reveal-model': [id: string]
 }>()
 
 const titleRef = ref<HTMLElement | null>(null)
 
-/** 分类与原来的三张卡一一对应、顺序不变；恢复默认作用于全部分类，留在页脚。 */
+/** 按功能分类，配置文件与模型目录这类「文件放在哪」的设置统一放在「文件管理」；恢复默认作用于全部分类，留在页脚。 */
 const categories: { key: SettingsCategory; label: string; icon: Component }[] = [
   { key: 'thumbnail', label: '预览缩略图', icon: GalleryThumbnails },
   { key: 'heal', label: '局部修瑕', icon: Wand2 },
   { key: 'sharpen', label: '清晰化', icon: Sparkles },
-  { key: 'config', label: '配置文件', icon: FileCog },
+  { key: 'files', label: '文件管理', icon: FolderCog },
 ]
 
 /** 方向键切换分类后把焦点移到新页签。 */
@@ -155,6 +157,18 @@ const configSummary = computed(() => {
     return '浏览器本地存储'
   }
   return props.configLocation?.isDefault ? '程序所在目录' : '自定义目录'
+})
+
+/** 文件管理页签的摘要：两个目录都在默认位置时只说一句，否则分别说明。 */
+const filesSummary = computed(() => {
+  const models = props.models
+  if (!isFileStorage.value || !props.modelsAvailable || !models) {
+    return configSummary.value
+  }
+  const modelsWhere = models.isDefault ? '程序所在目录' : '自定义目录'
+  return configSummary.value === modelsWhere
+    ? `都在${modelsWhere}`
+    : `配置：${configSummary.value} · 模型：${modelsWhere}`
 })
 
 /** 配置区域只显示一条状态：目录操作的进度或结果优先，其次是保存失败。 */
@@ -316,11 +330,9 @@ const modelsDirStatus = computed<ConfigDirStatus | null>(() => {
 /** 有错误的分类在页签上标出来：停在别的分类时，也能看到配置没保存上、模型下载失败。 */
 const categoryAlerts = computed<Record<SettingsCategory, boolean>>(() => ({
   thumbnail: false,
-  heal:
-    modelsDirStatus.value?.tone === 'error' ||
-    (props.models?.items.some((item) => isHealModel(item.id) && item.state === 'error') ?? false),
+  heal: props.models?.items.some((item) => isHealModel(item.id) && item.state === 'error') ?? false,
   sharpen: props.models?.items.some((item) => !isHealModel(item.id) && item.state === 'error') ?? false,
-  config: configStatus.value?.tone === 'error',
+  files: configStatus.value?.tone === 'error' || Boolean(props.modelsLoadError),
 }))
 
 const downloadPrompt = computed(() => {
@@ -530,7 +542,7 @@ defineExpose({ focusTitle })
           <span class="settings-pill">仅本机</span>
         </div>
         <p v-if="isFileStorage">
-          按类别调整预览缩略图、局部修瑕与清晰化的方式和 AI 模型，以及配置文件的位置。设置会自动保存到配置文件（默认在程序所在目录），不影响导出的原图。
+          按类别调整预览缩略图、局部修瑕与清晰化的方式和 AI 模型，以及配置文件和模型文件的存放位置。设置会自动保存到配置文件（默认在程序所在目录），不影响导出的原图。
         </p>
         <p v-else>
           按类别调整预览缩略图、局部修瑕与清晰化的方式。设置会自动保存在当前浏览器，不影响导出的原图。
@@ -733,10 +745,10 @@ defineExpose({ focusTitle })
         </div>
       </div>
 
-      <div class="setting-block">
+      <div class="setting-block setting-block--last">
         <div class="setting-label">
           <h4>AI 模型</h4>
-          <p>内置模型由本机程序下载，可暂停后接着下，下完按 SHA-256 校验；也可以导入自己找的 ONNX 修瑕模型。</p>
+          <p>内置模型由本机程序下载，可暂停后接着下，下完按 SHA-256 校验；也可以导入自己找的 ONNX 修瑕模型。模型文件放在「文件管理」里的模型目录，点「查看文件」可打开所在文件夹。</p>
         </div>
         <div v-if="modelsAvailable" class="model-list">
           <ModelRow
@@ -748,6 +760,7 @@ defineExpose({ focusTitle })
             :busy="modelsBusy"
             @download="emit('download-model', $event)"
             @pause="emit('pause-model', $event)"
+            @reveal="emit('reveal-model', $event)"
             @delete="pendingDelete = $event"
           />
           <CustomModelRow
@@ -761,6 +774,7 @@ defineExpose({ focusTitle })
             select-title="局部修瑕用这个模型补全"
             @select="selectHealCustom"
             @rename="(id, name) => emit('rename-custom-model', id, name)"
+            @reveal="emit('reveal-model', $event)"
             @delete="pendingCustomDelete = models?.custom.find((item) => item.id === $event) ?? null"
           />
           <div class="custom-import">
@@ -777,53 +791,6 @@ defineExpose({ focusTitle })
               支持修瑕（inpainting）类的 ONNX 模型：两个输入——3 通道图像 [1, 3, 高, 宽] 与 1 通道遮罩 [1, 1, 高, 宽]，float32（图像取值 0–1）或 uint8（0–255）；输出同尺寸的 [1, 3, 高, 宽] 图像。输入尺寸固定（如 512 × 512）或不固定都可以，遮罩用 1 还是 0 表示要补、输出取值范围会自动识别。不符合时修瑕会提示原因并改用经典算法。注意查看模型的许可证。
             </p>
           </div>
-        </div>
-        <p v-else class="config-note">
-          当前以浏览器页面运行。AI 模型由免安装 EXE 版的本机程序下载和提供，在这里只能使用经典算法。
-        </p>
-      </div>
-
-      <div class="setting-block setting-block--last">
-        <div class="setting-label">
-          <h4>模型目录</h4>
-          <p>默认放在程序所在目录的 models 文件夹；更改后会把已下载的模型一起移过去。下载进行中不能更改。</p>
-        </div>
-        <div v-if="modelsAvailable && models" class="config-location">
-          <div class="config-path">
-            <FolderCog :size="15" :stroke-width="1.8" aria-hidden="true" />
-            <span class="config-path__text">{{ models.dir }}</span>
-          </div>
-          <div class="config-actions">
-            <button
-              class="button button-secondary"
-              type="button"
-              :disabled="modelsBusy"
-              @click="emit('change-models-dir')"
-            >
-              <Loader2 v-if="modelsBusy" class="spin" :size="14" :stroke-width="1.9" />
-              <FolderInput v-else :size="14" :stroke-width="1.9" />
-              更改目录…
-            </button>
-            <button
-              class="button button-secondary"
-              type="button"
-              :disabled="modelsBusy"
-              @click="emit('open-models-dir')"
-            >
-              <FolderOpen :size="14" :stroke-width="1.9" />
-              打开目录
-            </button>
-            <button
-              v-if="!models.isDefault"
-              class="button button-secondary"
-              type="button"
-              :disabled="modelsBusy"
-              @click="emit('reset-models-dir')"
-            >
-              <Undo2 :size="14" :stroke-width="1.9" />
-              移回程序目录
-            </button>
-          </div>
           <p
             v-if="modelsDirStatus"
             class="config-status"
@@ -833,18 +800,9 @@ defineExpose({ focusTitle })
             {{ modelsDirStatus.text }}
           </p>
         </div>
-        <div v-else class="config-location">
-          <p v-if="!modelsAvailable" class="config-note">只有免安装 EXE 版会下载模型，浏览器页面没有模型目录。</p>
-          <p
-            v-else-if="modelsDirStatus"
-            class="config-status"
-            :class="`config-status--${modelsDirStatus.tone}`"
-            role="status"
-          >
-            {{ modelsDirStatus.text }}
-          </p>
-          <p v-else class="config-note">正在读取模型目录…</p>
-        </div>
+        <p v-else class="config-note">
+          当前以浏览器页面运行。AI 模型由免安装 EXE 版的本机程序下载和提供，在这里只能使用经典算法。
+        </p>
       </div>
     </section>
 
@@ -911,7 +869,7 @@ defineExpose({ focusTitle })
       <div class="setting-block setting-block--last">
         <div class="setting-label">
           <h4>AI 模型</h4>
-          <p>内置模型下完按 SHA-256 校验；也可以导入自己找的 ONNX 模型。都放在「局部修瑕」里设置的模型目录，运行库共用一份。</p>
+          <p>内置模型下完按 SHA-256 校验；也可以导入自己找的 ONNX 模型。都放在「文件管理」里的模型目录，运行库共用一份；点「查看文件」可打开所在文件夹。</p>
         </div>
         <div v-if="modelsAvailable" class="model-list">
           <ModelRow
@@ -925,6 +883,7 @@ defineExpose({ focusTitle })
             :selected="settings.sharpenModel === model.id"
             @download="emit('download-model', $event)"
             @pause="emit('pause-model', $event)"
+            @reveal="emit('reveal-model', $event)"
             @delete="pendingDelete = $event"
             @select="selectSharpenModel"
           />
@@ -939,6 +898,7 @@ defineExpose({ focusTitle })
             select-title="清晰化面板选 AI 时默认用这个模型"
             @select="selectSharpenModel"
             @rename="(id, name) => emit('rename-custom-model', id, name)"
+            @reveal="emit('reveal-model', $event)"
             @delete="pendingCustomDelete = models?.custom.find((item) => item.id === $event) ?? null"
           />
           <div class="custom-import">
@@ -971,24 +931,24 @@ defineExpose({ focusTitle })
     </section>
 
     <section
-      v-show="activeCategory === 'config'"
-      id="settings-panel-config"
+      v-show="activeCategory === 'files'"
+      id="settings-panel-files"
       class="settings-card"
       role="tabpanel"
-      aria-labelledby="settings-tab-config"
+      aria-labelledby="settings-tab-files"
     >
       <header class="settings-card__head">
         <div>
-          <h3 id="config-settings-title">配置文件</h3>
-          <p>缩略图设置、拼接间距与背景、修瑕补全方式、导出格式与压缩设置、上次用的工作区，以及预览面板（标注栏、缩放栏、空白页面板、缩略图）的位置与显示状态都保存在这里；AI 模型文件放在「局部修瑕」分类的模型目录里。</p>
+          <h3 id="files-settings-title">文件管理</h3>
+          <p>配置文件和 AI 模型文件放在哪里：可以打开所在目录、换到别的目录或移回程序目录。单个模型的「查看文件」在「局部修瑕」「清晰化」的模型列表里。</p>
         </div>
-        <span class="settings-summary">{{ configSummary }}</span>
+        <span class="settings-summary">{{ filesSummary }}</span>
       </header>
 
-      <div class="setting-block setting-block--last">
+      <div class="setting-block">
         <div class="setting-label">
-          <h4>存储目录</h4>
-          <p>默认放在程序所在目录，随程序一起拷走即可沿用；更改后会把配置文件移动到新目录。</p>
+          <h4>配置文件目录</h4>
+          <p>缩略图、拼接间距与背景、修瑕与清晰化方式、导出设置、工作区和预览面板的位置都存在这里。默认放在程序所在目录，随程序一起拷走即可沿用；更改后会把配置文件移动到新目录。</p>
         </div>
 
         <div v-if="isFileStorage && configLocation" class="config-location">
@@ -1049,6 +1009,70 @@ defineExpose({ focusTitle })
           >
             {{ configStatus.text }}
           </p>
+        </div>
+      </div>
+
+      <div class="setting-block setting-block--last">
+        <div class="setting-label">
+          <h4>模型目录</h4>
+          <p>默认放在程序所在目录的 models 文件夹；更改后会把已下载的模型一起移过去。下载进行中不能更改。</p>
+        </div>
+        <div v-if="modelsAvailable && models" class="config-location">
+          <div class="config-path">
+            <FolderCog :size="15" :stroke-width="1.8" aria-hidden="true" />
+            <span class="config-path__text">{{ models.dir }}</span>
+          </div>
+          <div class="config-actions">
+            <button
+              class="button button-secondary"
+              type="button"
+              :disabled="modelsBusy"
+              @click="emit('change-models-dir')"
+            >
+              <Loader2 v-if="modelsBusy" class="spin" :size="14" :stroke-width="1.9" />
+              <FolderInput v-else :size="14" :stroke-width="1.9" />
+              更改目录…
+            </button>
+            <button
+              class="button button-secondary"
+              type="button"
+              :disabled="modelsBusy"
+              @click="emit('open-models-dir')"
+            >
+              <FolderOpen :size="14" :stroke-width="1.9" />
+              打开目录
+            </button>
+            <button
+              v-if="!models.isDefault"
+              class="button button-secondary"
+              type="button"
+              :disabled="modelsBusy"
+              @click="emit('reset-models-dir')"
+            >
+              <Undo2 :size="14" :stroke-width="1.9" />
+              移回程序目录
+            </button>
+          </div>
+          <p
+            v-if="modelsDirStatus"
+            class="config-status"
+            :class="`config-status--${modelsDirStatus.tone}`"
+            role="status"
+          >
+            {{ modelsDirStatus.text }}
+          </p>
+        </div>
+        <div v-else class="config-location">
+          <p v-if="!modelsAvailable" class="config-note">只有免安装 EXE 版会下载模型，浏览器页面没有模型目录。</p>
+          <p
+            v-else-if="modelsDirStatus"
+            class="config-status"
+            :class="`config-status--${modelsDirStatus.tone}`"
+            role="status"
+          >
+            {{ modelsDirStatus.text }}
+          </p>
+          <p v-else class="config-note">正在读取模型目录…</p>
         </div>
       </div>
     </section>

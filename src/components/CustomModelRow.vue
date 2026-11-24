@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { nextTick, ref } from 'vue'
-import { Check, PencilLine, Trash2 } from 'lucide-vue-next'
+import { Check, FolderSearch, PencilLine, Trash2 } from 'lucide-vue-next'
 import type { CustomModel } from '../core/modelApi'
 import { formatFileSize } from '../core/image'
 
 /**
  * 设置页里一个自定义模型（清晰化或局部修瑕）：名称（可就地改名）、大小与 SHA-256 前几位、能不能用，
- * 以及设为默认、删除。行的样式与内置模型行共用（base.css 的 model-row）。
+ * 以及设为默认、查看文件、删除。行的样式与内置模型行共用（base.css 的 model-row）。
  */
 const props = defineProps<{
   model: CustomModel
@@ -23,6 +23,8 @@ const emit = defineEmits<{
   select: [id: string]
   rename: [id: string, name: string]
   delete: [id: string]
+  /** 打开模型所在文件夹 */
+  reveal: [id: string]
 }>()
 
 const isEditing = ref(false)
@@ -92,6 +94,17 @@ function cancelEdit(): void {
       >
         <PencilLine :size="14" :stroke-width="1.9" />
         改名
+      </button>
+      <button
+        v-if="model.available"
+        class="button button-secondary"
+        type="button"
+        :disabled="busy"
+        title="在资源管理器里打开模型所在的文件夹"
+        @click="emit('reveal', model.id)"
+      >
+        <FolderSearch :size="14" :stroke-width="1.9" />
+        查看文件
       </button>
       <button
         class="button button-secondary"

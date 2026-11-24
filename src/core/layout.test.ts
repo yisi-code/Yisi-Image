@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
-  MAX_EXPORT_AREA,
-  MAX_EXPORT_SIDE,
+  CANVAS_MAX_SIDE,
+  CANVAS_SAFE_AREA,
+  CANVAS_SAFE_SIDE,
+  WEBP_MAX_SIDE,
   MAX_GAP,
   calculateStitchLayout,
   clampGap,
@@ -78,15 +80,25 @@ describe('calculateStitchLayout', () => {
 })
 
 describe('inspectOutputSize', () => {
-  it('rejects empty output and oversized sides', () => {
+  it('安全范围内整张画布编码', () => {
     expect(inspectOutputSize(0, 0).ok).toBe(false)
-    expect(inspectOutputSize(MAX_EXPORT_SIDE, 1000).ok).toBe(true)
-    expect(inspectOutputSize(MAX_EXPORT_SIDE + 1, 1000).ok).toBe(false)
+    expect(inspectOutputSize(CANVAS_SAFE_SIDE, 1000)).toMatchObject({ ok: true, mode: 'canvas' })
+    expect(inspectOutputSize(10_000, CANVAS_SAFE_AREA / 10_000, 'jpeg')).toMatchObject({
+      ok: true,
+      mode: 'canvas',
+    })
   })
 
-  it('rejects output above the safe pixel area', () => {
-    expect(inspectOutputSize(10_000, MAX_EXPORT_AREA / 10_000).ok).toBe(true)
-    expect(inspectOutputSize(10_001, MAX_EXPORT_AREA / 10_000).ok).toBe(false)
+  it('PNG 超出画布安全范围时分块编码，不设上限', () => {
+    expect(inspectOutputSize(CANVAS_SAFE_SIDE + 1, 1000)).toMatchObject({ ok: true, mode: 'strips' })
+    expect(inspectOutputSize(1554, 200_000, 'png')).toMatchObject({ ok: true, mode: 'strips' })
+  })
+
+  it('JPG 用画布硬上限，WebP 用格式上限，超出时提示改用 PNG', () => {
+    expect(inspectOutputSize(20_000, 1000, 'jpeg')).toMatchObject({ ok: true, mode: 'canvas' })
+    expect(inspectOutputSize(CANVAS_MAX_SIDE + 1, 1000, 'jpeg').ok).toBe(false)
+    expect(inspectOutputSize(16_000, 17_000, 'jpeg').ok).toBe(false)
+    expect(inspectOutputSize(WEBP_MAX_SIDE + 1, 1000, 'webp').reason).toContain('改用 PNG')
   })
 
   it('marks large but exportable output', () => {

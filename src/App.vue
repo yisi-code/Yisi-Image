@@ -47,7 +47,16 @@ import {
   formatFileSize,
 } from './core/image'
 import { calculateStitchLayout, inspectOutputSize } from './core/layout'
+import {
+  displaySizeOf,
+  frameFromTransform,
+  frameLayout,
+  frameTransform,
+  layoutSourceOf,
+} from './core/imageTransform'
+import type { ContentTransform, StitchFrame } from './core/imageTransform'
 import { renderStitch } from './core/render'
+import type { OutputRegion } from './core/render'
 import { getSavePicker } from './core/save'
 import { isCustomModelKey, isModelBusy } from './core/modelApi'
 import { HEAL_ENGINE_OPTIONS, THUMBNAIL_SIZE_PX } from './core/settings'
@@ -259,6 +268,7 @@ const {
   addFiles,
   addBlankAt,
   resizeBlank,
+  setTransform: setStitchTransform,
   removeImage,
   moveImage,
   clearImages,
@@ -272,6 +282,7 @@ const {
   clearedCount: editClearedCount,
   addFiles: addEditFiles,
   removeImage: removeEditImage,
+  setTransform: setEditTransform,
   clearImages: clearEditImages,
   restoreCleared: restoreEditCleared,
 } = useImageQueue()
@@ -286,7 +297,7 @@ watch(
       push({
         tone: 'error',
         title: '设置未能保存',
-        message: `${message}。可在「设置 · 配置文件」里更换配置目录。`,
+        message: `${message}。可在「设置 · 文件管理」里更换配置目录。`,
       })
     }
   },
@@ -366,11 +377,31 @@ async function onPanelUpdate(key: PanelKey, state: PanelState): Promise<void> {
 }
 
 const layout = computed(() =>
-  calculateStitchLayout(images.value, direction.value, gap.value),
+  calculateStitchLayout(images.value.map(layoutSourceOf), direction.value, gap.value),
+)
+/** 整张拼接图的缩放与裁剪（调整工具「整张」）；null 表示原样。队列清空时一并清掉。 */
+const stitchFrame = ref<StitchFrame | null>(null)
+const stitchFrameTransform = computed(() =>
+  frameTransform({ width: layout.value.width, height: layout.value.height }, stitchFrame.value),
+)
+/** 换算到整张图变换后的布局：预览、导出都按它画 */
+const stitchViewLayout = computed(() => frameLayout(layout.value, stitchFrameTransform.value))
+
+watch(
+  () => images.value.length,
+  (count) => {
+    if (count === 0) {
+      stitchFrame.value = null
+    }
+  },
 )
 
+function setStitchFrame(transform: ContentTransform | null): void {
+  stitchFrame.value = frameFromTransform({ width: layout.value.width, height: layout.value.height }, transform)
+}
+
 const outputCheck = computed(() =>
-  inspectOutputSize(layout.value.width, layout.value.height),
+  inspectOutputSize(stitchViewLayout.value.width, stitchViewLayout.value.height),
 )
 
 const previewImages = computed<StitchImage[]>(() => {
@@ -380,12 +411,14 @@ const previewImages = computed<StitchImage[]>(() => {
   return editCurrent.value ? [editCurrent.value] : []
 })
 const previewLayout = computed(() =>
-  isStitchMode.value ? layout.value : calculateStitchLayout(previewImages.value, 'vertical', 0),
+  isStitchMode.value
+    ? stitchViewLayout.value
+    : calculateStitchLayout(previewImages.value.map(layoutSourceOf), 'vertical', 0),
 )
 
 const canExport = computed(() =>
   isStitchMode.value
-    ? images.value.length >= 2 && outputCheck.value.ok
+    ? images.value.length > 0 && outputCheck.value.ok
     : editCurrent.value !== null && !isEditImporting.value,
 )
 
@@ -401,8 +434,8 @@ const previewStatus = computed(() => {
   if (!outputCheck.value.ok) {
     return outputCheck.value.reason
   }
-  if (images.value.length === 1) {
-    return '再添加 1 张即可拼接'
+  if (outputCheck.value.mode === 'strips') {
+    return '超出画布上限，导出 PNG 时分块编码'
   }
   if (outputCheck.value.isLarge) {
     return '尺寸较大，导出可能需要几秒'
@@ -416,7 +449,7 @@ const statusTone = computed<'neutral' | 'ready' | 'warning'>(() => {
   if (!isStitchMode.value) {
     return editCurrent.value ? 'ready' : 'neutral'
   }
-  if (images.value.length < 2) {
+  if (images.value.length === 0) {
     return 'neutral'
   }
   if (!outputCheck.value.ok || outputCheck.value.isLarge) {
@@ -429,8 +462,8 @@ const exportHint = computed(() => {
   if (!isStitchMode.value) {
     return editCurrent.value ? '选择格式、压缩并预览对比后保存' : '先添加要编辑的图片'
   }
-  if (images.value.length < 2) {
-    return '至少需要两张图片才能导出'
+  if (images.value.length === 0) {
+    return '先添加要拼接的图片'
   }
   if (!outputCheck.value.ok) {
     return outputCheck.value.reason
@@ -450,7 +483,7 @@ const workspaceName = computed(() => (isStitchMode.value ? '拼接' : '编辑'))
 /** 导出对话框的内容：拼接是整张拼接图，单图编辑是列表里的每一张。 */
 const exportItems = computed<ExportItem[]>(() => {
   if (isStitchMode.value) {
-    const stitchLayout = layout.value
+    const stitchLayout = stitchViewLayout.value
     const stitchImages = images.value.slice()
     return [
       {
@@ -460,10 +493,11 @@ const exportItems = computed<ExportItem[]>(() => {
         height: stitchLayout.height,
         originalSize: 0,
         detailScale: Math.max(1, ...stitchImages.map((image) => image.enhance?.resolution ?? 1)),
-        render: (scale, background) =>
+        render: (scale, background, region) =>
           renderStitch(document.createElement('canvas'), stitchLayout, stitchImages, {
             scale,
             background,
+            region,
           }),
       },
     ]
@@ -471,16 +505,16 @@ const exportItems = computed<ExportItem[]>(() => {
   return editImages.value.map((image) => ({
     id: image.id,
     name: image.name,
-    width: image.width,
-    height: image.height,
+    width: displaySizeOf(image).width,
+    height: displaySizeOf(image).height,
     originalSize: image.size,
     detailScale: image.enhance?.resolution ?? 1,
-    render: (scale: number, background: string | null) =>
+    render: (scale: number, background: string | null, region?: OutputRegion) =>
       renderStitch(
         document.createElement('canvas'),
-        calculateStitchLayout([image], 'vertical', 0),
+        calculateStitchLayout([layoutSourceOf(image)], 'vertical', 0),
         [image],
-        { scale, background },
+        { scale, background, region },
       ),
   }))
 })
@@ -670,6 +704,15 @@ function insertBlankPage(): void {
   const insertAt = activeIndex.value >= 0 ? activeIndex.value + 1 : images.value.length
   const index = addBlankAt(insertAt)
   void nextTick(() => previewStageRef.value?.focusImage(index))
+}
+
+/** 调整工具改了缩放 / 裁剪：写回当前工作区里的那张图。 */
+function setImageTransform(id: string, transform: ContentTransform | null): void {
+  if (isStitchMode.value) {
+    setStitchTransform(id, transform)
+  } else {
+    setEditTransform(id, transform)
+  }
 }
 
 function resizeBlankPage(id: string, width: number, height: number): void {
@@ -931,7 +974,7 @@ function onExported(summary: ExportSummary): void {
           <div class="preview-heading">
             <h2>{{ isStitchMode ? '拼图预览' : '单图编辑' }}</h2>
             <span v-if="isStitchMode && images.length > 0" class="preview-meta tnum">
-              {{ images.length }} 张 · {{ formatDimensions(layout.width, layout.height) }} px
+              {{ images.length }} 张 · {{ formatDimensions(stitchViewLayout.width, stitchViewLayout.height) }} px
             </span>
             <span
               v-else-if="!isStitchMode && editCurrent"
@@ -1000,10 +1043,14 @@ function onExported(summary: ExportSummary): void {
           :ai-models="aiModelChoices"
           :ai-model-key="aiModelKey"
           :heal-engine="healEngineChoice"
+          :frame="isStitchMode ? stitchFrameTransform : null"
+          :base-size="isStitchMode ? { width: layout.width, height: layout.height } : null"
           @pick="openFilePicker"
           @add="handleAdd"
           @active-change="onActiveChange"
           @resize-blank="resizeBlankPage"
+          @set-transform="setImageTransform"
+          @set-frame="setStitchFrame"
           @update-panel="onPanelUpdate"
           @heal-failed="onHealFailed"
           @heal-notice="onHealNotice"
@@ -1063,6 +1110,7 @@ function onExported(summary: ExportSummary): void {
         @import-custom-model="models.importCustom"
         @rename-custom-model="models.renameCustom"
         @delete-custom-model="models.removeCustom"
+        @reveal-model="models.reveal"
       />
     </main>
 

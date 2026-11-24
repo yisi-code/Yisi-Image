@@ -6,6 +6,7 @@ import {
   releaseImage,
 } from '../core/image'
 import type { ImportProgress, ImportReport, StitchImage } from '../core/types'
+import type { ContentTransform } from '../core/imageTransform'
 
 type Outcome =
   | { kind: 'image'; image: StitchImage }
@@ -122,6 +123,14 @@ export function useImageQueue() {
     target.height = Math.max(40, Math.min(16_384, Math.round(height)))
   }
 
+  /** 调整工具：设置一张图的缩放 / 裁剪；null 表示还原。空白页不用。 */
+  function setTransform(id: string, transform: ContentTransform | null): void {
+    const target = images.value.find((image) => image.id === id && image.kind === 'image')
+    if (target) {
+      target.transform = transform ?? undefined
+    }
+  }
+
   function moveImage(from: number, to: number): void {
     const lastIndex = images.value.length - 1
     if (from === to || from < 0 || to < 0 || from > lastIndex || to > lastIndex) {
@@ -177,6 +186,7 @@ export function useImageQueue() {
     addFiles,
     addBlankAt,
     resizeBlank,
+    setTransform,
     removeImage,
     moveImage,
     clearImages,

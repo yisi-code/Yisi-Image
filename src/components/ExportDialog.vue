@@ -12,7 +12,7 @@ import {
   isTransparencyDropped,
 } from '../core/exportFormats'
 import type { ExportFormat, ExportFormatOption } from '../core/exportFormats'
-import { encodeCanvas, releaseCanvas } from '../core/exportJob'
+import { encodeCanvas, encodeItemAsPngStrips, releaseCanvas } from '../core/exportJob'
 import type { EncodedImage, ExportItem, ExportSummary } from '../core/exportJob'
 import {
   MAX_LONG_EDGE,
@@ -31,7 +31,8 @@ import {
 } from '../core/exportOptions'
 import type { CompressMode, ExportOptions, ResizeMode } from '../core/exportOptions'
 import { formatDimensions, formatFileSize } from '../core/image'
-import { inspectOutputSize } from '../core/layout'
+import { CANVAS_SAFE_AREA, CANVAS_SAFE_SIDE, inspectOutputSize } from '../core/layout'
+import { PngCanceledError, createBlobSink } from '../core/pngStream'
 import { UnsupportedExportFormatError } from '../core/render'
 import {
   downloadBlob,
@@ -45,7 +46,8 @@ import type { SaveDirectoryHandle, SaveFileHandle } from '../core/save'
 
 /**
  * 导出对话框：拼接与单图编辑共用。
- * 左边是导出效果的前后对比（真实编码后再解码），右边是格式、压缩与尺寸设置；
+ * 左边是导出效果预览（真实编码后再解码），默认只看导出结果，点「前后对比」才和未压缩的画面并排对比；
+ * 右边是格式、压缩与尺寸设置；
  * 点「保存」时才打开系统保存窗口（必须由点击直接触发），单图模式可按同一设置批量导出全部。
  */
 const props = defineProps<{
@@ -71,6 +73,18 @@ type ExportScope = 'current' | 'all'
 interface PreviewResult extends EncodedImage {
   key: string
   bitmap: ImageBitmap
+  /** 超大图按缩小版预览，文件大小要保存时才知道 */
+  approximate: boolean
+}
+
+/** 保存到哪里：系统保存窗口选的文件，或浏览器下载 */
+type SaveDestination = { kind: 'file'; handle: SaveFileHandle } | { kind: 'download'; name: string }
+
+interface SavedFile {
+  size: number
+  width: number
+  height: number
+  fits: boolean
 }
 
 const PREVIEW_DELAY_MS = 260
@@ -90,8 +104,12 @@ const COMPRESS_OPTIONS: Array<{ value: CompressMode; label: string; title: strin
 const dialogRef = ref<HTMLDialogElement | null>(null)
 const closeButtonRef = ref<HTMLButtonElement | null>(null)
 const scope = ref<ExportScope>('current')
+/** 预览是否打开前后对比；每次打开对话框都从「导出效果」开始 */
+const isComparing = ref(false)
 const isSaving = ref(false)
 const saveProgress = ref({ done: 0, total: 0 })
+/** 分块导出当前这张的进度（0–1）；不在分块导出时为 null */
+const stripProgress = ref<number | null>(null)
 const saveError = ref('')
 const isPreviewing = ref(false)
 const previewError = ref('')
@@ -114,8 +132,12 @@ const outputSize = computed(() =>
     : null,
 )
 const sizeCheck = computed(() =>
-  outputSize.value ? inspectOutputSize(outputSize.value.width, outputSize.value.height) : null,
+  outputSize.value
+    ? inspectOutputSize(outputSize.value.width, outputSize.value.height, format.value.value)
+    : null,
 )
+/** 超出画布上限、要分块写 PNG */
+const isStripExport = computed(() => sizeCheck.value?.ok === true && sizeCheck.value.mode === 'strips')
 const isBatch = computed(
   () => props.mode === 'single' && scope.value === 'all' && props.items.length > 1,
 )
@@ -135,7 +157,7 @@ const detailHint = computed(() => {
   return `这张图的 AI 清晰化保留了 ${item.detailScale} 倍细节；「尺寸」选百分比 ${item.detailScale * 100}% 导出，小字才会更清楚。`
 })
 const sizeChange = computed(() =>
-  currentResult.value && previewItem.value
+  currentResult.value && !currentResult.value.approximate && previewItem.value
     ? getSizeChangePercent(previewItem.value.originalSize, currentResult.value.blob.size)
     : null,
 )
@@ -158,9 +180,10 @@ const canSave = computed(
 )
 const saveLabel = computed(() => {
   if (isSaving.value) {
+    const strip = stripProgress.value === null ? '' : ` ${Math.floor(stripProgress.value * 100)}%`
     return isBatch.value
-      ? `正在保存 ${saveProgress.value.done}/${saveProgress.value.total}`
-      : '正在保存'
+      ? `正在保存 ${saveProgress.value.done}/${saveProgress.value.total}${strip}`
+      : `正在保存${strip}`
   }
   return isBatch.value ? `保存全部 ${props.items.length} 张` : '保存'
 })
@@ -294,10 +317,20 @@ async function runPreview(): Promise<void> {
     return
   }
   try {
-    const key = `${item.id}|${output.scale}|${exportBackground.value ?? 'none'}`
+    // 超大图分块导出时，预览按缩小版画（画布放得下），右边仍用所选格式真实编码。
+    const approximate = check.mode === 'strips'
+    const previewScale = approximate
+      ? output.scale *
+        Math.min(
+          1,
+          CANVAS_SAFE_SIDE / Math.max(output.width, output.height),
+          Math.sqrt((CANVAS_SAFE_AREA / 6) / (output.width * output.height)),
+        )
+      : output.scale
+    const key = `${item.id}|${previewScale}|${exportBackground.value ?? 'none'}`
     if (key !== sourceKey || !previewSource.value) {
       releaseCanvas(previewSource.value)
-      previewSource.value = item.render(output.scale, exportBackground.value)
+      previewSource.value = item.render(previewScale, exportBackground.value)
       sourceKey = key
     }
     const encoded = await encodeCanvas(previewSource.value, format.value, props.options)
@@ -310,7 +343,7 @@ async function runPreview(): Promise<void> {
       return
     }
     previewResult.value?.bitmap.close()
-    previewResult.value = { ...encoded, key: resultKey(item), bitmap }
+    previewResult.value = { ...encoded, key: resultKey(item), bitmap, approximate }
   } catch (error) {
     if (token === previewToken) {
       console.error('生成导出预览失败', error)
@@ -330,7 +363,7 @@ async function runPreview(): Promise<void> {
 async function encodeItem(item: ExportItem): Promise<EncodedImage & { width: number; height: number }> {
   const output = getOutputSize(item.width, item.height, props.options)
   const cached = previewResult.value
-  if (cached && cached.key === resultKey(item) && !isPreviewing.value) {
+  if (cached && !cached.approximate && cached.key === resultKey(item) && !isPreviewing.value) {
     return { blob: cached.blob, quality: cached.quality, fits: cached.fits, ...output }
   }
   await nextFrame()
@@ -343,9 +376,71 @@ async function encodeItem(item: ExportItem): Promise<EncodedImage & { width: num
   }
 }
 
+/**
+ * 导出一项并写到目标：画布放得下时整张编码（可用缓存的预览结果）；
+ * 超出画布上限的 PNG 分块编码，写文件时边编码边写盘，下载时攒成 Blob。
+ */
+async function exportItem(item: ExportItem, destination: SaveDestination): Promise<SavedFile> {
+  const output = getOutputSize(item.width, item.height, props.options)
+  const check = inspectOutputSize(output.width, output.height, format.value.value)
+  if (check.mode !== 'strips') {
+    const encoded = await encodeItem(item)
+    if (destination.kind === 'file') {
+      await writeBlobToHandle(destination.handle, encoded.blob)
+    } else {
+      downloadBlob(encoded.blob, destination.name)
+    }
+    return { size: encoded.blob.size, width: encoded.width, height: encoded.height, fits: encoded.fits }
+  }
+
+  stripProgress.value = 0
+  const options = {
+    onProgress: (fraction: number) => {
+      stripProgress.value = fraction
+    },
+    isCanceled: () => cancelRequested,
+  }
+  try {
+    if (destination.kind === 'file') {
+      const writable = await destination.handle.createWritable()
+      let size = 0
+      try {
+        await encodeItemAsPngStrips(
+          item,
+          output,
+          exportBackground.value,
+          {
+            async write(chunk) {
+              size += chunk.length
+              await writable.write(chunk)
+            },
+          },
+          options,
+        )
+        await writable.close()
+      } catch (error) {
+        // 中断时丢弃写了一半的文件，不留下打不开的图。
+        await writable.abort?.().catch(() => undefined)
+        throw error
+      }
+      return { size, width: output.width, height: output.height, fits: true }
+    }
+    const sink = createBlobSink()
+    await encodeItemAsPngStrips(item, output, exportBackground.value, sink, options)
+    const blob = sink.toBlob()
+    downloadBlob(blob, destination.name)
+    return { size: blob.size, width: output.width, height: output.height, fits: true }
+  } finally {
+    stripProgress.value = null
+  }
+}
+
 function describeError(error: unknown): string {
   if (error instanceof UnsupportedExportFormatError) {
     return '当前浏览器不支持所选格式，请换一种格式'
+  }
+  if (error instanceof PngCanceledError) {
+    return '已停止导出，文件没有保存'
   }
   return '保存失败，请稍后重试；无法选择位置时会改存到默认下载目录'
 }
@@ -377,13 +472,12 @@ async function saveCurrent(): Promise<void> {
 
   isSaving.value = true
   saveError.value = ''
+  cancelRequested = false
   try {
-    const encoded = await encodeItem(item)
-    if (target) {
-      await writeBlobToHandle(target, encoded.blob)
-    } else {
-      downloadBlob(encoded.blob, fileName)
-    }
+    const saved = await exportItem(
+      item,
+      target ? { kind: 'file', handle: target } : { kind: 'download', name: fileName },
+    )
     emit('exported', {
       count: 1,
       failed: [],
@@ -391,14 +485,16 @@ async function saveCurrent(): Promise<void> {
       format: formatOption,
       location: target ? 'file' : 'download',
       totalBefore: item.originalSize,
-      totalAfter: encoded.blob.size,
-      width: encoded.width,
-      height: encoded.height,
+      totalAfter: saved.size,
+      width: saved.width,
+      height: saved.height,
       transparencyDropped: transparencyDropped.value,
-      unmetTarget: encoded.fits ? 0 : 1,
+      unmetTarget: saved.fits ? 0 : 1,
     })
   } catch (error) {
-    console.error('导出图片失败', error)
+    if (!(error instanceof PngCanceledError)) {
+      console.error('导出图片失败', error)
+    }
     saveError.value = describeError(error)
   } finally {
     isSaving.value = false
@@ -455,30 +551,34 @@ async function saveAll(): Promise<void> {
       break
     }
     const output = getOutputSize(item.width, item.height, props.options)
-    if (!inspectOutputSize(output.width, output.height).ok) {
+    if (!inspectOutputSize(output.width, output.height, formatOption.value).ok) {
       failed.push(item.name)
     } else {
       try {
-        const encoded = await encodeItem(item)
         const name = await pickFileName(
           replaceExtension(item.name, formatOption.extension),
           taken,
           directory,
         )
-        if (directory) {
-          const handle = await directory.getFileHandle(name, { create: true })
-          await writeBlobToHandle(handle, encoded.blob)
-        } else {
-          downloadBlob(encoded.blob, name)
+        const saved = await exportItem(
+          item,
+          directory
+            ? { kind: 'file', handle: await directory.getFileHandle(name, { create: true }) }
+            : { kind: 'download', name },
+        )
+        if (!directory) {
           // 连续触发下载太快时浏览器会丢掉一部分，留一点间隔。
           await delay(DOWNLOAD_GAP_MS)
         }
         count += 1
         totalBefore += item.originalSize
-        totalAfter += encoded.blob.size
-        unmetTarget += encoded.fits ? 0 : 1
-        last = { width: encoded.width, height: encoded.height }
+        totalAfter += saved.size
+        unmetTarget += saved.fits ? 0 : 1
+        last = { width: saved.width, height: saved.height }
       } catch (error) {
+        if (error instanceof PngCanceledError) {
+          break
+        }
         console.error('批量导出失败', item.name, error)
         failed.push(item.name)
       }
@@ -541,6 +641,7 @@ watch(
     }
     if (open && !dialog.open) {
       scope.value = 'current'
+      isComparing.value = false
       saveError.value = ''
       dialog.showModal()
       await nextTick()
@@ -602,7 +703,7 @@ onBeforeUnmount(clearPreview)
         </header>
 
         <div class="export-body">
-          <section class="export-preview" aria-label="导出效果对比">
+          <section class="export-preview" aria-label="导出效果预览">
             <CompareView
               :before="previewSource"
               :after="currentResult?.bitmap ?? null"
@@ -611,7 +712,33 @@ onBeforeUnmount(clearPreview)
               :before-label="beforeLabel"
               :after-label="afterLabel"
               :busy="isPreviewing"
-            />
+              :comparing="isComparing"
+            >
+              <template #actions>
+                <div class="segmented" role="group" aria-label="预览方式">
+                  <button
+                    type="button"
+                    class="segment"
+                    :class="{ 'is-active': !isComparing }"
+                    :aria-pressed="!isComparing"
+                    title="只看导出后的样子"
+                    @click="isComparing = false"
+                  >
+                    导出效果
+                  </button>
+                  <button
+                    type="button"
+                    class="segment"
+                    :class="{ 'is-active': isComparing }"
+                    :aria-pressed="isComparing"
+                    title="左边未压缩、右边导出结果，拖中线对比"
+                    @click="isComparing = true"
+                  >
+                    前后对比
+                  </button>
+                </div>
+              </template>
+            </CompareView>
           </section>
 
           <section class="export-settings" aria-label="导出设置">
@@ -807,7 +934,8 @@ onBeforeUnmount(clearPreview)
               <div>
                 <dt>文件大小</dt>
                 <dd>
-                  <template v-if="currentResult">
+                  <template v-if="currentResult?.approximate">保存时计算</template>
+                  <template v-else-if="currentResult">
                     {{ formatFileSize(currentResult.blob.size) }}
                     <span v-if="previewItem && previewItem.originalSize > 0" class="export-result__sub">
                       原图 {{ formatFileSize(previewItem.originalSize) }}<template v-if="sizeChange !== null">
@@ -823,6 +951,9 @@ onBeforeUnmount(clearPreview)
               </div>
             </dl>
 
+            <p v-if="isStripExport" class="export-note">
+              图片超出浏览器画布的上限，会按行分块编码成 PNG，边编码边写入文件；左边预览是缩小版，文件大小保存时才知道。保存中可点「取消」停止。
+            </p>
             <p v-if="detailHint" class="export-note export-note--accent">{{ detailHint }}</p>
             <p v-if="isBatch" class="export-note">
               按同样的设置逐张导出全部 {{ items.length }} 张，文件名沿用原名并换成 .{{ format.extension }}；预览显示的是当前这张。

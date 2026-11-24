@@ -1,5 +1,5 @@
 export interface SaveWritable {
-  write(data: Blob): Promise<void>
+  write(data: Blob | Uint8Array): Promise<void>
   close(): Promise<void>
   abort?(): Promise<void>
 }

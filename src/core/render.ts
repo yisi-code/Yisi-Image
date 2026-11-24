@@ -1,16 +1,27 @@
 import { drawAnnotations } from './annotations'
 import type { DrawAnnotationsOptions } from './annotations'
 import { getImageSource } from './image'
+import { transformOf } from './imageTransform'
 import { getPreviewFit } from './preview'
 import type { PreviewOffset } from './preview'
 import { DEFAULT_BACKGROUND, TRANSPARENT_BACKGROUND } from './background'
 import type { StitchBackground } from './background'
 import type { StitchImage, StitchLayout } from './types'
 
+/** 输出图（已按 scale 缩放后）里的一块，单位是输出像素。 */
+export interface OutputRegion {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
 export interface RenderOptions {
   scale?: number
   /** 画布底色；null 不填充，保留透明 */
   background?: string | null
+  /** 只画输出图里的这一块（分块导出超大图时用）；不给时画整张 */
+  region?: OutputRegion
 }
 
 export interface ViewportRenderOptions {
@@ -53,6 +64,21 @@ export function getCheckerPattern(context: CanvasRenderingContext2D): CanvasPatt
   return context.createPattern(checkerTile, 'repeat') ?? CHECKER_LIGHT
 }
 
+/** 绘制源的实际像素尺寸：清晰化结果画布可能是原图的 2 倍、4 倍。 */
+function sourcePixelSize(source: CanvasImageSource, fallback: { width: number; height: number }) {
+  if (source instanceof HTMLImageElement) {
+    return { width: source.naturalWidth || fallback.width, height: source.naturalHeight || fallback.height }
+  }
+  if (source instanceof HTMLCanvasElement || source instanceof ImageBitmap) {
+    return { width: source.width, height: source.height }
+  }
+  return fallback
+}
+
+/**
+ * 画一张图到 (x, y, width, height)：按变换只取裁剪区域，标注与修瑕在原图坐标里，
+ * 跟着同样的裁剪与缩放画上去；裁剪过时把区域外的标注裁掉。
+ */
 function paintStitchImage(
   context: CanvasRenderingContext2D,
   image: StitchImage,
@@ -64,13 +90,28 @@ function paintStitchImage(
   /** 只画原图：不用清晰化结果，也不画标注和修瑕，供前后对比的左半边使用 */
   original = false,
 ): void {
+  const { crop } = transformOf(image)
+  const isCropped = crop.x !== 0 || crop.y !== 0 || crop.width !== image.width || crop.height !== image.height
   if (image.kind === 'blank') {
     context.fillStyle = image.backgroundColor ?? '#ffffff'
     context.fillRect(x, y, width, height)
   } else {
     const source = original ? image.element : getImageSource(image)
     if (source) {
-      context.drawImage(source, x, y, width, height)
+      const pixels = sourcePixelSize(source, image)
+      const kx = pixels.width / image.width
+      const ky = pixels.height / image.height
+      context.drawImage(
+        source,
+        crop.x * kx,
+        crop.y * ky,
+        crop.width * kx,
+        crop.height * ky,
+        x,
+        y,
+        width,
+        height,
+      )
     }
   }
   if (original) {
@@ -78,8 +119,14 @@ function paintStitchImage(
   }
 
   context.save()
+  if (isCropped) {
+    context.beginPath()
+    context.rect(x, y, width, height)
+    context.clip()
+  }
   context.translate(x, y)
-  context.scale(width / image.width, height / image.height)
+  context.scale(width / crop.width, height / crop.height)
+  context.translate(-crop.x, -crop.y)
   drawAnnotations(context, image, annotationOptions)
   context.restore()
 }
@@ -92,8 +139,9 @@ export function renderStitch(
 ): HTMLCanvasElement {
   const scale = options.scale ?? 1
   const background = options.background === undefined ? DEFAULT_BACKGROUND : options.background
-  const width = Math.max(1, Math.round(layout.width * scale))
-  const height = Math.max(1, Math.round(layout.height * scale))
+  const region = options.region
+  const width = Math.max(1, region ? region.width : Math.round(layout.width * scale))
+  const height = Math.max(1, region ? region.height : Math.round(layout.height * scale))
 
   target.width = width
   target.height = height
@@ -109,8 +157,8 @@ export function renderStitch(
     context.fillRect(0, 0, width, height)
   }
 
-  if (scale !== 1) {
-    context.setTransform(scale, 0, 0, scale, 0, 0)
+  if (scale !== 1 || region) {
+    context.setTransform(scale, 0, 0, scale, -(region?.x ?? 0), -(region?.y ?? 0))
   }
 
   context.imageSmoothingEnabled = true
@@ -194,6 +242,10 @@ export function renderStitchView(
   context.restore()
 
   context.save()
+  // 整张图裁剪过时，部分图片会落在内容框外，只画框内的部分。
+  context.beginPath()
+  context.rect(left, top, contentWidth, contentHeight)
+  context.clip()
   context.translate(left, top)
   context.scale(contentWidth / layout.width, contentHeight / layout.height)
   context.imageSmoothingEnabled = true
@@ -222,6 +274,9 @@ export function renderStitchView(
     context.fillStyle =
       background === TRANSPARENT_BACKGROUND ? getCheckerPattern(context) : background
     context.fillRect(left, top, contentWidth, contentHeight)
+    context.beginPath()
+    context.rect(left, top, contentWidth, contentHeight)
+    context.clip()
     context.translate(left, top)
     context.scale(contentWidth / layout.width, contentHeight / layout.height)
     context.imageSmoothingEnabled = true

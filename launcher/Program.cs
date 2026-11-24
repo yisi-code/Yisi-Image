@@ -944,6 +944,11 @@ namespace Yisi.ImageTool
                     ModelStore.OpenInExplorer();
                     json = "{\"ok\":true}";
                 }
+                else if (path == "/api/models/reveal")
+                {
+                    ModelStore.RevealModelFile(ReadStringField(request.Body, "id"));
+                    json = "{\"ok\":true}";
+                }
                 else if (path == "/api/models/custom/import")
                 {
                     Func<string, string> picker = PickFileRequested;

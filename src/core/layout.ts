@@ -1,11 +1,20 @@
+import type { ExportFormat } from './exportFormats'
 import type { LayoutItem, StitchDirection, StitchImage, StitchLayout } from './types'
 
 export const MIN_GAP = 0
 export const MAX_GAP = 200
 export const DEFAULT_GAP = 24
 
-export const MAX_EXPORT_SIDE = 16_384
-export const MAX_EXPORT_AREA = 100_000_000
+/** 一张画布直接画、直接编码的安全尺寸；超过时 PNG 改为分块编码，JPG / WebP 用浏览器硬上限。 */
+export const CANVAS_SAFE_SIDE = 16_384
+export const CANVAS_SAFE_AREA = 100_000_000
+/** Chromium 画布的硬上限：单边 32,767 px、面积 2^28 像素 */
+export const CANVAS_MAX_SIDE = 32_767
+export const CANVAS_MAX_AREA = 268_435_456
+/** WebP 格式本身单边最多 16,383 px */
+export const WEBP_MAX_SIDE = 16_383
+/** PNG 规范的单边上限（2^31 − 1） */
+export const PNG_MAX_SIDE = 2_147_483_647
 export const LARGE_OUTPUT_AREA = 60_000_000
 
 export type LayoutSource = Pick<StitchImage, 'id' | 'width' | 'height'>
@@ -14,6 +23,8 @@ export interface OutputSizeCheck {
   ok: boolean
   isLarge: boolean
   reason: string
+  /** canvas：整张画布编码；strips：PNG 按行带分块编码，不受画布上限 */
+  mode: 'canvas' | 'strips'
 }
 
 export function clampGap(value: number): number {
@@ -95,36 +106,51 @@ export function calculateStitchLayout(
   }
 }
 
-export function inspectOutputSize(width: number, height: number): OutputSizeCheck {
+/**
+ * 这个尺寸能不能导出、怎么导出。不给格式时按 PNG（最宽松）判断，用于拼接工作区的状态提示。
+ * - 画布安全范围内：整张画布编码；
+ * - PNG 超出：按行带分块编码，只受 PNG 规范限制；
+ * - JPG 超出画布硬上限、WebP 超出格式上限：不能导出，提示改用 PNG。
+ */
+export function inspectOutputSize(
+  width: number,
+  height: number,
+  format: ExportFormat = 'png',
+): OutputSizeCheck {
   if (width <= 0 || height <= 0) {
-    return {
-      ok: false,
-      isLarge: false,
-      reason: '还没有可导出的图片',
-    }
+    return { ok: false, isLarge: false, reason: '还没有可导出的图片', mode: 'canvas' }
   }
-
-  if (width > MAX_EXPORT_SIDE || height > MAX_EXPORT_SIDE) {
-    const side = width > MAX_EXPORT_SIDE ? `宽 ${width} px` : `高 ${height} px`
-    return {
-      ok: false,
-      isLarge: false,
-      reason: `拼接后${side}，超过浏览器单边 ${MAX_EXPORT_SIDE} px 的导出上限`,
-    }
-  }
-
   const area = width * height
-  if (area > MAX_EXPORT_AREA) {
+  const label = format === 'webp' ? 'WebP' : 'JPG'
+  const maxSide = format === 'webp' ? WEBP_MAX_SIDE : CANVAS_MAX_SIDE
+  // WebP 的格式上限（16,383）比画布安全档还小一点，先判断。
+  const overFormatSide = format !== 'png' && (width > maxSide || height > maxSide)
+  const withinSafe = width <= CANVAS_SAFE_SIDE && height <= CANVAS_SAFE_SIDE && area <= CANVAS_SAFE_AREA
+  if (withinSafe && !overFormatSide) {
+    return { ok: true, isLarge: area >= LARGE_OUTPUT_AREA, reason: '', mode: 'canvas' }
+  }
+  if (format === 'png') {
+    if (width > PNG_MAX_SIDE || height > PNG_MAX_SIDE) {
+      return { ok: false, isLarge: true, reason: '超过 PNG 格式的尺寸上限', mode: 'strips' }
+    }
+    return { ok: true, isLarge: true, reason: '', mode: 'strips' }
+  }
+  if (overFormatSide) {
+    const side = width > maxSide ? `宽 ${width} px` : `高 ${height} px`
     return {
       ok: false,
       isLarge: true,
-      reason: `拼接后约 ${Math.round(area / 1_000_000)} 百万像素，超过浏览器可稳定导出的 1 亿像素上限`,
+      reason: `${side}，超过 ${label} 单边 ${maxSide.toLocaleString('en-US')} px 的上限；改用 PNG 可以导出`,
+      mode: 'canvas',
     }
   }
-
-  return {
-    ok: true,
-    isLarge: area >= LARGE_OUTPUT_AREA,
-    reason: '',
+  if (area > CANVAS_MAX_AREA) {
+    return {
+      ok: false,
+      isLarge: true,
+      reason: `约 ${Math.round(area / 1_000_000)} 百万像素，超过 ${label} 可导出的 ${Math.round(CANVAS_MAX_AREA / 1_000_000)} 百万像素；改用 PNG 可以导出`,
+      mode: 'canvas',
+    }
   }
+  return { ok: true, isLarge: true, reason: '', mode: 'canvas' }
 }

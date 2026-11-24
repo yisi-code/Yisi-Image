@@ -6,6 +6,7 @@ import {
   ChevronsRight,
   ChevronsUp,
   Columns2,
+  Crop,
   Eraser,
   FilePlus2,
   GripVertical,
@@ -17,6 +18,7 @@ import {
   Paintbrush,
   Plus,
   Redo2,
+  RotateCcw,
   Sparkles,
   Type,
   Undo2,
@@ -53,6 +55,23 @@ import { createHealPatch, prepareHealJob } from '../core/heal'
 import { runHeal } from '../core/healEngine'
 import type { HealEngineChoice } from '../core/healEngine'
 import { formatDimensions } from '../core/image'
+import {
+  RESIZE_HANDLES,
+  applyCrop,
+  cropByHandle,
+  displayScale,
+  displayToSource,
+  identityTransform,
+  moveCrop,
+  normalizeTransform,
+  resizeByHandle,
+  resizeByInput,
+  scalePercent,
+  sourceToDisplay,
+  transformOf,
+  uncroppedPreview,
+} from '../core/imageTransform'
+import type { ContentTransform, Rect, ResizeHandle } from '../core/imageTransform'
 import {
   clampPreviewOffset,
   getFocusOffset,
@@ -110,6 +129,10 @@ const props = defineProps<{
   aiModelKey: string
   /** 这次修瑕用经典算法还是 AI 模型（由 App 按设置与模型下载状态算出） */
   healEngine: HealEngineChoice
+  /** 整张拼接图的缩放与裁剪（布局 layout 已按它换算好）；单图编辑或原样时为 null */
+  frame?: ContentTransform | null
+  /** 拼接布局原本的尺寸（整张调整的「原图」）；单图编辑时为 null */
+  baseSize?: { width: number; height: number } | null
 }>()
 
 const emit = defineEmits<{
@@ -117,6 +140,10 @@ const emit = defineEmits<{
   add: [files: File[]]
   'active-change': [id: string | null]
   'resize-blank': [id: string, width: number, height: number]
+  /** 调整工具改了一张图的缩放 / 裁剪；null 表示还原 */
+  'set-transform': [id: string, transform: ContentTransform | null]
+  /** 调整工具改了整张拼接图的缩放 / 裁剪；null 表示还原 */
+  'set-frame': [transform: ContentTransform | null]
   'update-panel': [key: PanelKey, state: PanelState]
   'heal-failed': [message: string]
   /** 修瑕成功但需要告诉用户的说明，例如 AI 模型不可用、这次改用了经典算法 */
@@ -195,6 +222,30 @@ let textDragState: {
   startY: number
   originX: number
   originY: number
+  /** 屏幕像素 / 原图像素（两个方向，图片拉伸过时不同） */
+  scaleX: number
+  scaleY: number
+} | null = null
+/** 调整工具：拖手柄与输入宽高时是否保持比例 */
+const adjustKeepRatio = ref(true)
+/** 正在裁剪：original 是进入裁剪前的变换（取消时恢复），crop 是裁剪框（原图像素） */
+const cropDraft = ref<{
+  kind: AdjustKind
+  targetId: string
+  original: ContentTransform | null
+  crop: Rect
+} | null>(null)
+/** 拼接时调整的对象：选中的那张，或整张拼接图 */
+const adjustScope = ref<AdjustKind>('image')
+/** 拖动调整手柄或裁剪框 */
+let adjustDrag: {
+  pointerId: number
+  target: ResizeHandle | 'move'
+  startX: number
+  startY: number
+  start: ContentTransform
+  startCrop: Rect | null
+  /** 布局像素 → 屏幕像素 */
   scale: number
 } | null = null
 let resizeState: {
@@ -225,6 +276,21 @@ let panState: {
   originY: number
 } | null = null
 
+type AdjustKind = 'image' | 'whole'
+
+/** 调整工具作用的对象：一张图（原图尺寸 + 它的变换）或整张拼接图（布局尺寸 + 整张变换） */
+interface AdjustSubject {
+  kind: AdjustKind
+  id: string
+  size: { width: number; height: number }
+  transform: ContentTransform
+  /** 原样之外有没有调整过 */
+  isTransformed: boolean
+  image: StitchImage | null
+}
+
+const WHOLE_ID = '__whole__'
+
 interface HistoryEntry {
   imageId: string
   before: StitchAnnotation[]
@@ -246,6 +312,7 @@ const ANNOTATION_TOOLS: AnnotationToolOption[] = [
   { value: 'brush', name: '画笔', tip: '画笔', icon: Paintbrush },
   { value: 'eraser', name: '橡皮擦', tip: '橡皮擦（只擦标注，不改原图）', icon: Eraser },
   { value: 'heal', name: '局部修瑕', tip: '局部修瑕（涂抹要去掉的物体，按周围画面补全）', icon: Wand2 },
+  { value: 'adjust', name: '调整', tip: '调整（拖手柄缩放，或裁剪、还原；原图不变）', icon: Crop },
 ]
 
 const MIN_ZOOM = 0.5
@@ -291,6 +358,99 @@ const activeImage = computed(
 const sharpenTarget = computed<StitchImage | null>(() =>
   props.singleImage ? (props.images[0] ?? null) : activeImage.value,
 )
+/** 调整工具作用的图片：单图编辑是当前这张，拼接是选中的那张；空白页有自己的尺寸面板，不在这里调整 */
+const adjustImage = computed<StitchImage | null>(() => {
+  const target = annotationTool.value === 'adjust' ? sharpenTarget.value : null
+  return target?.kind === 'image' ? target : null
+})
+const adjustSubject = computed<AdjustSubject | null>(() => {
+  if (annotationTool.value !== 'adjust') {
+    return null
+  }
+  if (!props.singleImage && adjustScope.value === 'whole') {
+    const size = props.baseSize
+    if (!size || size.width <= 0 || size.height <= 0) {
+      return null
+    }
+    return {
+      kind: 'whole',
+      id: WHOLE_ID,
+      size,
+      transform: props.frame ?? identityTransform(size),
+      isTransformed: Boolean(props.frame),
+      image: null,
+    }
+  }
+  const image = adjustImage.value
+  return image
+    ? {
+        kind: 'image',
+        id: image.id,
+        size: { width: image.width, height: image.height },
+        transform: transformOf(image),
+        isTransformed: Boolean(image.transform),
+        image,
+      }
+    : null
+})
+/** 整个内容（整张拼接图）在视口里的框 */
+function contentViewportRect(): Rect | null {
+  const viewport = viewportRef.value
+  if (!viewport || displaySize.value.width <= 0) {
+    return null
+  }
+  const width = displaySize.value.width * zoom.value
+  const height = displaySize.value.height * zoom.value
+  return {
+    x: (viewport.clientWidth - width) / 2 + offset.value.x,
+    y: (viewport.clientHeight - height) / 2 + offset.value.y,
+    width,
+    height,
+  }
+}
+const adjustRect = computed(() => {
+  const subject = adjustSubject.value
+  if (!subject) {
+    return null
+  }
+  return subject.kind === 'whole' ? contentViewportRect() : itemViewportRect(subject.id)
+})
+const adjustBoxStyle = computed(() => (adjustRect.value ? rectStyle(adjustRect.value) : null))
+/** 裁剪框相对选框的位置（像素） */
+const cropFrameStyle = computed<Record<string, string> | null>(() => {
+  const draft = cropDraft.value
+  const subject = adjustSubject.value
+  const box = adjustRect.value
+  if (!draft || !subject || !box || draft.targetId !== subject.id) {
+    return null
+  }
+  const transform = subject.transform
+  // 选框像素 / 显示像素（整张图缩放过时，单张图在选框里还要再乘这一层）
+  const scaleX = box.width / transform.width
+  const scaleY = box.height / transform.height
+  const origin = sourceToDisplay(transform, { x: draft.crop.x, y: draft.crop.y })
+  const factor = displayScale(transform)
+  return rectStyle({
+    x: origin.x * scaleX,
+    y: origin.y * scaleY,
+    width: draft.crop.width * factor.x * scaleX,
+    height: draft.crop.height * factor.y * scaleY,
+  })
+})
+const adjustInfo = computed(() => {
+  const subject = adjustSubject.value
+  if (!subject) {
+    return null
+  }
+  const { transform } = subject
+  return {
+    width: transform.width,
+    height: transform.height,
+    percent: scalePercent(transform),
+    isTransformed: subject.isTransformed,
+  }
+})
+
 const sharpenDisabledReason = computed(() => {
   const target = sharpenTarget.value
   if (!target) {
@@ -389,30 +549,10 @@ const imageToScreen = computed(() => {
   return (displaySize.value.width / props.layout.width) * zoom.value
 })
 
-const blankSelectionStyle = computed<Record<string, string> | null>(() => {
-  const image = activeBlank.value
-  const item = activeItem.value
+/** 一张图在视口里占的框（视口内像素）；选框、手柄、裁剪框都按它定位。 */
+function itemViewportRect(id: string | null | undefined): Rect | null {
   const viewport = viewportRef.value
-  if (!image || !item || !viewport) {
-    return null
-  }
-  const scale = imageToScreen.value
-  const contentWidth = displaySize.value.width * zoom.value
-  const contentHeight = displaySize.value.height * zoom.value
-  const left = (viewport.clientWidth - contentWidth) / 2 + offset.value.x + item.x * scale
-  const top = (viewport.clientHeight - contentHeight) / 2 + offset.value.y + item.y * scale
-  return {
-    left: `${left}px`,
-    top: `${top}px`,
-    width: `${item.width * scale}px`,
-    height: `${item.height * scale}px`,
-  }
-})
-
-/** 图片本地坐标 → 视口内坐标。 */
-function toViewport(imageId: string, x: number, y: number): { x: number; y: number } | null {
-  const viewport = viewportRef.value
-  const item = props.layout.items.find((candidate) => candidate.id === imageId)
+  const item = id ? props.layout.items.find((candidate) => candidate.id === id) : null
   if (!viewport || !item) {
     return null
   }
@@ -420,9 +560,50 @@ function toViewport(imageId: string, x: number, y: number): { x: number; y: numb
   const contentWidth = displaySize.value.width * zoom.value
   const contentHeight = displaySize.value.height * zoom.value
   return {
-    x: (viewport.clientWidth - contentWidth) / 2 + offset.value.x + (item.x + x) * scale,
-    y: (viewport.clientHeight - contentHeight) / 2 + offset.value.y + (item.y + y) * scale,
+    x: (viewport.clientWidth - contentWidth) / 2 + offset.value.x + item.x * scale,
+    y: (viewport.clientHeight - contentHeight) / 2 + offset.value.y + item.y * scale,
+    width: item.width * scale,
+    height: item.height * scale,
   }
+}
+
+function rectStyle(rect: Rect): Record<string, string> {
+  return {
+    left: `${rect.x}px`,
+    top: `${rect.y}px`,
+    width: `${rect.width}px`,
+    height: `${rect.height}px`,
+  }
+}
+
+const blankSelectionStyle = computed<Record<string, string> | null>(() => {
+  const rect = activeBlank.value ? itemViewportRect(activeItem.value?.id) : null
+  return rect ? rectStyle(rect) : null
+})
+
+/** 原图坐标 → 视口内坐标（按这张图的缩放与裁剪换算）。 */
+function toViewport(imageId: string, x: number, y: number): { x: number; y: number } | null {
+  const rect = itemViewportRect(imageId)
+  const image = findImage(imageId)
+  if (!rect || !image) {
+    return null
+  }
+  const transform = transformOf(image)
+  const local = sourceToDisplay(transform, { x, y })
+  return {
+    x: rect.x + (local.x * rect.width) / transform.width,
+    y: rect.y + (local.y * rect.height) / transform.height,
+  }
+}
+
+/** 布局像素 / 图片显示像素：整张拼接图缩放过时不是 1。 */
+function itemFactor(image: StitchImage | null): { x: number; y: number } {
+  const item = image ? props.layout.items.find((candidate) => candidate.id === image.id) : null
+  if (!image || !item) {
+    return { x: 1, y: 1 }
+  }
+  const transform = transformOf(image)
+  return { x: item.width / transform.width, y: item.height / transform.height }
 }
 
 /** 输入框直接按最终字号、颜色画在文字位置上，输入即所见；拖动手柄在左侧，确认 / 取消在右侧。 */
@@ -436,7 +617,13 @@ const textEditorLayout = computed(() => {
   if (!origin) {
     return null
   }
-  const fontPx = Math.max(6, draft.fontSize * imageToScreen.value)
+  const draftImage = findImage(draft.imageId)
+  const fontPx = Math.max(
+    6,
+    draft.fontSize *
+      imageToScreen.value *
+      (draftImage ? displayScale(transformOf(draftImage)).y * itemFactor(draftImage).y : 1),
+  )
   const sample = draft.value || '输入文字'
   const width = Math.max(fontPx * 2, measureText(sample, fontPx) + fontPx * 0.4)
   return {
@@ -493,9 +680,26 @@ function pointForItem(
   const top = (viewport.clientHeight - contentHeight) / 2 + offset.value.y
   const localX = (event.clientX - rect.left - left) / scale
   const localY = (event.clientY - rect.top - top) / scale
+  const image = findImage(item.id)
+  return toSourcePoint(image, item, localX - item.x, localY - item.y)
+}
+
+/** 图片框内的显示坐标 → 原图坐标（标注、修瑕都记在原图坐标里），限制在原图范围内。 */
+function toSourcePoint(
+  image: StitchImage | null,
+  item: StitchLayout['items'][number],
+  x: number,
+  y: number,
+): AnnotationPoint {
+  const local = { x: Math.max(0, Math.min(item.width, x)), y: Math.max(0, Math.min(item.height, y)) }
+  if (!image) {
+    return local
+  }
+  const factor = itemFactor(image)
+  const source = displayToSource(transformOf(image), { x: local.x / factor.x, y: local.y / factor.y })
   return {
-    x: Math.max(0, Math.min(item.width, localX - item.x)),
-    y: Math.max(0, Math.min(item.height, localY - item.y)),
+    x: Math.max(0, Math.min(image.width, source.x)),
+    y: Math.max(0, Math.min(image.height, source.y)),
   }
 }
 
@@ -534,10 +738,7 @@ function imageAtEvent(event: PointerEvent | MouseEvent): {
       return {
         image,
         item,
-        point: {
-          x: Math.max(0, Math.min(item.width, layoutX - item.x)),
-          y: Math.max(0, Math.min(item.height, layoutY - item.y)),
-        },
+        point: toSourcePoint(image, item, layoutX - item.x, layoutY - item.y),
         screenX: event.clientX - rect.left,
         screenY: event.clientY - rect.top,
       }
@@ -693,7 +894,7 @@ function openTextEditor(event: PointerEvent): void {
     editingId: null,
     x: hit.point.x,
     y: hit.point.y,
-    fontSize: Math.max(16, Math.round(24 / annotationScale())),
+    fontSize: Math.max(16, Math.round(24 / annotationScale(hit.image))),
     value: '',
   }
   focusTextInput()
@@ -717,13 +918,17 @@ function startTextDrag(event: PointerEvent): void {
   if (handle instanceof HTMLElement) {
     handle.setPointerCapture(event.pointerId)
   }
+  const draftImage = findImage(draft.imageId)
+  const imageScale = draftImage ? displayScale(transformOf(draftImage)) : { x: 1, y: 1 }
+  const factor = itemFactor(draftImage)
   textDragState = {
     pointerId: event.pointerId,
     startX: event.clientX,
     startY: event.clientY,
     originX: draft.x,
     originY: draft.y,
-    scale: Math.max(0.0001, imageToScreen.value),
+    scaleX: Math.max(0.0001, imageToScreen.value * imageScale.x * factor.x),
+    scaleY: Math.max(0.0001, imageToScreen.value * imageScale.y * factor.y),
   }
 }
 
@@ -732,11 +937,11 @@ function moveTextDrag(event: PointerEvent): void {
   if (!draft || !textDragState || event.pointerId !== textDragState.pointerId) {
     return
   }
-  const item = props.layout.items.find((candidate) => candidate.id === draft.imageId)
-  const maxX = item ? item.width - 1 : Infinity
-  const maxY = item ? item.height - 1 : Infinity
-  draft.x = Math.min(maxX, Math.max(0, textDragState.originX + (event.clientX - textDragState.startX) / textDragState.scale))
-  draft.y = Math.min(maxY, Math.max(0, textDragState.originY + (event.clientY - textDragState.startY) / textDragState.scale))
+  const image = findImage(draft.imageId)
+  const maxX = image ? image.width - 1 : Infinity
+  const maxY = image ? image.height - 1 : Infinity
+  draft.x = Math.min(maxX, Math.max(0, textDragState.originX + (event.clientX - textDragState.startX) / textDragState.scaleX))
+  draft.y = Math.min(maxY, Math.max(0, textDragState.originY + (event.clientY - textDragState.startY) / textDragState.scaleY))
 }
 
 function endTextDrag(event: PointerEvent): void {
@@ -751,11 +956,18 @@ function endTextDrag(event: PointerEvent): void {
   focusTextInput()
 }
 
-function annotationScale(): number {
+/** 屏幕像素 / 原图像素：给了图片时再乘上它的缩放（拉伸时取两个方向的几何平均）。 */
+function annotationScale(image?: StitchImage | null): number {
   if (!viewportRef.value || props.layout.width <= 0 || displaySize.value.width <= 0) {
     return 1
   }
-  return (displaySize.value.width / props.layout.width) * zoom.value
+  const layoutScale = (displaySize.value.width / props.layout.width) * zoom.value
+  if (!image) {
+    return layoutScale
+  }
+  const scale = displayScale(transformOf(image))
+  const factor = itemFactor(image)
+  return layoutScale * Math.sqrt(scale.x * factor.x * scale.y * factor.y)
 }
 
 /** 确认文字：新建就追加；修改就原位替换（保持图层顺序）；改成空就删除。都记入撤销历史。 */
@@ -844,7 +1056,7 @@ function beginDrawing(event: PointerEvent): void {
     return
   }
 
-  const width = getToolDiameter(annotationTool.value, annotationWidth.value, annotationScale())
+  const width = getToolDiameter(annotationTool.value, annotationWidth.value, annotationScale(hit.image))
   const stroke: StrokeAnnotation = {
     id: createAnnotationId(),
     type: annotationTool.value === 'heal' ? 'heal' : 'brush',
@@ -864,7 +1076,7 @@ function applyEraser(point: AnnotationPoint): void {
   const next = eraseAnnotationsAt(
     drawingImage.annotations,
     point,
-    getToolDiameter('eraser', annotationWidth.value, annotationScale()) / 2,
+    getToolDiameter('eraser', annotationWidth.value, annotationScale(drawingImage)) / 2,
   )
   if (next.length !== drawingImage.annotations.length) {
     drawingImage.annotations = next
@@ -1008,6 +1220,12 @@ function swapHealFill(): void {
  * 同一帧内多次改尺寸只记第一次，保证按「改之前」计算。
  */
 function requestBlankResize(id: string, width: number, height: number): void {
+  keepScaleBeforeResize()
+  emit('resize-blank', id, width, height)
+}
+
+/** 改布局尺寸前记下屏幕比例与平移，下一帧按它调整，其他图片在屏幕上不跳。 */
+function keepScaleBeforeResize(): void {
   isHoldingActiveImage = true
   if (!pendingScaleKeep && displaySize.value.width > 0) {
     pendingScaleKeep = {
@@ -1016,7 +1234,188 @@ function requestBlankResize(id: string, width: number, height: number): void {
       size: { width: props.layout.width, height: props.layout.height },
     }
   }
-  emit('resize-blank', id, width, height)
+}
+
+/** 调整工具改缩放 / 裁剪的唯一入口：一张图交给 set-transform，整张交给 set-frame；等于原样时按还原处理。 */
+function requestTransform(kind: AdjustKind, id: string, transform: ContentTransform | null): void {
+  keepScaleBeforeResize()
+  if (kind === 'whole') {
+    emit('set-frame', transform)
+    return
+  }
+  const image = findImage(id)
+  if (image) {
+    emit('set-transform', image.id, transform ? normalizeTransform(image, transform) : null)
+  }
+}
+
+function subjectSize(kind: AdjustKind, id: string): { width: number; height: number } | null {
+  if (kind === 'whole') {
+    return props.baseSize ?? null
+  }
+  const image = findImage(id)
+  return image ? { width: image.width, height: image.height } : null
+}
+
+function startAdjustDrag(target: ResizeHandle | 'move', event: PointerEvent): void {
+  const subject = adjustSubject.value
+  const box = adjustRect.value
+  if (!subject || !box || event.button !== 0 || isHealing.value) {
+    return
+  }
+  event.preventDefault()
+  event.stopPropagation()
+  const element = event.currentTarget
+  if (element instanceof HTMLElement) {
+    element.setPointerCapture(event.pointerId)
+  }
+  adjustDrag = {
+    pointerId: event.pointerId,
+    target,
+    startX: event.clientX,
+    startY: event.clientY,
+    start: subject.transform,
+    startCrop: cropDraft.value ? { ...cropDraft.value.crop } : null,
+    // 屏幕像素 / 显示像素
+    scale: Math.max(0.0001, box.width / subject.transform.width),
+  }
+}
+
+function moveAdjustDrag(event: PointerEvent): void {
+  const drag = adjustDrag
+  const subject = adjustSubject.value
+  if (!drag || !subject || drag.pointerId !== event.pointerId) {
+    return
+  }
+  const dxDisplay = (event.clientX - drag.startX) / drag.scale
+  const dyDisplay = (event.clientY - drag.startY) / drag.scale
+  const draft = cropDraft.value
+  if (draft && drag.startCrop) {
+    const scale = displayScale(drag.start)
+    const dx = dxDisplay / scale.x
+    const dy = dyDisplay / scale.y
+    const crop =
+      drag.target === 'move'
+        ? moveCrop(drag.startCrop, dx, dy, subject.size)
+        : cropByHandle(drag.startCrop, drag.target, dx, dy, subject.size, adjustKeepRatio.value)
+    cropDraft.value = { ...draft, crop }
+    return
+  }
+  if (drag.target === 'move') {
+    return
+  }
+  // 居中排列的方向上会向两侧同时变，按 2 倍换算，手柄才跟得上指针（同空白页）；整张图在视口里两个方向都居中。
+  const widthFactor = subject.kind === 'whole' || props.layout.direction === 'vertical' ? 2 : 1
+  const heightFactor = subject.kind === 'whole' || props.layout.direction === 'horizontal' ? 2 : 1
+  const size = resizeByHandle(
+    { width: drag.start.width, height: drag.start.height },
+    drag.target,
+    dxDisplay * widthFactor,
+    dyDisplay * heightFactor,
+    adjustKeepRatio.value,
+  )
+  requestTransform(subject.kind, subject.id, { ...drag.start, width: size.width, height: size.height })
+}
+
+function endAdjustDrag(event: PointerEvent): void {
+  if (!adjustDrag || adjustDrag.pointerId !== event.pointerId) {
+    return
+  }
+  const element = event.currentTarget
+  if (element instanceof HTMLElement && element.hasPointerCapture(event.pointerId)) {
+    element.releasePointerCapture(event.pointerId)
+  }
+  adjustDrag = null
+}
+
+/** 输入宽、高或百分比；保持比例时另一边跟着变。 */
+function applyAdjustInput(kind: 'width' | 'height' | 'percent', event: Event): void {
+  const subject = adjustSubject.value
+  const input = event.target as HTMLInputElement
+  if (!subject) {
+    return
+  }
+  const { transform } = subject
+  const value = Number(input.value)
+  if (!Number.isFinite(value) || value <= 0) {
+    input.value = String(kind === 'percent' ? scalePercent(transform) : transform[kind])
+    return
+  }
+  const size = resizeByInput(transform, { [kind]: value }, adjustKeepRatio.value)
+  requestTransform(subject.kind, subject.id, { ...transform, ...size })
+}
+
+/** 进入裁剪：先按原比例显示整个内容，裁剪框落在原来的裁剪区域上。 */
+function startCrop(): void {
+  const subject = adjustSubject.value
+  if (!subject || cropDraft.value) {
+    return
+  }
+  const current = subject.transform
+  cropDraft.value = {
+    kind: subject.kind,
+    targetId: subject.id,
+    original: subject.isTransformed ? current : null,
+    crop: { ...current.crop },
+  }
+  requestTransform(subject.kind, subject.id, uncroppedPreview(current, subject.size))
+}
+
+function applyCropDraft(): void {
+  const draft = cropDraft.value
+  const size = draft ? subjectSize(draft.kind, draft.targetId) : null
+  cropDraft.value = null
+  if (!draft || !size) {
+    return
+  }
+  requestTransform(draft.kind, draft.targetId, applyCrop(draft.original ?? identityTransform(size), draft.crop))
+}
+
+function cancelCrop(): void {
+  const draft = cropDraft.value
+  cropDraft.value = null
+  if (draft && subjectSize(draft.kind, draft.targetId)) {
+    requestTransform(draft.kind, draft.targetId, draft.original)
+  }
+}
+
+/** 还原：去掉缩放与裁剪，标注、修瑕回到原位；之后整张回到窗口里看。 */
+function restoreTransform(): void {
+  const subject = adjustSubject.value
+  if (!subject) {
+    return
+  }
+  cropDraft.value = null
+  if (props.singleImage || subject.kind === 'whole') {
+    // 还原后的大图沿用缩放时的屏幕比例会超出窗口，改为适应窗口。
+    if (subject.kind === 'whole') {
+      emit('set-frame', null)
+    } else {
+      emit('set-transform', subject.id, null)
+    }
+    resetView()
+    return
+  }
+  requestTransform(subject.kind, subject.id, null)
+}
+
+/** 调整工具下单击图片：选中它（拼接时）。 */
+function handleAdjustClick(event: PointerEvent): void {
+  const press = selectPress
+  selectPress = null
+  if (!press || press.pointerId !== event.pointerId || cropDraft.value || adjustScope.value === 'whole') {
+    return
+  }
+  if (Math.hypot(event.clientX - press.x, event.clientY - press.y) > 4) {
+    return
+  }
+  const hit = imageAtEvent(event)
+  if (hit && hit.image.id !== activeImageId.value) {
+    activeImageId.value = hit.image.id
+    isHoldingActiveImage = true
+    emit('active-change', hit.image.id)
+    scheduleRender()
+  }
 }
 
 function updateBlankSize(axis: 'width' | 'height', event: Event): void {
@@ -1060,7 +1459,7 @@ function startBlankResize(event: PointerEvent): void {
     startY: event.clientY,
     startWidth: image.width,
     startHeight: image.height,
-    scale: imageToScreen.value,
+    scale: imageToScreen.value * itemFactor(image).x,
   }
 }
 
@@ -1294,7 +1693,7 @@ function onPointerDown(event: PointerEvent): void {
   if (event.button !== 0) {
     return
   }
-  if (annotationTool.value !== 'select') {
+  if (annotationTool.value !== 'select' && annotationTool.value !== 'adjust') {
     beginDrawing(event)
     return
   }
@@ -1377,6 +1776,8 @@ function onPointerUp(event: PointerEvent): void {
   }
   if (annotationTool.value === 'select') {
     handleSelectClick(event)
+  } else if (annotationTool.value === 'adjust') {
+    handleAdjustClick(event)
   }
   if (!panState || event.pointerId !== panState.pointerId) {
     return
@@ -1414,6 +1815,12 @@ function onViewportKeydown(event: KeyboardEvent): void {
   }
   if (event.key === 'Escape') {
     cancelText()
+    cancelCrop()
+    return
+  }
+  if (event.key === 'Enter' && cropDraft.value) {
+    event.preventDefault()
+    applyCropDraft()
     return
   }
   if (event.key === '+' || event.key === '=') {
@@ -1736,6 +2143,15 @@ watch(() => props.background, scheduleRender)
 watch([isComparing, compareSplit], scheduleRender)
 // 换了作用的图片（切换单图、拼接里选中另一张），面板里的参数跟着换成那张的。
 watch(() => sharpenTarget.value?.id ?? null, syncSharpenDraft)
+watch(
+  () => [annotationTool.value, adjustSubject.value?.id ?? null] as const,
+  () => {
+    const draft = cropDraft.value
+    if (draft && (annotationTool.value !== 'adjust' || adjustSubject.value?.id !== draft.targetId)) {
+      cancelCrop()
+    }
+  },
+)
 watch([isSharpenOpen, () => props.sharpenEngine, aiState], probeSelectedModel)
 // 换了模型、等级或目标图后，原来选的结果倍数做不到时退回能做的（默认 2 倍）。
 watch(aiAllowedResolutions, (allowed) => {
@@ -1909,47 +2325,158 @@ defineExpose({ focusImage })
           <component :is="tool.icon" :size="14" :stroke-width="1.9" />
         </button>
         <span class="annotation-separator" aria-hidden="true" />
-        <label v-tooltip="'标注颜色'" class="annotation-color">
-          <input v-model="annotationColor" type="color" aria-label="标注颜色" />
-        </label>
-        <label v-tooltip="'笔触粗细'" class="annotation-size">
+        <template v-if="annotationTool !== 'adjust'">
+          <label v-tooltip="'标注颜色'" class="annotation-color">
+            <input v-model="annotationColor" type="color" aria-label="标注颜色" />
+          </label>
+          <label v-tooltip="'笔触粗细'" class="annotation-size">
+            <input
+              v-model.number="annotationWidth"
+              type="range"
+              :min="MIN_BRUSH_WIDTH"
+              :max="MAX_BRUSH_WIDTH"
+              step="1"
+              aria-label="笔触粗细"
+              @pointerdown="startWidthAdjust"
+            />
+            <span
+              v-if="isAdjustingWidth"
+              class="annotation-size-preview"
+              aria-hidden="true"
+            >
+              <span
+                class="annotation-size-dot"
+                :style="{
+                  width: `${annotationWidth}px`,
+                  height: `${annotationWidth}px`,
+                  background: annotationColor,
+                }"
+              />
+              <span class="tnum">{{ annotationWidth }} px</span>
+            </span>
+          </label>
           <input
-            v-model.number="annotationWidth"
-            type="range"
+            v-tooltip="`笔触粗细，可输入 ${MIN_BRUSH_WIDTH}–${MAX_BRUSH_WIDTH}`"
+            class="annotation-size-input tnum"
+            type="number"
             :min="MIN_BRUSH_WIDTH"
             :max="MAX_BRUSH_WIDTH"
             step="1"
-            aria-label="笔触粗细"
-            @pointerdown="startWidthAdjust"
+            :value="annotationWidth"
+            aria-label="笔触粗细（像素）"
+            @input="onWidthInput"
+            @change="commitWidthInput"
           />
-          <span
-            v-if="isAdjustingWidth"
-            class="annotation-size-preview"
-            aria-hidden="true"
+        </template>
+        <template v-else>
+          <template v-if="!singleImage">
+            <button
+              v-tooltip="'调整选中的那张图'"
+              class="annotation-text-button"
+              :class="{ 'is-active': adjustScope === 'image' }"
+              type="button"
+              :aria-pressed="adjustScope === 'image'"
+              @click="adjustScope = 'image'"
+            >
+              单张
+            </button>
+            <button
+              v-tooltip="'调整整张拼接结果'"
+              class="annotation-text-button"
+              :class="{ 'is-active': adjustScope === 'whole' }"
+              type="button"
+              :aria-pressed="adjustScope === 'whole'"
+              @click="adjustScope = 'whole'"
+            >
+              整张
+            </button>
+            <span class="annotation-separator" aria-hidden="true" />
+          </template>
+        </template>
+        <template v-if="annotationTool === 'adjust' && !adjustSubject">
+          <span class="annotation-hint">{{ activeBlank ? '空白页用空白页面板改尺寸' : '点选一张图片' }}</span>
+        </template>
+        <template v-else-if="cropDraft">
+          <span class="annotation-hint tnum">裁剪 {{ formatDimensions(cropDraft.crop.width, cropDraft.crop.height) }}</span>
+          <label v-tooltip="'裁剪框按原来的宽高比变化'" class="annotation-check">
+            <input v-model="adjustKeepRatio" type="checkbox" />
+            保持比例
+          </label>
+          <button v-tooltip="'放弃这次裁剪（Esc）'" class="annotation-text-button" type="button" @click="cancelCrop">
+            取消
+          </button>
+          <button
+            v-tooltip="'按框里的范围裁剪（Enter）；原图不变，可随时还原'"
+            class="annotation-text-button is-primary"
+            type="button"
+            @click="applyCropDraft"
           >
-            <span
-              class="annotation-size-dot"
-              :style="{
-                width: `${annotationWidth}px`,
-                height: `${annotationWidth}px`,
-                background: annotationColor,
-              }"
+            确定裁剪
+          </button>
+        </template>
+        <template v-else-if="adjustInfo">
+          <label class="annotation-hint" for="adjust-width">宽</label>
+          <input
+            id="adjust-width"
+            v-tooltip="'显示与导出的宽度（像素）'"
+            class="annotation-size-input annotation-size-input--wide tnum"
+            type="number"
+            min="8"
+            step="1"
+            :value="adjustInfo.width"
+            @change="applyAdjustInput('width', $event)"
+          />
+          <label class="annotation-hint" for="adjust-height">高</label>
+          <input
+            id="adjust-height"
+            v-tooltip="'显示与导出的高度（像素）'"
+            class="annotation-size-input annotation-size-input--wide tnum"
+            type="number"
+            min="8"
+            step="1"
+            :value="adjustInfo.height"
+            @change="applyAdjustInput('height', $event)"
+          />
+          <template v-if="adjustKeepRatio">
+            <input
+              v-tooltip="'按百分比等比缩放（相对原图）'"
+              class="annotation-size-input annotation-size-input--wide tnum"
+              type="number"
+              min="1"
+              step="1"
+              aria-label="缩放百分比"
+              :value="adjustInfo.percent"
+              @change="applyAdjustInput('percent', $event)"
             />
-            <span class="tnum">{{ annotationWidth }} px</span>
-          </span>
-        </label>
-        <input
-          v-tooltip="`笔触粗细，可输入 ${MIN_BRUSH_WIDTH}–${MAX_BRUSH_WIDTH}`"
-          class="annotation-size-input tnum"
-          type="number"
-          :min="MIN_BRUSH_WIDTH"
-          :max="MAX_BRUSH_WIDTH"
-          step="1"
-          :value="annotationWidth"
-          aria-label="笔触粗细（像素）"
-          @input="onWidthInput"
-          @change="commitWidthInput"
-        />
+            <span class="annotation-hint">%</span>
+          </template>
+          <label
+            v-tooltip="adjustKeepRatio ? '拖任意手柄、输入宽或高都等比缩放' : '手柄和输入可分别改宽高（会变形）'"
+            class="annotation-check"
+          >
+            <input v-model="adjustKeepRatio" type="checkbox" />
+            保持比例
+          </label>
+          <button
+            v-tooltip="adjustScope === 'whole' && !singleImage ? '裁剪整张拼接图（可随时还原）' : '裁剪这张图（原图不变，可随时还原）'"
+            class="annotation-text-button"
+            type="button"
+            @click="startCrop"
+          >
+            <Crop :size="13" :stroke-width="1.9" />
+            裁剪
+          </button>
+          <button
+            v-tooltip="'去掉缩放与裁剪，标注回到原位'"
+            class="annotation-text-button"
+            type="button"
+            :disabled="!adjustInfo.isTransformed"
+            @click="restoreTransform"
+          >
+            <RotateCcw :size="13" :stroke-width="1.9" />
+            还原
+          </button>
+        </template>
         <span class="annotation-separator" aria-hidden="true" />
         <button
           v-tooltip="'撤销标注（Ctrl+Z）'"
@@ -2061,14 +2588,14 @@ defineExpose({ focusImage })
 
           <div
             v-if="activeBlank && blankSelectionStyle"
-            class="blank-selection"
+            class="stage-selection"
             :style="blankSelectionStyle"
             aria-hidden="true"
           >
-            <span class="blank-selection-label">空白页</span>
+            <span class="stage-selection__label">空白页</span>
             <button
               v-tooltip="'拖动调整空白页大小'"
-              class="blank-resize-handle"
+              class="stage-handle stage-handle--se"
               type="button"
               aria-label="拖动调整空白页大小"
               @pointerdown="startBlankResize"
@@ -2076,6 +2603,58 @@ defineExpose({ focusImage })
               @pointerup="endBlankResize"
               @pointercancel="endBlankResize"
             />
+          </div>
+
+          <div
+            v-if="adjustSubject && adjustBoxStyle"
+            class="stage-selection"
+            :style="adjustBoxStyle"
+          >
+            <span class="stage-selection__label tnum">
+              {{ cropDraft ? '裁剪' : adjustSubject.kind === 'whole' ? '整张' : '调整' }} ·
+              {{ adjustInfo ? formatDimensions(adjustInfo.width, adjustInfo.height) : '' }}
+            </span>
+            <template v-if="cropDraft && cropFrameStyle">
+              <div class="stage-crop-dim" aria-hidden="true">
+                <span class="stage-crop-hole" :style="cropFrameStyle" />
+              </div>
+              <div
+                class="stage-crop-frame"
+                :style="cropFrameStyle"
+                aria-label="裁剪框，拖动平移"
+                @pointerdown="startAdjustDrag('move', $event)"
+                @pointermove="moveAdjustDrag"
+                @pointerup="endAdjustDrag"
+                @pointercancel="endAdjustDrag"
+              >
+                <button
+                  v-for="handle in RESIZE_HANDLES"
+                  :key="handle"
+                  class="stage-handle"
+                  :class="`stage-handle--${handle}`"
+                  type="button"
+                  :aria-label="`拖动调整裁剪框（${handle}）`"
+                  @pointerdown="startAdjustDrag(handle, $event)"
+                  @pointermove="moveAdjustDrag"
+                  @pointerup="endAdjustDrag"
+                  @pointercancel="endAdjustDrag"
+                />
+              </div>
+            </template>
+            <template v-else>
+              <button
+                v-for="handle in RESIZE_HANDLES"
+                :key="handle"
+                class="stage-handle"
+                :class="`stage-handle--${handle}`"
+                type="button"
+                :aria-label="`拖动缩放图片（${handle}）`"
+                @pointerdown="startAdjustDrag(handle, $event)"
+                @pointermove="moveAdjustDrag"
+                @pointerup="endAdjustDrag"
+                @pointercancel="endAdjustDrag"
+              />
+            </template>
           </div>
 
           <div v-if="isComparing" class="preview-compare">
@@ -2105,18 +2684,18 @@ defineExpose({ focusImage })
 
           <div
             v-if="activeBlank && !blankPanel.collapsed"
-            class="blank-size-panel"
+            class="stage-panel"
             @pointerdown.stop
             @click.stop
             @dblclick.stop
             @wheel.stop
           >
-            <div class="blank-size-head">
+            <div class="stage-panel__head">
               <strong>空白页</strong>
               <span class="tnum">{{ blankSizeSummary }}</span>
               <button
                 v-tooltip="'收起空白页面板（可在预览标题栏重新显示）'"
-                class="blank-size-collapse"
+                class="stage-panel__collapse"
                 type="button"
                 aria-label="收起空白页面板（可在预览标题栏重新显示）"
                 @click="collapsePanel('blankPanel')"
@@ -2124,7 +2703,7 @@ defineExpose({ focusImage })
                 <ChevronsRight :size="14" :stroke-width="1.9" />
               </button>
             </div>
-            <div class="blank-size-fields">
+            <div class="stage-panel__fields">
               <label>
                 <span>宽</span>
                 <input
@@ -2148,12 +2727,12 @@ defineExpose({ focusImage })
                 />
               </label>
             </div>
-            <div class="blank-size-presets">
+            <div class="stage-panel__buttons">
               <button type="button" @click="applyBlankPreset(800, 800)">1:1</button>
               <button type="button" @click="applyBlankPreset(1200, 800)">3:2</button>
               <button type="button" @click="applyBlankPreset(1920, 1080)">16:9</button>
             </div>
-            <span class="blank-size-hint">也可拖动右下角调整</span>
+            <span class="stage-panel__hint">也可拖动右下角调整</span>
           </div>
 
           <span
@@ -2751,7 +3330,83 @@ defineExpose({ focusImage })
   outline: none;
 }
 
-.blank-selection {
+.annotation-size-input--wide {
+  width: 46px;
+}
+
+/* 调整工具在标注栏里的提示、开关与文字按钮 */
+.annotation-hint {
+  padding: 0 2px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.annotation-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 27px;
+  padding: 0 5px;
+  border-radius: 5px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.annotation-check:hover {
+  background: var(--surface-hover);
+  color: var(--text-strong);
+}
+
+.annotation-check input {
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.annotation-text-button {
+  display: inline-flex;
+  height: 24px;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text-strong);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.annotation-text-button:hover:not(:disabled) {
+  border-color: var(--accent-line-strong);
+  color: var(--accent);
+}
+
+.annotation-text-button:disabled {
+  color: var(--text-faint);
+  cursor: not-allowed;
+}
+
+.annotation-text-button.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.annotation-text-button.is-primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--surface);
+}
+
+.annotation-text-button.is-primary:hover {
+  color: var(--surface);
+  filter: brightness(1.05);
+}
+
+.stage-selection {
   position: absolute;
   z-index: 3;
   border: 1.5px dashed var(--accent);
@@ -2760,7 +3415,7 @@ defineExpose({ focusImage })
   pointer-events: none;
 }
 
-.blank-selection-label {
+.stage-selection__label {
   position: absolute;
   top: -19px;
   left: -1px;
@@ -2774,26 +3429,57 @@ defineExpose({ focusImage })
   white-space: nowrap;
 }
 
-.blank-resize-handle {
+.stage-handle {
   position: absolute;
-  right: 0;
-  bottom: 0;
   width: 15px;
   height: 15px;
   border: 2px solid var(--accent);
   border-radius: 50%;
   background: var(--surface);
   box-shadow: var(--shadow-xs);
-  cursor: nwse-resize;
   pointer-events: auto;
-  transform: translate(50%, 50%);
+  touch-action: none;
 }
 
-.blank-resize-handle:hover {
+/* 手柄位置：四角与四边中点，光标方向跟着变 */
+.stage-handle--nw { top: 0; left: 0; cursor: nwse-resize; transform: translate(-50%, -50%); }
+.stage-handle--n { top: 0; left: 50%; cursor: ns-resize; transform: translate(-50%, -50%); }
+.stage-handle--ne { top: 0; right: 0; cursor: nesw-resize; transform: translate(50%, -50%); }
+.stage-handle--e { top: 50%; right: 0; cursor: ew-resize; transform: translate(50%, -50%); }
+.stage-handle--se { right: 0; bottom: 0; cursor: nwse-resize; transform: translate(50%, 50%); }
+.stage-handle--s { bottom: 0; left: 50%; cursor: ns-resize; transform: translate(-50%, 50%); }
+.stage-handle--sw { bottom: 0; left: 0; cursor: nesw-resize; transform: translate(-50%, 50%); }
+.stage-handle--w { top: 50%; left: 0; cursor: ew-resize; transform: translate(-50%, -50%); }
+
+/* 裁剪：框外压暗（只在图片范围内），框可拖动平移，边角有手柄 */
+.stage-crop-dim {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.stage-crop-hole {
+  position: absolute;
+  box-shadow: 0 0 0 9999px rgba(12, 20, 17, 0.52);
+}
+
+.stage-crop-frame {
+  position: absolute;
+  border: 1.5px solid var(--surface);
+  box-shadow: 0 0 0 1px var(--accent);
+  cursor: move;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+
+
+.stage-handle:hover {
   background: var(--accent-soft);
 }
 
-.blank-size-panel {
+.stage-panel {
   position: absolute;
   z-index: 4;
   right: 10px;
@@ -2810,26 +3496,26 @@ defineExpose({ focusImage })
   backdrop-filter: blur(8px);
 }
 
-.blank-size-head {
+.stage-panel__head {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-.blank-size-head strong {
+.stage-panel__head strong {
   color: var(--text-strong);
   font-size: 11px;
   font-weight: 650;
 }
 
-.blank-size-head span {
+.stage-panel__head span {
   flex: 1;
   color: var(--text-faint);
   font-size: 9.5px;
   text-align: right;
 }
 
-.blank-size-collapse {
+.stage-panel__collapse {
   display: inline-flex;
   width: 22px;
   height: 22px;
@@ -2841,17 +3527,17 @@ defineExpose({ focusImage })
   color: var(--text-muted);
 }
 
-.blank-size-collapse:hover {
+.stage-panel__collapse:hover {
   background: var(--surface-hover);
   color: var(--text-strong);
 }
 
-.blank-size-fields {
+.stage-panel__fields {
   display: flex;
   gap: 7px;
 }
 
-.blank-size-fields label {
+.stage-panel__fields label {
   display: flex;
   min-width: 0;
   flex: 1;
@@ -2861,7 +3547,7 @@ defineExpose({ focusImage })
   font-size: 9px;
 }
 
-.blank-size-fields input {
+.stage-panel__fields input {
   width: 100%;
   min-width: 0;
   height: 24px;
@@ -2874,17 +3560,17 @@ defineExpose({ focusImage })
   font-variant-numeric: tabular-nums;
 }
 
-.blank-size-fields input:focus {
+.stage-panel__fields input:focus {
   border-color: var(--accent);
   outline: none;
 }
 
-.blank-size-presets {
+.stage-panel__buttons {
   display: flex;
   gap: 4px;
 }
 
-.blank-size-presets button {
+.stage-panel__buttons button {
   height: 22px;
   flex: 1;
   border: 1px solid var(--border);
@@ -2894,12 +3580,12 @@ defineExpose({ focusImage })
   font-size: 9px;
 }
 
-.blank-size-presets button:hover {
+.stage-panel__buttons button:hover {
   border-color: var(--accent-line-strong);
   color: var(--accent);
 }
 
-.blank-size-hint {
+.stage-panel__hint {
   color: var(--text-faint);
   font-size: 9px;
   line-height: 1.4;
@@ -3321,7 +4007,7 @@ defineExpose({ focusImage })
     display: none;
   }
 
-  .blank-size-panel {
+  .stage-panel {
     right: 8px;
     bottom: 8px;
     width: 190px;
@@ -3329,7 +4015,7 @@ defineExpose({ focusImage })
   }
 
 
-  .blank-selection-label {
+  .stage-selection__label {
     font-size: 8px;
   }
 

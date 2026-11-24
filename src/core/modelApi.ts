@@ -236,3 +236,8 @@ export async function deleteCustomModel(id: string): Promise<ModelsSnapshot> {
 export async function openModelsDir(): Promise<void> {
   await post('/api/models/open-dir')
 }
+
+/** 在资源管理器里打开模型所在的文件夹并选中模型文件（内置模型编号或 custom-…）。 */
+export async function revealModelFile(id: string): Promise<void> {
+  await post('/api/models/reveal', { id })
+}

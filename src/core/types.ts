@@ -1,4 +1,5 @@
 import type { AiSharpenLevel } from './aiUpscale'
+import type { ContentTransform } from './imageTransform'
 import type { SharpenEngine } from './settings'
 import type { SharpenSettings } from './sharpen'
 
@@ -51,7 +52,7 @@ export interface StrokeAnnotation extends AnnotationBase {
 }
 
 export type StitchAnnotation = TextAnnotation | StrokeAnnotation
-export type AnnotationTool = 'select' | 'text' | 'brush' | 'eraser' | 'heal'
+export type AnnotationTool = 'select' | 'text' | 'brush' | 'eraser' | 'heal' | 'adjust'
 
 export interface StitchImage {
   id: string
@@ -67,6 +68,11 @@ export interface StitchImage {
   annotations: StitchAnnotation[]
   /** 清晰化结果：与原图同尺寸的画布；没有处理过时为空 */
   enhance?: ImageEnhance
+  /**
+   * 缩放与裁剪（「调整」工具）：取原图里 crop 这块，显示 / 导出成 width × height。
+   * 没有时就是整张原图、原尺寸；width、height 仍是原图尺寸，标注与修瑕都在原图坐标里。空白页不用。
+   */
+  transform?: ContentTransform
 }
 
 /**
