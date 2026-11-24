@@ -2610,10 +2610,7 @@ defineExpose({ focusImage })
             class="stage-selection"
             :style="adjustBoxStyle"
           >
-            <span class="stage-selection__label tnum">
-              {{ cropDraft ? '裁剪' : adjustSubject.kind === 'whole' ? '整张' : '调整' }} ·
-              {{ adjustInfo ? formatDimensions(adjustInfo.width, adjustInfo.height) : '' }}
-            </span>
+            <!-- 尺寸已在标注栏的宽、高输入框里；选框上不再挂标签，免得盖住上一张图。 -->
             <template v-if="cropDraft && cropFrameStyle">
               <div class="stage-crop-dim" aria-hidden="true">
                 <span class="stage-crop-hole" :style="cropFrameStyle" />
