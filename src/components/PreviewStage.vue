@@ -2,7 +2,10 @@
 import { computed, markRaw, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { Component } from 'vue'
 import {
+  BringToFront,
   Check,
+  ChevronDown,
+  ChevronUp,
   ChevronsRight,
   ChevronsUp,
   Columns2,
@@ -10,6 +13,7 @@ import {
   Eraser,
   FilePlus2,
   GripVertical,
+  ImageMinus,
   ImagePlus,
   Loader2,
   Maximize2,
@@ -19,6 +23,8 @@ import {
   Plus,
   Redo2,
   RotateCcw,
+  Scissors,
+  SendToBack,
   Sparkles,
   Type,
   Undo2,
@@ -41,7 +47,11 @@ import {
   sharpenImage,
 } from '../core/sharpenEngine'
 import type { AiModelChoice, AiModelInfo, SharpenAiState } from '../core/sharpenEngine'
+import { useCutout } from '../composables/useCutout'
 import { useFileDrop } from '../composables/useFileDrop'
+import { applySelection, removeBackground } from '../core/matteEngine'
+import type { MatteModelChoice, SegmentModelChoice } from '../core/matteEngine'
+import type { CutoutMode } from '../core/matte'
 import {
   cloneAnnotations,
   createAnnotationId,
@@ -54,7 +64,7 @@ import {
 import { createHealPatch, prepareHealJob } from '../core/heal'
 import { runHeal } from '../core/healEngine'
 import type { HealEngineChoice } from '../core/healEngine'
-import { formatDimensions } from '../core/image'
+import { formatDimensions, getBaseSource, releaseMatteComposite } from '../core/image'
 import {
   RESIZE_HANDLES,
   applyCrop,
@@ -80,6 +90,8 @@ import {
   getPreviewFit,
   keepScaleAfterResize,
 } from '../core/preview'
+import { clampCanvasSide, clampDragDelta, moveLayer, paintOrder, snapMove } from '../core/layout'
+import type { CanvasSize, LayerAction } from '../core/layout'
 import { renderStitchView } from '../core/render'
 import { THUMBNAIL_SIZE_PX } from '../core/settings'
 import type {
@@ -101,6 +113,7 @@ import type {
   StitchLayout,
   HealFill,
   ImageEnhance,
+  ImageMatte,
   StrokeAnnotation,
   TextAnnotation,
 } from '../core/types'
@@ -129,10 +142,20 @@ const props = defineProps<{
   aiModelKey: string
   /** 这次修瑕用经典算法还是 AI 模型（由 App 按设置与模型下载状态算出） */
   healEngine: HealEngineChoice
+  /** 去除背景用的模型及能不能用（由 App 按设置与模型下载状态算出） */
+  matteModel: MatteModelChoice
+  /** 点选抠图用的模型及能不能用 */
+  segmentModel: SegmentModelChoice
   /** 整张拼接图的缩放与裁剪（布局 layout 已按它换算好）；单图编辑或原样时为 null */
   frame?: ContentTransform | null
   /** 拼接布局原本的尺寸（整张调整的「原图」）；单图编辑时为 null */
   baseSize?: { width: number; height: number } | null
+  /** 手动设定的画布尺寸；null 表示贴合内容。单图编辑时为 null */
+  canvasSize?: CanvasSize | null
+  /** 按方向、间距自动排出来的内容尺寸（画布贴合内容时的大小）；单图编辑时为 null */
+  contentSize?: { width: number; height: number } | null
+  /** 拼接时拖动图片是否吸附 */
+  snap?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -144,6 +167,13 @@ const emit = defineEmits<{
   'set-transform': [id: string, transform: ContentTransform | null]
   /** 调整工具改了整张拼接图的缩放 / 裁剪；null 表示还原 */
   'set-frame': [transform: ContentTransform | null]
+  /** 拼接时拖动了一张图：相对自动位置的位移（布局像素）；null 表示归位 */
+  'set-position': [id: string, position: { x: number; y: number } | null]
+  /** 拼接时调整了图层：从下往上的图片编号顺序 */
+  'set-layers': [order: string[]]
+  /** 改了画布尺寸；null 表示贴合内容 */
+  'set-canvas': [canvas: CanvasSize | null]
+  'update-snap': [snap: boolean]
   'update-panel': [key: PanelKey, state: PanelState]
   'heal-failed': [message: string]
   /** 修瑕成功但需要告诉用户的说明，例如 AI 模型不可用、这次改用了经典算法 */
@@ -151,6 +181,9 @@ const emit = defineEmits<{
   /** 修瑕计算开始 / 结束；单图模式据此暂时禁止切换图片，免得结果写不回去 */
   'busy-change': [busy: boolean]
   'sharpen-failed': [message: string]
+  /** 抠图 / 去除背景的结果说明或不能用的原因 */
+  'matte-notice': [message: string]
+  'matte-failed': [message: string]
   'update-sharpen-engine': [engine: SharpenEngine]
   'update-sharpen-model': [key: string]
 }>()
@@ -248,6 +281,22 @@ let adjustDrag: {
   /** 布局像素 → 屏幕像素 */
   scale: number
 } | null = null
+/** 调整工具下拖动选中的图片换位置（拼接时） */
+let moveDrag: {
+  pointerId: number
+  imageId: string
+  startX: number
+  startY: number
+  /** 拖动开始时的位移（拼接布局像素，整张缩放前） */
+  startPosition: { x: number; y: number }
+  /** 拖动开始时图片在预览布局里的框 */
+  rect: Rect
+  /** 预览布局像素 → 屏幕像素 */
+  scale: number
+  /** 整张拼接图的缩放：预览布局像素 / 拼接布局像素 */
+  frameScale: { x: number; y: number }
+  moved: boolean
+} | null = null
 let resizeState: {
   pointerId: number
   startX: number
@@ -295,7 +344,12 @@ interface HistoryEntry {
   imageId: string
   before: StitchAnnotation[]
   after: StitchAnnotation[]
+  /** 抠图 / 去除背景这一步：遮罩前后（null 表示整张不透明）；有它时标注不变 */
+  matte?: { before: ImageMatte | null; after: ImageMatte | null }
 }
+
+/** 撤销记录里最多留几步抠图（每步一张原图尺寸的遮罩画布，占内存） */
+const MAX_MATTE_HISTORY = 5
 
 interface AnnotationToolOption {
   value: AnnotationTool
@@ -306,13 +360,31 @@ interface AnnotationToolOption {
   icon: Component
 }
 
+const LAYER_ACTIONS: Array<{ value: LayerAction; name: string; icon: Component }> = [
+  { value: 'top', name: '置于顶层', icon: BringToFront },
+  { value: 'up', name: '上移一层', icon: ChevronUp },
+  { value: 'down', name: '下移一层', icon: ChevronDown },
+  { value: 'bottom', name: '置于底层', icon: SendToBack },
+]
+
 const ANNOTATION_TOOLS: AnnotationToolOption[] = [
   { value: 'select', name: '选择与平移', tip: '选择与平移', icon: MousePointer2 },
   { value: 'text', name: '添加文字', tip: '添加文字', icon: Type },
   { value: 'brush', name: '画笔', tip: '画笔', icon: Paintbrush },
   { value: 'eraser', name: '橡皮擦', tip: '橡皮擦（只擦标注，不改原图）', icon: Eraser },
   { value: 'heal', name: '局部修瑕', tip: '局部修瑕（涂抹要去掉的物体，按周围画面补全）', icon: Wand2 },
-  { value: 'adjust', name: '调整', tip: '调整（拖手柄缩放，或裁剪、还原；原图不变）', icon: Crop },
+  {
+    value: 'cutout',
+    name: '抠图',
+    tip: '抠图（点要保留的物体，可选细部 / 部位 / 整体；Alt + 点击排除）',
+    icon: Scissors,
+  },
+  {
+    value: 'adjust',
+    name: '调整',
+    tip: '调整（拖手柄缩放，拼接时拖动图片换位置、调图层，或裁剪、还原；原图不变）',
+    icon: Crop,
+  },
 ]
 
 const MIN_ZOOM = 0.5
@@ -723,8 +795,13 @@ function imageAtEvent(event: PointerEvent | MouseEvent): {
   const layoutX = (event.clientX - rect.left - left) / scale
   const layoutY = (event.clientY - rect.top - top) / scale
 
-  for (let index = props.layout.items.length - 1; index >= 0; index -= 1) {
-    const item = props.layout.items[index]
+  // 画布外的部分已被裁掉，点不到；重叠时最上层的先命中。
+  if (layoutX < 0 || layoutY < 0 || layoutX > props.layout.width || layoutY > props.layout.height) {
+    return null
+  }
+  const ordered = paintOrder(props.layout.items)
+  for (let index = ordered.length - 1; index >= 0; index -= 1) {
+    const item = ordered[index]
     if (
       layoutX >= item.x &&
       layoutX <= item.x + item.width &&
@@ -785,7 +862,11 @@ function undo(): void {
     if (!image) {
       continue
     }
-    image.annotations = cloneAnnotations(entry.before)
+    if (entry.matte) {
+      replaceMatte(image, entry.matte.before)
+    } else {
+      image.annotations = cloneAnnotations(entry.before)
+    }
     redoStack.value.push(entry)
     scheduleRender()
     return
@@ -806,11 +887,48 @@ function redo(): void {
     if (!image) {
       continue
     }
-    image.annotations = cloneAnnotations(entry.after)
+    if (entry.matte) {
+      replaceMatte(image, entry.matte.after)
+    } else {
+      image.annotations = cloneAnnotations(entry.after)
+    }
     undoStack.value.push(entry)
     scheduleRender()
     return
   }
+}
+
+/** 换上另一份遮罩（或去掉），释放旧遮罩的合成画面；遮罩画布本身可能还在撤销记录里。 */
+function replaceMatte(image: StitchImage, matte: ImageMatte | null): void {
+  releaseMatteComposite(image.matte?.mask)
+  image.matte = matte ?? undefined
+  scheduleRender()
+}
+
+/** 抠图 / 去除背景改了遮罩：换上并记进撤销记录（Ctrl+Z 可撤回）。 */
+function setMatte(image: StitchImage, mask: HTMLCanvasElement | null, source: ImageMatte['source']): void {
+  const before = image.matte ?? null
+  const after: ImageMatte | null = mask ? markRaw({ source, mask: markRaw(mask) }) : null
+  if (!before && !after) {
+    return
+  }
+  replaceMatte(image, after)
+  undoStack.value.push({
+    imageId: image.id,
+    before: image.annotations,
+    after: image.annotations,
+    matte: { before, after },
+  })
+  // 抠图步骤只留最近几步，再早的从撤销记录里拿掉。
+  const matteEntries = undoStack.value.filter((entry) => entry.matte)
+  if (matteEntries.length > MAX_MATTE_HISTORY) {
+    const oldest = matteEntries[0]
+    undoStack.value = undoStack.value.filter((entry) => entry !== oldest)
+  }
+  if (undoStack.value.length > MAX_HISTORY) {
+    undoStack.value.shift()
+  }
+  redoStack.value = []
 }
 
 function startWidthAdjust(): void {
@@ -1399,6 +1517,210 @@ function restoreTransform(): void {
   requestTransform(subject.kind, subject.id, null)
 }
 
+/** 拼接时选中的那张可以拖动换位置、调图层（单张调整、不在裁剪时）。 */
+const movableImage = computed<StitchImage | null>(() =>
+  !props.singleImage && adjustScope.value === 'image' && !cropDraft.value ? (adjustSubject.value?.image ?? null) : null,
+)
+/** 从下往上的绘制顺序 */
+const layerOrder = computed(() => paintOrder(props.layout.items).map((item) => item.id))
+
+function canMoveLayer(action: LayerAction): boolean {
+  const image = movableImage.value
+  return Boolean(image && moveLayer(layerOrder.value, image.id, action))
+}
+
+function applyLayer(action: LayerAction): void {
+  const image = movableImage.value
+  const next = image ? moveLayer(layerOrder.value, image.id, action) : null
+  if (next) {
+    isHoldingActiveImage = true
+    emit('set-layers', next)
+  }
+}
+
+function resetPosition(): void {
+  const image = movableImage.value
+  if (image?.position) {
+    isHoldingActiveImage = true
+    emit('set-position', image.id, null)
+  }
+}
+
+function startMoveDrag(event: PointerEvent): void {
+  const image = movableImage.value
+  const item = image ? props.layout.items.find((candidate) => candidate.id === image.id) : null
+  if (!image || !item || event.button !== 0 || isHealing.value) {
+    return
+  }
+  event.preventDefault()
+  event.stopPropagation()
+  if (event.currentTarget instanceof HTMLElement) {
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }
+  moveDrag = {
+    pointerId: event.pointerId,
+    imageId: image.id,
+    startX: event.clientX,
+    startY: event.clientY,
+    startPosition: { ...(image.position ?? { x: 0, y: 0 }) },
+    rect: { x: item.x, y: item.y, width: item.width, height: item.height },
+    scale: Math.max(0.0001, imageToScreen.value),
+    frameScale: props.frame ? displayScale(props.frame) : { x: 1, y: 1 },
+    moved: false,
+  }
+}
+
+function moveMoveDrag(event: PointerEvent): void {
+  const drag = moveDrag
+  if (!drag || drag.pointerId !== event.pointerId) {
+    return
+  }
+  const screenDx = event.clientX - drag.startX
+  const screenDy = event.clientY - drag.startY
+  if (!drag.moved && Math.hypot(screenDx, screenDy) <= 4) {
+    return
+  }
+  drag.moved = true
+  const bounds = { width: props.layout.width, height: props.layout.height }
+  let dx = screenDx / drag.scale
+  let dy = screenDy / drag.scale
+  snapGuides.value = null
+  // 吸附：边或中线离其他图片、画布的边与中线不到 8 个屏幕像素就贴上去；按住 Alt 临时不吸附。
+  if (props.snap && !event.altKey) {
+    const others = props.layout.items.filter((item) => item.id !== drag.imageId)
+    const snapped = snapMove(drag.rect, dx, dy, others, bounds, SNAP_SCREEN_PX / drag.scale)
+    dx = snapped.dx
+    dy = snapped.dy
+    snapGuides.value =
+      snapped.guideX === null && snapped.guideY === null ? null : { x: snapped.guideX, y: snapped.guideY }
+  }
+  // 画布大小不变：拖出去的部分会被裁掉，但至少留一条在画布里，免得再也点不到。
+  const delta = clampDragDelta(drag.rect, dx, dy, bounds)
+  isHoldingActiveImage = true
+  emit('set-position', drag.imageId, {
+    x: Math.round(drag.startPosition.x + delta.dx / drag.frameScale.x),
+    y: Math.round(drag.startPosition.y + delta.dy / drag.frameScale.y),
+  })
+}
+
+function endMoveDrag(event: PointerEvent): void {
+  const drag = moveDrag
+  if (!drag || drag.pointerId !== event.pointerId) {
+    return
+  }
+  if (event.currentTarget instanceof HTMLElement && event.currentTarget.hasPointerCapture(event.pointerId)) {
+    event.currentTarget.releasePointerCapture(event.pointerId)
+  }
+  moveDrag = null
+  snapGuides.value = null
+  // 没拖动只是点了一下：按点选处理，重叠时可以点中上面那张。
+  if (!drag.moved) {
+    selectPress = { pointerId: event.pointerId, x: drag.startX, y: drag.startY }
+    handleAdjustClick(event)
+  }
+}
+
+/** 吸附距离（屏幕像素） */
+const SNAP_SCREEN_PX = 8
+/** 拖动时吸附上的参考线（预览布局坐标） */
+const snapGuides = ref<{ x: number | null; y: number | null } | null>(null)
+
+/** 选中那张在画布里的位置和大小（输出像素，已含整张缩放裁剪） */
+const movableMetrics = computed(() => {
+  const image = movableImage.value
+  const item = image ? props.layout.items.find((candidate) => candidate.id === image.id) : null
+  return item
+    ? { x: Math.round(item.x), y: Math.round(item.y), width: Math.round(item.width), height: Math.round(item.height) }
+    : null
+})
+
+/** 输入 X / Y：把选中那张移到画布里的这个位置（输出像素）。 */
+function applyPositionInput(axis: 'x' | 'y', event: Event): void {
+  const image = movableImage.value
+  const metrics = movableMetrics.value
+  const input = event.target as HTMLInputElement
+  const value = Number(input.value)
+  if (!image || !metrics) {
+    return
+  }
+  if (!Number.isFinite(value)) {
+    input.value = String(metrics[axis])
+    return
+  }
+  const frameScale = props.frame ? displayScale(props.frame) : { x: 1, y: 1 }
+  const start = image.position ?? { x: 0, y: 0 }
+  const shift = (Math.round(value) - metrics[axis]) / frameScale[axis]
+  isHoldingActiveImage = true
+  emit('set-position', image.id, { ...start, [axis]: Math.round(start[axis] + shift) })
+}
+
+/** 选中图片的参考线：在视口里的位置 */
+const snapGuideStyles = computed(() => {
+  const guides = snapGuides.value
+  const box = contentViewportRect()
+  if (!guides || !box) {
+    return []
+  }
+  const scale = box.width / Math.max(1, props.layout.width)
+  const styles: Array<{ key: string; style: Record<string, string> }> = []
+  if (guides.x !== null) {
+    styles.push({ key: 'x', style: { left: `${box.x + guides.x * scale}px`, top: '0', bottom: '0', width: '0' } })
+  }
+  if (guides.y !== null) {
+    styles.push({ key: 'y', style: { top: `${box.y + guides.y * scale}px`, left: '0', right: '0', height: '0' } })
+  }
+  return styles
+})
+
+/** 画布面板：调整工具「整张」时显示，手动设定拼接画布的宽高和内容位置 */
+const showCanvasPanel = computed(
+  () => !props.singleImage && annotationTool.value === 'adjust' && adjustScope.value === 'whole' && !cropDraft.value,
+)
+const canvasValue = computed<CanvasSize | null>(() => {
+  if (props.canvasSize) {
+    return props.canvasSize
+  }
+  const content = props.contentSize
+  return content ? { width: content.width, height: content.height, anchorX: 0.5, anchorY: 0.5 } : null
+})
+const CANVAS_ANCHORS: Array<{ x: 0 | 0.5 | 1; y: 0 | 0.5 | 1; name: string }> = [
+  { x: 0, y: 0, name: '左上' },
+  { x: 0.5, y: 0, name: '上' },
+  { x: 1, y: 0, name: '右上' },
+  { x: 0, y: 0.5, name: '左' },
+  { x: 0.5, y: 0.5, name: '居中' },
+  { x: 1, y: 0.5, name: '右' },
+  { x: 0, y: 1, name: '左下' },
+  { x: 0.5, y: 1, name: '下' },
+  { x: 1, y: 1, name: '右下' },
+]
+
+function setCanvas(patch: Partial<CanvasSize>): void {
+  const current = canvasValue.value
+  if (!current) {
+    return
+  }
+  keepScaleBeforeResize()
+  emit('set-canvas', { ...current, ...patch })
+}
+
+function applyCanvasInput(axis: 'width' | 'height', event: Event): void {
+  const input = event.target as HTMLInputElement
+  const value = Number(input.value)
+  if (!Number.isFinite(value) || value <= 0) {
+    input.value = String(canvasValue.value?.[axis] ?? '')
+    return
+  }
+  const side = clampCanvasSide(value)
+  input.value = String(side)
+  setCanvas({ [axis]: side })
+}
+
+function fitCanvasToContent(): void {
+  keepScaleBeforeResize()
+  emit('set-canvas', null)
+}
+
 /** 调整工具下单击图片：选中它（拼接时）。 */
 function handleAdjustClick(event: PointerEvent): void {
   const press = selectPress
@@ -1693,7 +2015,7 @@ function onPointerDown(event: PointerEvent): void {
   if (event.button !== 0) {
     return
   }
-  if (annotationTool.value !== 'select' && annotationTool.value !== 'adjust') {
+  if (annotationTool.value !== 'select' && annotationTool.value !== 'adjust' && annotationTool.value !== 'cutout') {
     beginDrawing(event)
     return
   }
@@ -1778,6 +2100,8 @@ function onPointerUp(event: PointerEvent): void {
     handleSelectClick(event)
   } else if (annotationTool.value === 'adjust') {
     handleAdjustClick(event)
+  } else if (annotationTool.value === 'cutout') {
+    handleCutoutClick(event)
   }
   if (!panState || event.pointerId !== panState.pointerId) {
     return
@@ -1816,11 +2140,22 @@ function onViewportKeydown(event: KeyboardEvent): void {
   if (event.key === 'Escape') {
     cancelText()
     cancelCrop()
+    cutout.clear()
     return
   }
   if (event.key === 'Enter' && cropDraft.value) {
     event.preventDefault()
     applyCropDraft()
+    return
+  }
+  if (annotationTool.value === 'cutout' && event.key === 'Enter' && cutout.hasSelection.value) {
+    event.preventDefault()
+    applyCutout('keep')
+    return
+  }
+  if (annotationTool.value === 'cutout' && event.key === 'Backspace' && cutoutTarget.value) {
+    event.preventDefault()
+    cutout.undoPoint(cutoutTarget.value)
     return
   }
   if (event.key === '+' || event.key === '=') {
@@ -2023,6 +2358,166 @@ function resetSharpen(): void {
   scheduleRender()
 }
 
+/** 抠图与去除背景作用的图片：同清晰化（单图是当前这张，拼接是选中的那张），空白页除外 */
+const cutoutTarget = computed<StitchImage | null>(() =>
+  sharpenTarget.value?.kind === 'image' ? sharpenTarget.value : null,
+)
+/** 点下去加的是保留点还是排除点；按住 Alt 临时反过来 */
+const cutoutPointMode = ref<'keep' | 'exclude'>('keep')
+const cutout = useCutout({
+  target: cutoutTarget,
+  active: computed(() => annotationTool.value === 'cutout'),
+  choice: computed(() => props.segmentModel),
+  onError: (message) => emit('matte-failed', `抠图：${message}`),
+})
+/** 正在去除背景的图片编号与进度 */
+const removingId = ref<string | null>(null)
+const removeProgress = ref(0)
+const removePercent = computed(() => `${Math.round(removeProgress.value * 100)}%`)
+const cutoutPercent = computed(() => `${Math.round(cutout.progress.value * 100)}%`)
+
+/** 抠图工具栏上的状态提示 */
+const cutoutHint = computed(() => {
+  if (!cutoutTarget.value) {
+    return sharpenTarget.value?.kind === 'blank' ? '空白页不能抠图' : '先选中一张图片'
+  }
+  if (!props.segmentModel.ready) {
+    return '抠图模型还不能用'
+  }
+  if (cutout.phase.value === 'encoding') {
+    return `正在分析画面 ${cutoutPercent.value}`
+  }
+  if (cutout.points.value.length === 0) {
+    return cutoutPointMode.value === 'keep' ? '点要保留的物体' : '点要排除的地方'
+  }
+  return cutout.phase.value === 'decoding' ? '正在选取…' : ''
+})
+
+const removeDisabledReason = computed(() => {
+  if (!cutoutTarget.value) {
+    return sharpenTarget.value?.kind === 'blank'
+      ? '空白页不需要去除背景'
+      : '先选中一张图片：点左侧卡片，或把它移到画面中间'
+  }
+  if (removingId.value) {
+    return '正在去除背景'
+  }
+  return ''
+})
+
+/** 抠图工具下单击：在点中的图片上加一个保留点或排除点（拼接时点到别的图就改选那张）。 */
+function handleCutoutClick(event: PointerEvent): void {
+  const press = selectPress
+  selectPress = null
+  if (!press || press.pointerId !== event.pointerId) {
+    return
+  }
+  if (Math.hypot(event.clientX - press.x, event.clientY - press.y) > 4) {
+    return
+  }
+  if (!props.segmentModel.ready) {
+    emit('matte-notice', props.segmentModel.reason)
+    return
+  }
+  const hit = imageAtEvent(event)
+  if (!hit || hit.image.kind !== 'image') {
+    return
+  }
+  if (!props.singleImage && hit.image.id !== activeImageId.value) {
+    activeImageId.value = hit.image.id
+    isHoldingActiveImage = true
+    emit('active-change', hit.image.id)
+  }
+  const positive = (cutoutPointMode.value === 'keep') !== event.altKey
+  cutout.addPoint(hit.image, { x: hit.point.x, y: hit.point.y, positive })
+}
+
+/** 用当前选区：保留选中的（其余变透明），或把选中的去掉。可撤销。 */
+function applyCutout(mode: CutoutMode): void {
+  const image = cutout.pointImageId.value ? findImage(cutout.pointImageId.value) : null
+  const selection = cutout.selectionCanvas()
+  if (!image || !selection) {
+    return
+  }
+  const mask = applySelection(image.matte?.mask ?? null, selection, mode, image.width, image.height)
+  selection.width = 0
+  setMatte(image, mask, 'cutout')
+  cutout.clear()
+  // 用完选区后下一次多半是重新选物体，点选方式回到「保留点」。
+  cutoutPointMode.value = 'keep'
+  emit(
+    'matte-notice',
+    mode === 'keep'
+      ? '已保留选中部分，其余变透明；可在底栏换底色，Ctrl+Z 撤销'
+      : '已去掉选中部分；可继续点选，Ctrl+Z 撤销',
+  )
+}
+
+/** 去掉抠图与去除背景的结果，回到整张不透明（可撤销）。 */
+function restoreMatte(): void {
+  const image = cutoutTarget.value
+  if (image?.matte) {
+    cutout.clear()
+    setMatte(image, null, 'cutout')
+  }
+}
+
+async function runRemoveBackground(): Promise<void> {
+  const image = cutoutTarget.value
+  if (!image || removeDisabledReason.value) {
+    return
+  }
+  const choice = props.matteModel
+  if (!choice.ready) {
+    emit('matte-notice', choice.reason)
+    return
+  }
+  const source = getBaseSource(image)
+  if (!source) {
+    return
+  }
+  removingId.value = image.id
+  removeProgress.value = 0
+  try {
+    const mask = await removeBackground(source, image.width, image.height, image.matte?.mask ?? null, choice, (fraction) => {
+      removeProgress.value = fraction
+    })
+    if (!mask) {
+      emit('matte-notice', `${choice.label} 没有找到可以去掉的背景，图片保持原样`)
+      return
+    }
+    setMatte(image, mask, 'remove-background')
+    emit('matte-notice', `已用 ${choice.label} 去除背景；可在底栏换底色，Ctrl+Z 撤销，或用「抠图」再细调`)
+  } catch (error) {
+    if (!(error instanceof AiCanceledError)) {
+      console.error('去除背景失败', error)
+      emit('matte-failed', error instanceof Error && error.message ? error.message : '去除背景计算失败')
+    }
+  } finally {
+    removingId.value = null
+  }
+}
+
+function stopRemoveBackground(): void {
+  cancelAiJobs()
+}
+
+/** 选点在视口里的位置，画成圆点标记 */
+const cutoutMarkers = computed(() => {
+  const imageId = cutout.pointImageId.value
+  if (annotationTool.value !== 'cutout' || !imageId) {
+    return []
+  }
+  // 依赖缩放与平移，跟着画面走。
+  void zoom.value
+  void offset.value
+  void displaySize.value
+  return cutout.points.value.flatMap((point, index) => {
+    const position = toViewport(imageId, point.x, point.y)
+    return position ? [{ index, positive: point.positive, style: { left: `${position.x}px`, top: `${position.y}px` } }] : []
+  })
+})
+
 function toggleCompare(): void {
   isComparing.value = !isComparing.value
 }
@@ -2126,6 +2621,7 @@ function renderPreview(): void {
     background: props.background,
     compareSplit: isComparing.value ? compareSplit.value : null,
     hiddenAnnotationId: textDraft.value?.editingId ?? null,
+    highlight: annotationTool.value === 'cutout' ? cutout.highlight.value : null,
   })
   if (!isHoldingActiveImage) {
     updateActiveImage()
@@ -2141,6 +2637,7 @@ watch(() => props.layout, scheduleRender, { flush: 'post' })
 watch(zoom, scheduleRender, { flush: 'post' })
 watch(() => props.background, scheduleRender)
 watch([isComparing, compareSplit], scheduleRender)
+watch(() => cutout.highlight.value, scheduleRender)
 // 换了作用的图片（切换单图、拼接里选中另一张），面板里的参数跟着换成那张的。
 watch(() => sharpenTarget.value?.id ?? null, syncSharpenDraft)
 watch(
@@ -2325,7 +2822,89 @@ defineExpose({ focusImage })
           <component :is="tool.icon" :size="14" :stroke-width="1.9" />
         </button>
         <span class="annotation-separator" aria-hidden="true" />
-        <template v-if="annotationTool !== 'adjust'">
+        <template v-if="annotationTool === 'cutout'">
+          <span class="annotation-group" role="group" aria-label="点选方式">
+            <button
+              v-tooltip="'点下去是要保留的物体（按住 Alt 临时改为排除）'"
+              class="annotation-text-button"
+              :class="{ 'is-active': cutoutPointMode === 'keep' }"
+              type="button"
+              :aria-pressed="cutoutPointMode === 'keep'"
+              @click="cutoutPointMode = 'keep'"
+            >
+              <Plus :size="12" :stroke-width="2.2" />
+              保留点
+            </button>
+            <button
+              v-tooltip="'点下去是要排除的地方，用来修掉多选进来的部分（按住 Alt 临时改为保留）'"
+              class="annotation-text-button"
+              :class="{ 'is-active': cutoutPointMode === 'exclude' }"
+              type="button"
+              :aria-pressed="cutoutPointMode === 'exclude'"
+              @click="cutoutPointMode = 'exclude'"
+            >
+              <Minus :size="12" :stroke-width="2.2" />
+              排除点
+            </button>
+          </span>
+          <template v-if="cutout.levelOptions.value.length > 0">
+            <span class="annotation-separator" aria-hidden="true" />
+            <button
+              v-for="level in cutout.levelOptions.value"
+              :key="level.index"
+              v-tooltip="`选区范围：${level.name}（同一个点可以选物体的一小块、一个部位或整体）`"
+              class="annotation-text-button"
+              :class="{ 'is-active': cutout.levelIndex.value === level.index }"
+              type="button"
+              :aria-pressed="cutout.levelIndex.value === level.index"
+              @click="cutout.setLevel(level.index)"
+            >
+              {{ level.name }}
+            </button>
+          </template>
+          <span class="annotation-separator" aria-hidden="true" />
+          <span class="annotation-group">
+            <button
+              v-tooltip="'只留下选中的部分，其余变透明（Enter）'"
+              class="annotation-text-button is-primary"
+              type="button"
+              :disabled="!cutout.hasSelection.value"
+              @click="applyCutout('keep')"
+            >
+              保留选中
+            </button>
+            <button
+              v-tooltip="'把选中的部分变透明'"
+              class="annotation-text-button"
+              type="button"
+              :disabled="!cutout.hasSelection.value"
+              @click="applyCutout('remove')"
+            >
+              去掉选中
+            </button>
+            <button
+              v-tooltip="'清掉选点重新选（Esc；Backspace 撤回最后一个点）'"
+              class="annotation-text-button"
+              type="button"
+              :disabled="cutout.points.value.length === 0"
+              @click="cutout.clear()"
+            >
+              清除选点
+            </button>
+            <button
+              v-tooltip="'去掉抠图与去除背景的结果，回到原图'"
+              class="annotation-text-button"
+              type="button"
+              :disabled="!cutoutTarget?.matte"
+              @click="restoreMatte"
+            >
+              <RotateCcw :size="13" :stroke-width="1.9" />
+              还原
+            </button>
+          </span>
+          <span v-if="cutoutHint" class="annotation-hint tnum">{{ cutoutHint }}</span>
+        </template>
+        <template v-else-if="annotationTool !== 'adjust'">
           <label v-tooltip="'标注颜色'" class="annotation-color">
             <input v-model="annotationColor" type="color" aria-label="标注颜色" />
           </label>
@@ -2415,85 +2994,152 @@ defineExpose({ focusImage })
           </button>
         </template>
         <template v-else-if="adjustInfo">
-          <label class="annotation-hint" for="adjust-width">宽</label>
-          <input
-            id="adjust-width"
-            v-tooltip="'显示与导出的宽度（像素）'"
-            class="annotation-size-input annotation-size-input--wide tnum"
-            type="number"
-            min="8"
-            step="1"
-            :value="adjustInfo.width"
-            @change="applyAdjustInput('width', $event)"
-          />
-          <label class="annotation-hint" for="adjust-height">高</label>
-          <input
-            id="adjust-height"
-            v-tooltip="'显示与导出的高度（像素）'"
-            class="annotation-size-input annotation-size-input--wide tnum"
-            type="number"
-            min="8"
-            step="1"
-            :value="adjustInfo.height"
-            @change="applyAdjustInput('height', $event)"
-          />
-          <template v-if="adjustKeepRatio">
+          <!-- 输入框、按钮按用途分组：工具栏换行时整组一起换，不把一组拆到两行。 -->
+          <span v-if="movableMetrics" class="annotation-group" role="group" aria-label="在画布里的位置">
+            <label class="annotation-hint" for="adjust-x">X</label>
             <input
-              v-tooltip="'按百分比等比缩放（相对原图）'"
+              id="adjust-x"
+              v-tooltip="'选中图片左上角在画布里的横坐标（像素），可输入；拖动图片也会变'"
               class="annotation-size-input annotation-size-input--wide tnum"
               type="number"
-              min="1"
               step="1"
-              aria-label="缩放百分比"
-              :value="adjustInfo.percent"
-              @change="applyAdjustInput('percent', $event)"
+              :value="movableMetrics.x"
+              @change="applyPositionInput('x', $event)"
             />
-            <span class="annotation-hint">%</span>
+            <label class="annotation-hint" for="adjust-y">Y</label>
+            <input
+              id="adjust-y"
+              v-tooltip="'选中图片左上角在画布里的纵坐标（像素），可输入'"
+              class="annotation-size-input annotation-size-input--wide tnum"
+              type="number"
+              step="1"
+              :value="movableMetrics.y"
+              @change="applyPositionInput('y', $event)"
+            />
+          </span>
+          <span class="annotation-group" role="group" aria-label="尺寸">
+            <label class="annotation-hint" for="adjust-width">宽</label>
+            <input
+              id="adjust-width"
+              v-tooltip="'显示与导出的宽度（像素）'"
+              class="annotation-size-input annotation-size-input--wide tnum"
+              type="number"
+              min="8"
+              step="1"
+              :value="adjustInfo.width"
+              @change="applyAdjustInput('width', $event)"
+            />
+            <label class="annotation-hint" for="adjust-height">高</label>
+            <input
+              id="adjust-height"
+              v-tooltip="'显示与导出的高度（像素）'"
+              class="annotation-size-input annotation-size-input--wide tnum"
+              type="number"
+              min="8"
+              step="1"
+              :value="adjustInfo.height"
+              @change="applyAdjustInput('height', $event)"
+            />
+            <template v-if="adjustKeepRatio">
+              <input
+                v-tooltip="'按百分比等比缩放（相对原图）'"
+                class="annotation-size-input annotation-size-input--wide tnum"
+                type="number"
+                min="1"
+                step="1"
+                aria-label="缩放百分比"
+                :value="adjustInfo.percent"
+                @change="applyAdjustInput('percent', $event)"
+              />
+              <span class="annotation-hint">%</span>
+            </template>
+            <label
+              v-tooltip="adjustKeepRatio ? '拖任意手柄、输入宽或高都等比缩放' : '手柄和输入可分别改宽高（会变形）'"
+              class="annotation-check"
+            >
+              <input v-model="adjustKeepRatio" type="checkbox" />
+              保持比例
+            </label>
+          </span>
+          <span class="annotation-group">
+            <button
+              v-tooltip="adjustScope === 'whole' && !singleImage ? '裁剪整张拼接图（可随时还原）' : '裁剪这张图（原图不变，可随时还原）'"
+              class="annotation-text-button"
+              type="button"
+              @click="startCrop"
+            >
+              <Crop :size="13" :stroke-width="1.9" />
+              裁剪
+            </button>
+            <button
+              v-tooltip="'去掉缩放与裁剪，标注回到原位'"
+              class="annotation-text-button"
+              type="button"
+              :disabled="!adjustInfo.isTransformed"
+              @click="restoreTransform"
+            >
+              <RotateCcw :size="13" :stroke-width="1.9" />
+              还原
+            </button>
+            <template v-if="movableImage">
+              <button
+                v-tooltip="'回到按拼接方向排好的位置（拖动画面里的图片可换位置）'"
+                class="annotation-text-button"
+                type="button"
+                :disabled="!movableImage.position"
+                @click="resetPosition"
+              >
+                归位
+              </button>
+              <label
+                v-tooltip="'拖动时贴到其他图片和画布的边、中线上（按住 Alt 临时不吸附）'"
+                class="annotation-check"
+              >
+                <input
+                  type="checkbox"
+                  :checked="snap"
+                  @change="emit('update-snap', ($event.target as HTMLInputElement).checked)"
+                />
+                吸附
+              </label>
+            </template>
+          </span>
+          <template v-if="movableImage">
+            <span class="annotation-separator" aria-hidden="true" />
+            <!-- 图层四个按钮放成一组：工具栏换行时整组一起换，不拆开。 -->
+            <span class="annotation-group" role="group" aria-label="图层">
+              <button
+                v-for="action in LAYER_ACTIONS"
+                :key="action.value"
+                v-tooltip="`${action.name}（图片重叠时谁在上面）`"
+                class="annotation-tool"
+                type="button"
+                :disabled="!canMoveLayer(action.value)"
+                :aria-label="action.name"
+                @click="applyLayer(action.value)"
+              >
+                <component :is="action.icon" :size="14" :stroke-width="1.9" />
+              </button>
+            </span>
           </template>
-          <label
-            v-tooltip="adjustKeepRatio ? '拖任意手柄、输入宽或高都等比缩放' : '手柄和输入可分别改宽高（会变形）'"
-            class="annotation-check"
-          >
-            <input v-model="adjustKeepRatio" type="checkbox" />
-            保持比例
-          </label>
-          <button
-            v-tooltip="adjustScope === 'whole' && !singleImage ? '裁剪整张拼接图（可随时还原）' : '裁剪这张图（原图不变，可随时还原）'"
-            class="annotation-text-button"
-            type="button"
-            @click="startCrop"
-          >
-            <Crop :size="13" :stroke-width="1.9" />
-            裁剪
-          </button>
-          <button
-            v-tooltip="'去掉缩放与裁剪，标注回到原位'"
-            class="annotation-text-button"
-            type="button"
-            :disabled="!adjustInfo.isTransformed"
-            @click="restoreTransform"
-          >
-            <RotateCcw :size="13" :stroke-width="1.9" />
-            还原
-          </button>
         </template>
         <span class="annotation-separator" aria-hidden="true" />
         <button
-          v-tooltip="'撤销标注（Ctrl+Z）'"
+          v-tooltip="'撤销标注与抠图（Ctrl+Z）'"
           class="annotation-tool"
           type="button"
           :disabled="!canUndo"
-          aria-label="撤销标注"
+          aria-label="撤销标注与抠图"
           @click="undo"
         >
           <Undo2 :size="14" :stroke-width="1.9" />
         </button>
         <button
-          v-tooltip="'重做标注（Ctrl+Shift+Z）'"
+          v-tooltip="'重做标注与抠图（Ctrl+Shift+Z）'"
           class="annotation-tool"
           type="button"
           :disabled="!canRedo"
-          aria-label="重做标注"
+          aria-label="重做标注与抠图"
           @click="redo"
         >
           <Redo2 :size="14" :stroke-width="1.9" />
@@ -2509,6 +3155,17 @@ defineExpose({ focusImage })
           @click="toggleSharpenPanel"
         >
           <Sparkles :size="14" :stroke-width="1.9" />
+        </button>
+        <button
+          v-tooltip="removeDisabledReason || (matteModel.ready ? `去除背景：用 ${matteModel.label} 自动识别主体，背景变透明` : `去除背景：${matteModel.reason}`)"
+          class="annotation-tool"
+          :class="{ 'is-active': removingId !== null }"
+          type="button"
+          aria-label="去除背景"
+          :disabled="Boolean(removeDisabledReason)"
+          @click="runRemoveBackground"
+        >
+          <ImageMinus :size="14" :stroke-width="1.9" />
         </button>
         <button
           v-tooltip="isComparing ? '关闭前后对比' : '前后对比：左边原图，右边处理后'"
@@ -2639,6 +3296,15 @@ defineExpose({ focusImage })
               </div>
             </template>
             <template v-else>
+              <div
+                v-if="movableImage"
+                class="stage-move-area"
+                aria-hidden="true"
+                @pointerdown="startMoveDrag"
+                @pointermove="moveMoveDrag"
+                @pointerup="endMoveDrag"
+                @pointercancel="endMoveDrag"
+              />
               <button
                 v-for="handle in RESIZE_HANDLES"
                 :key="handle"
@@ -2679,8 +3345,84 @@ defineExpose({ focusImage })
             </div>
           </div>
 
+          <span
+            v-for="guide in snapGuideStyles"
+            :key="guide.key"
+            class="snap-guide"
+            :class="`snap-guide--${guide.key}`"
+            :style="guide.style"
+            aria-hidden="true"
+          />
+
           <div
-            v-if="activeBlank && !blankPanel.collapsed"
+            v-if="showCanvasPanel && canvasValue"
+            class="stage-panel"
+            role="group"
+            aria-label="画布尺寸"
+            @pointerdown.stop
+            @click.stop
+            @dblclick.stop
+            @wheel.stop
+          >
+            <div class="stage-panel__head">
+              <strong>画布</strong>
+              <span class="tnum">{{ canvasSize ? '自定义' : '贴合内容' }}</span>
+            </div>
+            <div class="stage-panel__fields">
+              <label>
+                <span>宽</span>
+                <input
+                  type="number"
+                  min="16"
+                  max="65536"
+                  step="10"
+                  :value="canvasValue.width"
+                  @change="applyCanvasInput('width', $event)"
+                />
+              </label>
+              <label>
+                <span>高</span>
+                <input
+                  type="number"
+                  min="16"
+                  max="65536"
+                  step="10"
+                  :value="canvasValue.height"
+                  @change="applyCanvasInput('height', $event)"
+                />
+              </label>
+            </div>
+            <div class="canvas-anchor">
+              <span class="stage-panel__hint">内容位置</span>
+              <div class="canvas-anchor__grid" role="group" aria-label="内容在画布里的位置">
+                <button
+                  v-for="anchor in CANVAS_ANCHORS"
+                  :key="anchor.name"
+                  v-tooltip="`内容放在画布${anchor.name === '居中' ? '中间' : anchor.name}`"
+                  class="canvas-anchor__cell"
+                  :class="{ 'is-active': canvasValue.anchorX === anchor.x && canvasValue.anchorY === anchor.y }"
+                  type="button"
+                  :aria-label="anchor.name"
+                  :aria-pressed="canvasValue.anchorX === anchor.x && canvasValue.anchorY === anchor.y"
+                  @click="setCanvas({ anchorX: anchor.x, anchorY: anchor.y })"
+                />
+              </div>
+              <div class="stage-panel__buttons canvas-anchor__fit">
+                <button
+                  v-tooltip="'画布回到刚好包住内容的大小'"
+                  type="button"
+                  :disabled="!canvasSize"
+                  @click="fitCanvasToContent"
+                >
+                  贴合内容
+                </button>
+              </div>
+            </div>
+            <span class="stage-panel__hint">变大处填背景，超出画布的部分被裁掉</span>
+          </div>
+
+          <div
+            v-if="activeBlank && !blankPanel.collapsed && !showCanvasPanel"
             class="stage-panel"
             @pointerdown.stop
             @click.stop
@@ -2731,6 +3473,18 @@ defineExpose({ focusImage })
             </div>
             <span class="stage-panel__hint">也可拖动右下角调整</span>
           </div>
+
+          <span
+            v-for="marker in cutoutMarkers"
+            :key="marker.index"
+            class="cutout-marker"
+            :class="marker.positive ? 'cutout-marker--keep' : 'cutout-marker--exclude'"
+            :style="marker.style"
+            aria-hidden="true"
+          >
+            <Plus v-if="marker.positive" :size="10" :stroke-width="3" />
+            <Minus v-else :size="10" :stroke-width="3" />
+          </span>
 
           <span
             v-if="toolCursorStyle"
@@ -2894,6 +3648,24 @@ defineExpose({ focusImage })
         <div v-if="isHealing" class="stage-busy" role="status">
           <Loader2 class="spin" :size="13" :stroke-width="2" />
           <span class="tnum">{{ healEngineLabel ? `正在用 ${healEngineLabel} 修瑕` : '正在修瑕' }} {{ healPercent }}</span>
+        </div>
+
+        <div v-if="removingId" class="stage-busy" role="status">
+          <Loader2 class="spin" :size="13" :stroke-width="2" />
+          <span class="tnum">正在用 {{ matteModel.label }} 去除背景 {{ removePercent }}</span>
+          <button
+            v-tooltip="'停止去除背景，图片保持原样'"
+            class="heal-choice__switch"
+            type="button"
+            @click="stopRemoveBackground"
+          >
+            停止
+          </button>
+        </div>
+
+        <div v-else-if="annotationTool === 'cutout' && cutout.phase.value === 'encoding'" class="stage-busy" role="status">
+          <Loader2 class="spin" :size="13" :stroke-width="2" />
+          <span class="tnum">正在用 {{ segmentModel.label }} 分析画面 {{ cutoutPercent }}，可以先点选</span>
         </div>
 
         <div v-if="isImporting && images.length > 0" class="stage-busy" role="status">
@@ -3459,6 +4231,93 @@ defineExpose({ focusImage })
 .stage-crop-hole {
   position: absolute;
   box-shadow: 0 0 0 9999px rgba(12, 20, 17, 0.52);
+}
+
+.cutout-marker {
+  position: absolute;
+  z-index: 4;
+  display: grid;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+  border: 2px solid var(--surface);
+  border-radius: 50%;
+  color: var(--surface);
+  box-shadow: var(--shadow-xs);
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+}
+
+.cutout-marker--keep {
+  background: var(--accent);
+}
+
+.cutout-marker--exclude {
+  background: var(--danger);
+}
+
+.annotation-group {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 1px;
+}
+
+.snap-guide {
+  position: absolute;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.snap-guide--x {
+  border-left: 1px dashed var(--danger);
+}
+
+.snap-guide--y {
+  border-top: 1px dashed var(--danger);
+}
+
+.canvas-anchor {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.canvas-anchor__grid {
+  display: grid;
+  grid-template-columns: repeat(3, 12px);
+  gap: 2px;
+}
+
+.canvas-anchor__fit {
+  flex: 1;
+}
+
+.canvas-anchor__cell {
+  width: 12px;
+  height: 12px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.canvas-anchor__cell:hover {
+  border-color: var(--accent);
+}
+
+.canvas-anchor__cell.is-active {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.stage-move-area {
+  position: absolute;
+  inset: 0;
+  cursor: move;
+  pointer-events: auto;
+  touch-action: none;
 }
 
 .stage-crop-frame {

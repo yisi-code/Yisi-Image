@@ -110,12 +110,72 @@ export function createBlankPage(
   }
 }
 
-/** 这张图当前的画面：清晰化过就用结果画布，否则用原图；空白页返回 null。 */
-export function getImageSource(image: StitchImage): CanvasImageSource | null {
+/**
+ * 抠图前的画面：清晰化过就用结果画布，否则用原图；空白页返回 null。
+ * 抠图、去除背景都按它计算，遮罩只决定哪里透明。
+ */
+export function getBaseSource(image: StitchImage): CanvasImageSource | null {
   return image.enhance?.canvas ?? image.element ?? null
 }
 
+/** 遮罩 → 合成好的画面；底图（清晰化结果）换了就重算。按遮罩画布缓存，遮罩不用了随之回收。 */
+const matteComposites = new WeakMap<HTMLCanvasElement, { base: CanvasImageSource; canvas: HTMLCanvasElement }>()
+
+/** 绘制源的实际像素尺寸：清晰化结果画布可能是原图的 2 倍、4 倍。 */
+export function pixelSizeOf(source: CanvasImageSource, fallback: { width: number; height: number }) {
+  if (source instanceof HTMLImageElement) {
+    return { width: source.naturalWidth || fallback.width, height: source.naturalHeight || fallback.height }
+  }
+  if (source instanceof HTMLCanvasElement || source instanceof ImageBitmap) {
+    return { width: source.width, height: source.height }
+  }
+  return fallback
+}
+
+/** 这张图当前的画面：底图（见 getBaseSource）按抠图遮罩去掉透明部分；空白页返回 null。 */
+export function getImageSource(image: StitchImage): CanvasImageSource | null {
+  const base = getBaseSource(image)
+  const mask = image.matte?.mask
+  if (!base || !mask) {
+    return base
+  }
+  const cached = matteComposites.get(mask)
+  if (cached?.base === base) {
+    return cached.canvas
+  }
+  const { width, height } = pixelSizeOf(base, image)
+  const canvas = cached?.canvas ?? document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const context = canvas.getContext('2d')
+  if (!context) {
+    return base
+  }
+  context.drawImage(base, 0, 0, width, height)
+  context.globalCompositeOperation = 'destination-in'
+  context.imageSmoothingEnabled = true
+  context.imageSmoothingQuality = 'high'
+  context.drawImage(mask, 0, 0, width, height)
+  context.globalCompositeOperation = 'source-over'
+  matteComposites.set(mask, { base, canvas })
+  return canvas
+}
+
+/** 去掉抠图遮罩，及早释放合成画面占的内存（遮罩画布本身可能还在撤销记录里，不释放）。 */
+export function releaseMatteComposite(mask: HTMLCanvasElement | null | undefined): void {
+  const cached = mask ? matteComposites.get(mask) : undefined
+  if (cached && mask) {
+    cached.canvas.width = 0
+    cached.canvas.height = 0
+    matteComposites.delete(mask)
+  }
+}
+
 export function releaseImage(image: StitchImage): void {
+  if (image.matte) {
+    releaseMatteComposite(image.matte.mask)
+    image.matte = undefined
+  }
   if (image.enhance) {
     // 及早释放清晰化结果占用的内存。
     image.enhance.canvas.width = 0

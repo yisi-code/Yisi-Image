@@ -15,6 +15,7 @@ const CUSTOM_SETTINGS: ToolSettings = {
   thumbnailFit: 'fill',
   gap: 48,
   background: 'transparent',
+  stitchSnap: false,
   annotationToolbar: {
     collapsed: true,
     position: { x: 'right', y: 'top', dx: 20, dy: 12 },
@@ -25,6 +26,8 @@ const CUSTOM_SETTINGS: ToolSettings = {
   healEngine: 'migan',
   sharpenEngine: 'ai',
   sharpenModel: 'custom-0123456789ab',
+  matteModel: 'u2netp',
+  segmentModel: 'custom-abcdef012345',
   workMode: 'single',
   exportOptions: {
     format: 'webp',
@@ -88,6 +91,12 @@ describe('normalizeSettings', () => {
       sharpenModel: 'realesrgan',
     })
     expect(normalizeSettings({ sharpenModel: '../evil' }).sharpenModel).toBe('realesrgan')
+  })
+
+  it('去背景、抠图模型编号格式不对时回退默认', () => {
+    const parsed = normalizeSettings({ matteModel: '../evil', segmentModel: 42 })
+    expect(parsed.matteModel).toBe('isnet')
+    expect(parsed.segmentModel).toBe('mobilesam')
   })
 
   it('修瑕方式接受自定义模型编号，格式不对时回退经典算法', () => {

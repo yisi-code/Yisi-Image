@@ -8,9 +8,11 @@ using System.Web.Script.Serialization;
 namespace Yisi.ImageTool
 {
     /// <summary>
-    /// 用户自己导入的 AI 模型（ONNX），用途是清晰化（sharpen）或局部修瑕（heal）。
-    /// 文件复制到模型目录下的 custom 文件夹，以「custom-SHA-256 前 12 位.onnx」保存，
+    /// 用户自己导入的 AI 模型（ONNX），用途是清晰化（sharpen）、局部修瑕（heal）、去除背景（matte）
+    /// 或点选抠图（segment）。文件复制到模型目录下的 custom 文件夹，以「custom-SHA-256 前 12 位.onnx」保存，
     /// 清单 custom-models.json 记用途、名称、大小与 SHA-256（早期没有用途字段的条目按清晰化处理）。
+    /// 抠图模型是一对文件（图像编码器 + 掩码解码器）：解码器另存为「编号.decoder.onnx」，
+    /// 编号取两个文件 SHA-256 拼接后再算一次 SHA-256 的前 12 位。
     /// 页面通过 /models/custom/文件名 读取；只认清单里且大小一致的文件。
     /// 运行库与内置模型共用（模型目录里的 ort-wasm 文件）。
     /// </summary>
@@ -22,6 +24,8 @@ namespace Yisi.ImageTool
         private const int MaxNameLength = 60;
         internal const string KindSharpen = "sharpen";
         internal const string KindHeal = "heal";
+        internal const string KindMatte = "matte";
+        internal const string KindSegment = "segment";
         private static readonly Regex IdPattern = new Regex("^custom-[0-9a-f]{12}$");
 
         private static readonly object Sync = new object();
@@ -34,6 +38,9 @@ namespace Yisi.ImageTool
             public string Name { get; set; }
             public long Size { get; set; }
             public string Sha256 { get; set; }
+            /// <summary>抠图模型的掩码解码器；其他用途为空</summary>
+            public long DecoderSize { get; set; }
+            public string DecoderSha256 { get; set; }
             public string AddedAt { get; set; }
         }
 
@@ -47,14 +54,31 @@ namespace Yisi.ImageTool
             return id + ".onnx";
         }
 
-        private static string KindOf(CustomModel model)
+        private static string DecoderFileNameOf(string id)
         {
-            return model.Kind == KindHeal ? KindHeal : KindSharpen;
+            return id + ".decoder.onnx";
         }
 
-        private static string PurposeText(string kind)
+        private static string KindOf(CustomModel model)
         {
-            return kind == KindHeal ? "局部修瑕" : "清晰化";
+            return model.Kind == KindHeal || model.Kind == KindMatte || model.Kind == KindSegment
+                ? model.Kind
+                : KindSharpen;
+        }
+
+        internal static string PurposeText(string kind)
+        {
+            switch (kind)
+            {
+                case KindHeal:
+                    return "局部修瑕";
+                case KindMatte:
+                    return "去除背景";
+                case KindSegment:
+                    return "抠图";
+                default:
+                    return "清晰化";
+            }
         }
 
         /// <summary>页面传来的用途；缺省为清晰化（兼容只会导入清晰化模型的旧页面）。</summary>
@@ -64,9 +88,9 @@ namespace Yisi.ImageTool
             {
                 return KindSharpen;
             }
-            if (kind == KindHeal)
+            if (kind == KindHeal || kind == KindMatte || kind == KindSegment)
             {
-                return KindHeal;
+                return kind;
             }
             throw new ModelException("模型用途无效");
         }
@@ -125,14 +149,21 @@ namespace Yisi.ImageTool
                 foreach (CustomModel model in Load(modelsDir))
                 {
                     string file = Path.Combine(FolderIn(modelsDir), FileNameOf(model.Id));
+                    bool available = File.Exists(file) && new FileInfo(file).Length == model.Size;
                     Dictionary<string, object> item = new Dictionary<string, object>();
                     item["id"] = model.Id;
                     item["kind"] = KindOf(model);
                     item["name"] = model.Name;
-                    item["size"] = model.Size;
+                    item["size"] = model.Size + model.DecoderSize;
                     item["sha256"] = model.Sha256;
-                    item["available"] = File.Exists(file) && new FileInfo(file).Length == model.Size;
                     item["modelUrl"] = "/models/" + FolderName + "/" + FileNameOf(model.Id);
+                    if (KindOf(model) == KindSegment)
+                    {
+                        string decoder = Path.Combine(FolderIn(modelsDir), DecoderFileNameOf(model.Id));
+                        available = available && File.Exists(decoder) && new FileInfo(decoder).Length == model.DecoderSize;
+                        item["decoderUrl"] = "/models/" + FolderName + "/" + DecoderFileNameOf(model.Id);
+                    }
+                    item["available"] = available;
                     items.Add(item);
                 }
                 return items;
@@ -144,6 +175,89 @@ namespace Yisi.ImageTool
         /// 已作为另一用途导入过时报错（两个用途共用一个文件名，不能各存一份）。
         /// </summary>
         internal static string Import(string sourcePath, string kind)
+        {
+            if (kind == KindSegment)
+            {
+                throw new ModelException("抠图模型要同时导入图像编码器和掩码解码器");
+            }
+            long size = CheckSource(sourcePath);
+            string sha = ModelStore.Sha256Of(sourcePath);
+            string id = "custom-" + sha.Substring(0, 12);
+            lock (Sync)
+            {
+                string modelsDir = ModelStore.CurrentDirectory();
+                List<CustomModel> list = Load(modelsDir);
+                string folder = FolderIn(modelsDir);
+                string target = Path.Combine(folder, FileNameOf(id));
+                CustomModel existing = FindForKind(list, id, kind);
+                if (existing != null && File.Exists(target) && new FileInfo(target).Length == size)
+                {
+                    return id;
+                }
+
+                CopyInto(sourcePath, target);
+                list.RemoveAll(item => item.Id == id);
+                list.Add(new CustomModel
+                {
+                    Id = id,
+                    Kind = kind,
+                    Name = CleanName(Path.GetFileNameWithoutExtension(sourcePath)),
+                    Size = size,
+                    Sha256 = sha,
+                    AddedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                });
+                Save(modelsDir, list);
+                return id;
+            }
+        }
+
+        /// <summary>导入一对抠图模型文件（图像编码器 + 掩码解码器）；同一对重复导入时返回已有的编号。</summary>
+        internal static string ImportPair(string encoderPath, string decoderPath)
+        {
+            long encoderSize = CheckSource(encoderPath);
+            long decoderSize = CheckSource(decoderPath);
+            string encoderSha = ModelStore.Sha256Of(encoderPath);
+            string decoderSha = ModelStore.Sha256Of(decoderPath);
+            if (string.Equals(encoderSha, decoderSha, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ModelException("两次选的是同一个文件；请先选图像编码器，再选掩码解码器");
+            }
+            string id = "custom-" + Sha256OfText(encoderSha + decoderSha).Substring(0, 12);
+            lock (Sync)
+            {
+                string modelsDir = ModelStore.CurrentDirectory();
+                List<CustomModel> list = Load(modelsDir);
+                string folder = FolderIn(modelsDir);
+                string encoderTarget = Path.Combine(folder, FileNameOf(id));
+                string decoderTarget = Path.Combine(folder, DecoderFileNameOf(id));
+                CustomModel existing = FindForKind(list, id, KindSegment);
+                if (existing != null && File.Exists(encoderTarget) && new FileInfo(encoderTarget).Length == encoderSize &&
+                    File.Exists(decoderTarget) && new FileInfo(decoderTarget).Length == decoderSize)
+                {
+                    return id;
+                }
+
+                CopyInto(encoderPath, encoderTarget);
+                CopyInto(decoderPath, decoderTarget);
+                list.RemoveAll(item => item.Id == id);
+                list.Add(new CustomModel
+                {
+                    Id = id,
+                    Kind = KindSegment,
+                    Name = CleanName(Path.GetFileNameWithoutExtension(encoderPath)),
+                    Size = encoderSize,
+                    Sha256 = encoderSha,
+                    DecoderSize = decoderSize,
+                    DecoderSha256 = decoderSha,
+                    AddedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                });
+                Save(modelsDir, list);
+                return id;
+            }
+        }
+
+        /// <summary>所选文件存在、是 .onnx、大小合适；返回字节数。</summary>
+        private static long CheckSource(string sourcePath)
         {
             if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
             {
@@ -158,66 +272,64 @@ namespace Yisi.ImageTool
             {
                 throw new ModelException("模型文件大小不合适（需大于 0、不超过 1 GB）");
             }
+            return size;
+        }
 
-            string sha = ModelStore.Sha256Of(sourcePath);
-            string id = "custom-" + sha.Substring(0, 12);
-            lock (Sync)
+        /// <summary>清单里同编号的条目；已作为另一用途导入时报错（同一编号只能存一份文件）。</summary>
+        private static CustomModel FindForKind(List<CustomModel> list, string id, string kind)
+        {
+            CustomModel existing = list.Find(item => item.Id == id);
+            if (existing != null && KindOf(existing) != kind)
             {
-                string modelsDir = ModelStore.CurrentDirectory();
-                List<CustomModel> list = Load(modelsDir);
-                string folder = FolderIn(modelsDir);
-                string target = Path.Combine(folder, FileNameOf(id));
-                CustomModel existing = list.Find(item => item.Id == id);
-                if (existing != null && KindOf(existing) != kind)
-                {
-                    throw new ModelException(
-                        "这个文件已经作为" + PurposeText(KindOf(existing)) + "模型导入过（「" + existing.Name +
-                        "」），要换用途请先在那里删除");
-                }
-                if (existing != null && File.Exists(target) && new FileInfo(target).Length == size)
-                {
-                    return id;
-                }
+                throw new ModelException(
+                    "这个文件已经作为" + PurposeText(KindOf(existing)) + "模型导入过（「" + existing.Name +
+                    "」），要换用途请先在那里删除");
+            }
+            return existing;
+        }
 
-                Directory.CreateDirectory(folder);
-                string part = target + ".part";
+        /// <summary>先复制成 .part 再改名，复制失败时不留下半个文件。</summary>
+        private static void CopyInto(string sourcePath, string target)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(target));
+            string part = target + ".part";
+            try
+            {
+                File.Copy(sourcePath, part, true);
+                if (File.Exists(target))
+                {
+                    File.Delete(target);
+                }
+                File.Move(part, target);
+            }
+            catch (Exception ex)
+            {
                 try
                 {
-                    File.Copy(sourcePath, part, true);
-                    if (File.Exists(target))
+                    if (File.Exists(part))
                     {
-                        File.Delete(target);
+                        File.Delete(part);
                     }
-                    File.Move(part, target);
                 }
-                catch (Exception ex)
+                catch
                 {
-                    try
-                    {
-                        if (File.Exists(part))
-                        {
-                            File.Delete(part);
-                        }
-                    }
-                    catch
-                    {
-                        // 清理失败不掩盖真正的错误。
-                    }
-                    throw new ModelException("复制模型文件失败：" + ex.Message, ex);
+                    // 清理失败不掩盖真正的错误。
                 }
+                throw new ModelException("复制模型文件失败：" + ex.Message, ex);
+            }
+        }
 
-                list.RemoveAll(item => item.Id == id);
-                list.Add(new CustomModel
+        private static string Sha256OfText(string text)
+        {
+            using (System.Security.Cryptography.SHA256 sha = System.Security.Cryptography.SHA256.Create())
+            {
+                byte[] hash = sha.ComputeHash(Encoding.UTF8.GetBytes(text.ToLowerInvariant()));
+                StringBuilder builder = new StringBuilder(hash.Length * 2);
+                foreach (byte value in hash)
                 {
-                    Id = id,
-                    Kind = kind,
-                    Name = CleanName(Path.GetFileNameWithoutExtension(sourcePath)),
-                    Size = size,
-                    Sha256 = sha,
-                    AddedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
-                });
-                Save(modelsDir, list);
-                return id;
+                    builder.Append(value.ToString("x2"));
+                }
+                return builder.ToString();
             }
         }
 
@@ -252,12 +364,15 @@ namespace Yisi.ImageTool
                 string modelsDir = ModelStore.CurrentDirectory();
                 List<CustomModel> list = Load(modelsDir);
                 bool listed = list.RemoveAll(item => item.Id == id) > 0;
-                string file = Path.Combine(FolderIn(modelsDir), FileNameOf(id));
                 try
                 {
-                    if (File.Exists(file))
+                    foreach (string name in new string[] { FileNameOf(id), DecoderFileNameOf(id) })
                     {
-                        File.Delete(file);
+                        string file = Path.Combine(FolderIn(modelsDir), name);
+                        if (File.Exists(file))
+                        {
+                            File.Delete(file);
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -290,12 +405,22 @@ namespace Yisi.ImageTool
                 string modelsDir = ModelStore.CurrentDirectory();
                 foreach (CustomModel model in Load(modelsDir))
                 {
-                    if (!string.Equals(FileNameOf(model.Id), fileName, StringComparison.Ordinal))
+                    long size;
+                    if (string.Equals(FileNameOf(model.Id), fileName, StringComparison.Ordinal))
+                    {
+                        size = model.Size;
+                    }
+                    else if (KindOf(model) == KindSegment &&
+                        string.Equals(DecoderFileNameOf(model.Id), fileName, StringComparison.Ordinal))
+                    {
+                        size = model.DecoderSize;
+                    }
+                    else
                     {
                         continue;
                     }
                     string path = Path.Combine(FolderIn(modelsDir), fileName);
-                    return File.Exists(path) && new FileInfo(path).Length == model.Size ? path : null;
+                    return File.Exists(path) && new FileInfo(path).Length == size ? path : null;
                 }
                 return null;
             }
@@ -310,6 +435,10 @@ namespace Yisi.ImageTool
                 foreach (CustomModel model in Load(modelsDir))
                 {
                     names.Add(Path.Combine(FolderName, FileNameOf(model.Id)));
+                    if (KindOf(model) == KindSegment)
+                    {
+                        names.Add(Path.Combine(FolderName, DecoderFileNameOf(model.Id)));
+                    }
                 }
             }
             names.Add(Path.Combine(FolderName, ManifestName));

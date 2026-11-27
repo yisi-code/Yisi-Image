@@ -18,6 +18,8 @@ export interface ExportItem {
   originalSize: number
   /** 这一项里 AI 清晰化保留的最高倍数（没有时为 1）；导出尺寸低于它时提示放大 */
   detailScale: number
+  /** 这一项自己的底色（单图编辑每张图各自设）；没有时用导出对话框的背景 */
+  background?: string
   /** 按缩放比例画出导出画布；background 为 null 时保留透明；给 region 时只画输出图里的这一块 */
   render: (scale: number, background: string | null, region?: OutputRegion) => HTMLCanvasElement
 }

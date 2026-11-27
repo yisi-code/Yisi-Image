@@ -58,7 +58,7 @@ const props = defineProps<{
   currentId: string | null
   options: ExportOptions
   formats: readonly ExportFormatOption[]
-  /** 拼接用设置里的背景；单图传 transparent，PNG / WebP 保留原图透明 */
+  /** 拼接用设置里的背景；单图传 transparent（每张图自己的底色在 item.background 里） */
   background: StitchBackground
 }>()
 
@@ -124,8 +124,15 @@ const previewItem = computed(
   () => props.items.find((item) => item.id === props.currentId) ?? props.items[0] ?? null,
 )
 const format = computed(() => getExportFormat(props.options.format))
-const exportBackground = computed(() => getExportBackground(props.background, format.value))
-const transparencyDropped = computed(() => isTransparencyDropped(props.background, format.value))
+/** 这一项的底色：单图编辑每张图各自设，没设时用 props.background */
+function backgroundOf(item: ExportItem): StitchBackground {
+  return item.background ?? props.background
+}
+
+/** 这一项导出画布的底色；null 保留透明 */
+function exportBackgroundOf(item: ExportItem): string | null {
+  return getExportBackground(backgroundOf(item), format.value)
+}
 const outputSize = computed(() =>
   previewItem.value
     ? getOutputSize(previewItem.value.width, previewItem.value.height, props.options)
@@ -138,6 +145,12 @@ const sizeCheck = computed(() =>
 )
 /** 超出画布上限、要分块写 PNG */
 const isStripExport = computed(() => sizeCheck.value?.ok === true && sizeCheck.value.mode === 'strips')
+/** 这次要导出的项里有透明底、格式却是 JPG 的（会按白底导出） */
+const transparencyDropped = computed(() =>
+  (isBatch.value ? props.items : previewItem.value ? [previewItem.value] : []).some((item) =>
+    isTransparencyDropped(backgroundOf(item), format.value),
+  ),
+)
 const isBatch = computed(
   () => props.mode === 'single' && scope.value === 'all' && props.items.length > 1,
 )
@@ -209,7 +222,7 @@ const percentStyle = computed(
 )
 
 function resultKey(item: ExportItem): string {
-  return `${item.id}|${JSON.stringify(props.options)}|${props.background}`
+  return `${item.id}|${JSON.stringify(props.options)}|${backgroundOf(item)}`
 }
 
 function update(patch: Partial<ExportOptions>): void {
@@ -327,10 +340,10 @@ async function runPreview(): Promise<void> {
           Math.sqrt((CANVAS_SAFE_AREA / 6) / (output.width * output.height)),
         )
       : output.scale
-    const key = `${item.id}|${previewScale}|${exportBackground.value ?? 'none'}`
+    const key = `${item.id}|${previewScale}|${exportBackgroundOf(item) ?? 'none'}`
     if (key !== sourceKey || !previewSource.value) {
       releaseCanvas(previewSource.value)
-      previewSource.value = item.render(previewScale, exportBackground.value)
+      previewSource.value = item.render(previewScale, exportBackgroundOf(item))
       sourceKey = key
     }
     const encoded = await encodeCanvas(previewSource.value, format.value, props.options)
@@ -367,7 +380,7 @@ async function encodeItem(item: ExportItem): Promise<EncodedImage & { width: num
     return { blob: cached.blob, quality: cached.quality, fits: cached.fits, ...output }
   }
   await nextFrame()
-  const canvas = item.render(output.scale, exportBackground.value)
+  const canvas = item.render(output.scale, exportBackgroundOf(item))
   try {
     const encoded = await encodeCanvas(canvas, format.value, props.options)
     return { ...encoded, width: output.width, height: output.height }
@@ -408,7 +421,7 @@ async function exportItem(item: ExportItem, destination: SaveDestination): Promi
         await encodeItemAsPngStrips(
           item,
           output,
-          exportBackground.value,
+          exportBackgroundOf(item),
           {
             async write(chunk) {
               size += chunk.length
@@ -426,7 +439,7 @@ async function exportItem(item: ExportItem, destination: SaveDestination): Promi
       return { size, width: output.width, height: output.height, fits: true }
     }
     const sink = createBlobSink()
-    await encodeItemAsPngStrips(item, output, exportBackground.value, sink, options)
+    await encodeItemAsPngStrips(item, output, exportBackgroundOf(item), sink, options)
     const blob = sink.toBlob()
     downloadBlob(blob, destination.name)
     return { size: blob.size, width: output.width, height: output.height, fits: true }

@@ -18,20 +18,41 @@ import {
 } from './aiInpaint'
 import type { CustomInpaintSpec, InpaintTensorType } from './aiInpaint'
 import { UPSCALE_FACTOR, planTiles, tileToTensor, writeTileResult } from './aiUpscale'
+import {
+  CUSTOM_MATTE_SIZE,
+  MATTE_PROBE_THRESHOLD,
+  PROBE_MATTE_SIZE,
+  PROBE_NORMALIZATIONS,
+  SEGMENT_NOT_ENCODED,
+  foregroundContrast,
+  logitsToAlpha,
+  matteProbeImage,
+  outputToAlpha,
+  pickMaskLevels,
+  rgbaToChw,
+  samEncoderInput,
+  samPointTensors,
+} from './matte'
+import type { MatteNormalization, MatteSpec, SamEncoderLayout, SegmentPoint } from './matte'
 
 /**
- * 在 Worker 里用 onnxruntime-web（wasm）跑 AI 模型（修瑕、清晰化），页面不卡。
+ * 在 Worker 里用 onnxruntime-web（wasm）跑 AI 模型（修瑕、清晰化、去除背景、点选抠图），页面不卡。
  * wasm 运行库和模型都由 EXE 启动器下载、在 /models/ 下提供；胶水脚本随页面打包。
- * 已加载的会话按模型地址缓存，连续修瑕只加载一次；换模型时释放旧的，避免同时占两份内存；
- * 空闲 IDLE_RELEASE_MS 后也释放（LaMa 加载后约占 600 MB），下次修瑕再重新加载。
+ * 已加载的会话按模型地址缓存，连续修瑕只加载一次；换模型时释放这次用不到的，避免同时占几份内存
+ * （抠图要同时留着编码器和解码器）；空闲 IDLE_RELEASE_MS 后全部释放（LaMa 加载后约占 600 MB），
+ * 下次再重新加载。
  */
 
 const IDLE_RELEASE_MS = 3 * 60 * 1000
 
 interface AiRequest {
   id: number
-  /** inpaint：修瑕（默认）；upscale：清晰化；probe：读一个陌生模型的输入要求并试算放大倍数 */
-  kind?: 'inpaint' | 'upscale' | 'probe'
+  /**
+   * inpaint：修瑕（默认）；upscale：清晰化；probe：读一个陌生清晰化模型的输入要求并试算放大倍数；
+   * matte：去除背景；matte-probe：试出自定义去背景模型的输入尺寸与归一化；
+   * segment-encode / segment-decode：点选抠图的编码（每张图一次）与按提示点解码。
+   */
+  kind?: 'inpaint' | 'upscale' | 'probe' | 'matte' | 'matte-probe' | 'segment-encode' | 'segment-decode'
   /** 修瑕时是 migan / lama 或自定义模型编号（custom-…）；清晰化时是内置或自定义模型的编号 */
   model: string
   modelUrl: string
@@ -51,6 +72,14 @@ interface AiRequest {
   multiple?: number
   /** 模型只接受的固定输入尺寸 */
   fixedSize?: { width: number; height: number } | null
+  /** 去除背景：送进模型的尺寸与归一化（rgba 已按 size × size 拉伸好） */
+  matteSpec?: MatteSpec
+  /** 抠图：掩码解码器的地址（modelUrl 是图像编码器） */
+  decoderUrl?: string
+  /** 抠图：这张图（及其当时的画面）的编号，编码结果按它缓存 */
+  imageKey?: string
+  /** 抠图解码：提示点（编码器输入尺寸里的坐标） */
+  points?: SegmentPoint[]
 }
 
 interface AiResult {
@@ -64,6 +93,22 @@ interface ProbeResult {
   scale: number
   fixedSize: { width: number; height: number } | null
 }
+
+/** 去除背景的结果：模型输出尺寸（通常与输入同为方形）的 0–255 前景透明度 */
+interface MatteResult {
+  alpha: Uint8ClampedArray
+  width: number
+  height: number
+}
+
+/** 抠图解码的结果：几档掩码（从小到大），每档 width × height 的 0–255 透明度 */
+interface SegmentResult {
+  masks: Uint8ClampedArray[]
+  width: number
+  height: number
+}
+
+type WorkerResult = AiResult | ProbeResult | MatteResult | SegmentResult | { encoded: true } | { matteSpec: MatteSpec }
 
 interface InputMetadata {
   type?: string
@@ -84,17 +129,27 @@ const scope = self as unknown as {
   location: Location
 }
 
-let loaded: { key: string; session: ort.InferenceSession } | null = null
+/** 已加载的会话，按模型地址 */
+const loaded = new Map<string, ort.InferenceSession>()
+/** 抠图编码结果：只留最近一张图的 */
+let segmentCache: { imageKey: string; encoderKey: string; embeddings: ort.Tensor } | null = null
+/** 自定义去背景模型试出的输入约定，按模型地址缓存 */
+const matteSpecs = new Map<string, MatteSpec>()
 let idleTimer: ReturnType<typeof setTimeout> | undefined
 let running = 0
+
+async function releaseAll(): Promise<void> {
+  segmentCache = null
+  const sessions = [...loaded.values()]
+  loaded.clear()
+  await Promise.all(sessions.map((session) => session.release()))
+}
 
 function scheduleRelease(): void {
   clearTimeout(idleTimer)
   idleTimer = setTimeout(() => {
-    if (running === 0 && loaded) {
-      const session = loaded.session
-      loaded = null
-      void session.release()
+    if (running === 0 && loaded.size > 0) {
+      void releaseAll()
     }
   }, IDLE_RELEASE_MS)
 }
@@ -103,14 +158,28 @@ function absolute(url: string): string {
   return new URL(url, scope.location.href).href
 }
 
-async function getSession(request: AiRequest, report: (fraction: number) => void): Promise<ort.InferenceSession> {
-  const key = absolute(request.modelUrl)
-  if (loaded?.key === key) {
-    return loaded.session
+/** 释放这次请求用不到的会话（抠图的编码器、解码器要一起留着）。 */
+async function keepOnly(keys: readonly string[]): Promise<void> {
+  for (const [key, session] of [...loaded]) {
+    if (!keys.includes(key)) {
+      loaded.delete(key)
+      if (segmentCache?.encoderKey === key) {
+        segmentCache = null
+      }
+      await session.release()
+    }
   }
-  if (loaded) {
-    await loaded.session.release()
-    loaded = null
+}
+
+async function getSession(
+  request: AiRequest,
+  report: (fraction: number) => void,
+  modelUrl = request.modelUrl,
+): Promise<ort.InferenceSession> {
+  const key = absolute(modelUrl)
+  const existing = loaded.get(key)
+  if (existing) {
+    return existing
   }
   ort.env.wasm.wasmPaths = { mjs: absolute(ortGlueUrl), wasm: absolute(request.runtimeUrl) }
   // 页面跨源隔离（EXE 启动器加了 COOP / COEP 头）时才能多线程；否则单线程照样能算，只是慢一些。
@@ -129,7 +198,7 @@ async function getSession(request: AiRequest, report: (fraction: number) => void
     executionProviders: ['wasm'],
     graphOptimizationLevel: 'all',
   })
-  loaded = { key, session }
+  loaded.set(key, session)
   return session
 }
 
@@ -339,8 +408,229 @@ async function upscale(
   return { rgba: output, width: outWidth, height: outHeight }
 }
 
-async function run(request: AiRequest, report: (fraction: number) => void): Promise<AiResult | ProbeResult> {
+/** 模型第一个输入里固定的高、宽（四维 [1, 3, 高, 宽]）；不固定的维度为 null。 */
+function fixedInputSize(session: ort.InferenceSession): { width: number | null; height: number | null } {
+  const shape = (session as unknown as { inputMetadata?: InputMetadata[] }).inputMetadata?.[0]?.shape
+  return {
+    height: typeof shape?.[2] === 'number' && shape[2] > 0 ? shape[2] : null,
+    width: typeof shape?.[3] === 'number' && shape[3] > 0 ? shape[3] : null,
+  }
+}
+
+/** 第一个单通道的输出：[1, 1, 高, 宽]、[1, 高, 宽] 或 [高, 宽]。 */
+function alphaOutput(
+  session: ort.InferenceSession,
+  result: ort.InferenceSession.OnnxValueMapType,
+): { data: Float32Array; width: number; height: number } {
+  for (const name of session.outputNames) {
+    const output = result[name] as ort.Tensor
+    const dims = output.dims.map(Number)
+    const single =
+      (dims.length === 4 && dims[0] === 1 && dims[1] === 1) ||
+      (dims.length === 3 && dims[0] === 1) ||
+      dims.length === 2
+    if (single && output.data instanceof Float32Array) {
+      return { data: output.data, width: dims[dims.length - 1], height: dims[dims.length - 2] }
+    }
+  }
+  throw new Error('模型没有单通道的 float32 输出（[1, 1, 高, 宽]），不是去背景模型')
+}
+
+async function runMatteModel(
+  session: ort.InferenceSession,
+  rgba: Uint8ClampedArray,
+  size: number,
+  normalization: MatteNormalization,
+): Promise<MatteResult> {
+  const input = rgbaToChw(rgba, size, size, normalization)
+  const result = await session.run({
+    [session.inputNames[0]]: new ort.Tensor('float32', input, [1, 3, size, size]),
+  })
+  const output = alphaOutput(session, result)
+  return {
+    alpha: outputToAlpha(output.data, output.width * output.height),
+    width: output.width,
+    height: output.height,
+  }
+}
+
+/**
+ * 读自定义去背景模型的输入要求，并用「灰底 + 红圆」的试算图依次试三种归一化，取前景分得最开的那种。
+ * 要求：一个 float32 [1, 3, 高, 宽] 输入（固定尺寸时只支持方形），输出里有一个单通道的前景图。
+ */
+async function matteSpecOf(session: ort.InferenceSession, key: string): Promise<MatteSpec> {
+  const cached = matteSpecs.get(key)
+  if (cached) {
+    return cached
+  }
+  if (session.inputNames.length !== 1) {
+    throw new Error(`这个模型有 ${session.inputNames.length} 个输入，去背景模型只要一个图像输入`)
+  }
+  const metadata = (session as unknown as { inputMetadata?: InputMetadata[] }).inputMetadata?.[0]
+  if (metadata?.type && metadata.type !== 'float32') {
+    throw new Error(`模型输入是 ${metadata.type}，目前只支持 float32`)
+  }
+  if (metadata?.shape && metadata.shape.length !== 4) {
+    throw new Error('模型输入不是 [1, 3, 高, 宽] 的四维图像')
+  }
+  if (typeof metadata?.shape?.[1] === 'number' && metadata.shape[1] !== 3) {
+    throw new Error(`模型输入是 ${metadata.shape[1]} 通道，只支持 3 通道 RGB`)
+  }
+  const fixed = fixedInputSize(session)
+  if (fixed.width !== null && fixed.height !== null && fixed.width !== fixed.height) {
+    throw new Error(`模型只收 ${fixed.width} × ${fixed.height} 的输入，目前只支持方形或不固定尺寸`)
+  }
+  const fixedSide = fixed.width ?? fixed.height
+  const testSize = fixedSide ?? PROBE_MATTE_SIZE
+  const test = matteProbeImage(testSize)
+  let best: { normalization: MatteNormalization; contrast: number } | null = null
+  for (const normalization of PROBE_NORMALIZATIONS) {
+    const output = await runMatteModel(session, test.rgba, testSize, normalization)
+    if (output.width !== testSize || output.height !== testSize) {
+      throw new Error(`模型输出是 ${output.width} × ${output.height}，需要与输入同尺寸`)
+    }
+    const contrast = foregroundContrast(output.alpha, test.inside)
+    if (!best || contrast > best.contrast) {
+      best = { normalization, contrast }
+    }
+  }
+  if (!best || best.contrast < MATTE_PROBE_THRESHOLD) {
+    throw new Error('试算时模型没有把前景物体和背景分开，可能不是去背景（显著性分割）模型')
+  }
+  const spec: MatteSpec = { size: fixedSide ?? CUSTOM_MATTE_SIZE, normalization: best.normalization }
+  matteSpecs.set(key, spec)
+  return spec
+}
+
+/** 去除背景：rgba 已按 spec.size 拉伸成方形；返回模型输出尺寸的前景透明度。 */
+async function removeBackground(
+  session: ort.InferenceSession,
+  request: AiRequest,
+  report: (fraction: number) => void,
+): Promise<MatteResult> {
+  const spec = request.matteSpec ?? (await matteSpecOf(session, absolute(request.modelUrl)))
+  if (request.width !== spec.size || request.height !== spec.size) {
+    throw new Error('去背景的输入尺寸与模型不一致')
+  }
+  report(0.3)
+  const result = await runMatteModel(session, request.rgba, spec.size, spec.normalization)
+  report(1)
+  return result
+}
+
+/** 标准 SAM 掩码解码器的输入 */
+const SAM_DECODER_INPUTS = [
+  'image_embeddings',
+  'point_coords',
+  'point_labels',
+  'mask_input',
+  'has_mask_input',
+  'orig_im_size',
+] as const
+
+/** 编码器输入是 [高, 宽, 3]（模型自己归一化、补边）还是标准 SAM 的 [1, 3, 1024, 1024]。 */
+function encoderLayoutOf(session: ort.InferenceSession): SamEncoderLayout {
+  if (session.inputNames.length !== 1) {
+    throw new Error(`图像编码器有 ${session.inputNames.length} 个输入，SAM 编码器只要一个图像输入`)
+  }
+  const shape = (session as unknown as { inputMetadata?: InputMetadata[] }).inputMetadata?.[0]?.shape
+  if (!shape || shape.length === 3) {
+    return 'hwc'
+  }
+  if (shape.length === 4) {
+    return 'chw'
+  }
+  throw new Error('图像编码器的输入既不是 [高, 宽, 3] 也不是 [1, 3, 1024, 1024]')
+}
+
+/**
+ * 点选抠图。encode：把长边缩到 1024 的画面送进编码器，结果按 imageKey 缓存（每张图只算一次，约几秒）；
+ * decode：按提示点跑解码器（不到 1 秒），返回几档掩码。编码结果不在了（Worker 重建、换了模型）时
+ * decode 报 SEGMENT_NOT_ENCODED，页面重新编码后再解码。
+ */
+async function segment(request: AiRequest, report: (fraction: number) => void): Promise<SegmentResult | { encoded: true }> {
+  if (!request.decoderUrl || !request.imageKey) {
+    throw new Error('抠图请求缺少解码器或图片编号')
+  }
+  const encoderKey = absolute(request.modelUrl)
+  const decoderKey = absolute(request.decoderUrl)
+  await keepOnly([encoderKey, decoderKey])
+
+  if (request.kind === 'segment-encode') {
+    const encoder = await getSession(request, report)
+    const decoder = await getSession(request, () => undefined, request.decoderUrl)
+    const missing = SAM_DECODER_INPUTS.filter((name) => !decoder.inputNames.includes(name))
+    if (missing.length > 0) {
+      throw new Error(`掩码解码器不是标准 SAM 接口：缺少 ${missing.join('、')} 输入`)
+    }
+    const layout = encoderLayoutOf(encoder)
+    report(0.3)
+    const { width, height } = request
+    const input = samEncoderInput(request.rgba, width, height, layout)
+    const dims = layout === 'hwc' ? [height, width, 3] : [1, 3, 1024, 1024]
+    const result = await encoder.run({ [encoder.inputNames[0]]: new ort.Tensor('float32', input, dims) })
+    const embeddings = result[encoder.outputNames[0]] as ort.Tensor
+    if (embeddings.dims.length !== 4) {
+      throw new Error('图像编码器的输出不是四维特征图，不是 SAM 编码器')
+    }
+    segmentCache = { imageKey: request.imageKey, encoderKey, embeddings }
+    report(1)
+    return { encoded: true }
+  }
+
+  const cache = segmentCache
+  if (!cache || cache.imageKey !== request.imageKey || cache.encoderKey !== encoderKey) {
+    throw new Error(SEGMENT_NOT_ENCODED)
+  }
+  const decoder = await getSession(request, report, request.decoderUrl)
+  const points = request.points ?? []
+  const { coords, labels } = samPointTensors(points)
+  const count = points.length + 1
+  const { width, height } = request
+  const result = await decoder.run({
+    image_embeddings: cache.embeddings,
+    point_coords: new ort.Tensor('float32', coords, [1, count, 2]),
+    point_labels: new ort.Tensor('float32', labels, [1, count]),
+    mask_input: new ort.Tensor('float32', new Float32Array(256 * 256), [1, 1, 256, 256]),
+    has_mask_input: new ort.Tensor('float32', new Float32Array([0]), [1]),
+    orig_im_size: new ort.Tensor('float32', new Float32Array([height, width]), [2]),
+  })
+  const masks = (result.masks ?? result[decoder.outputNames[0]]) as ort.Tensor
+  const dims = masks.dims.map(Number)
+  if (dims.length !== 4 || dims[2] !== height || dims[3] !== width || !(masks.data instanceof Float32Array)) {
+    throw new Error(`掩码解码器输出是 [${dims.join(', ')}]，需要 [1, 张数, ${height}, ${width}]`)
+  }
+  const plane = width * height
+  const data = masks.data
+  const areas = Array.from({ length: dims[1] }, (_, index) => {
+    let area = 0
+    for (let offset = index * plane; offset < (index + 1) * plane; offset += 1) {
+      if (data[offset] > 0) {
+        area += 1
+      }
+    }
+    return area
+  })
+  const levels = pickMaskLevels(areas)
+  return {
+    masks: levels.map((index) => logitsToAlpha(data, index * plane, plane)),
+    width,
+    height,
+  }
+}
+
+async function run(request: AiRequest, report: (fraction: number) => void): Promise<WorkerResult> {
+  if (request.kind === 'segment-encode' || request.kind === 'segment-decode') {
+    return segment(request, report)
+  }
+  await keepOnly([absolute(request.modelUrl)])
   const session = await getSession(request, report)
+  if (request.kind === 'matte-probe') {
+    return { matteSpec: await matteSpecOf(session, absolute(request.modelUrl)) }
+  }
+  if (request.kind === 'matte') {
+    return removeBackground(session, request, report)
+  }
   if (request.kind === 'probe') {
     return probe(session)
   }
@@ -408,6 +698,18 @@ scope.onmessage = (event) => {
           { id: request.id, type: 'done', rgba: result.rgba, width: result.width, height: result.height },
           [result.rgba.buffer],
         )
+      } else if ('alpha' in result) {
+        scope.postMessage(
+          { id: request.id, type: 'done', alpha: result.alpha, width: result.width, height: result.height },
+          [result.alpha.buffer],
+        )
+      } else if ('masks' in result) {
+        scope.postMessage(
+          { id: request.id, type: 'done', masks: result.masks, width: result.width, height: result.height },
+          result.masks.map((mask) => mask.buffer),
+        )
+      } else if ('encoded' in result || 'matteSpec' in result) {
+        scope.postMessage({ id: request.id, type: 'done', ...result })
       } else {
         scope.postMessage({ id: request.id, type: 'done', probe: result })
       }

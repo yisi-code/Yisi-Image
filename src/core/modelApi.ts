@@ -1,5 +1,5 @@
 /**
- * EXE 启动器的 AI 模型（修瑕、清晰化）接口：查看状态、下载 / 暂停 / 删除、选择与移动模型目录。
+ * EXE 启动器的 AI 模型（修瑕、清晰化、去除背景、抠图）接口：查看状态、下载 / 暂停 / 删除、选择与移动模型目录。
  * 下载在启动器里进行（断点续传、SHA-256 校验），页面只发指令、轮询进度；
  * 下载好的文件由启动器在 /models/文件名 下提供给页面。
  */
@@ -11,13 +11,19 @@ import type { LauncherResponse } from './configApi'
 export type HealModelId = 'migan' | 'lama'
 /** 清晰化用的 AI 模型 */
 export type SharpenModelId = 'realesrgan'
+/** 去除背景用的 AI 模型 */
+export type MatteModelId = 'u2netp' | 'isnet'
+/** 点选抠图用的 AI 模型（编码器 + 解码器两个文件） */
+export type SegmentModelId = 'mobilesam'
 /** 启动器能下载的全部模型 */
-export type ModelId = HealModelId | SharpenModelId
+export type ModelId = HealModelId | SharpenModelId | MatteModelId | SegmentModelId
 
-export const MODEL_IDS: readonly ModelId[] = ['migan', 'lama', 'realesrgan']
+export const MODEL_IDS: readonly ModelId[] = ['migan', 'lama', 'realesrgan', 'u2netp', 'isnet', 'mobilesam']
 
-/** 自定义模型的用途：清晰化或局部修瑕 */
-export type CustomModelKind = 'sharpen' | 'heal'
+/** 自定义模型的用途：清晰化、局部修瑕、去除背景或点选抠图 */
+export type CustomModelKind = 'sharpen' | 'heal' | 'matte' | 'segment'
+
+const CUSTOM_MODEL_KINDS: readonly CustomModelKind[] = ['sharpen', 'heal', 'matte', 'segment']
 /** 自定义模型编号：custom- 加 SHA-256 前 12 位 */
 export type CustomModelKey = `custom-${string}`
 
@@ -54,7 +60,10 @@ export interface ModelStatus {
   runtimeSize: number
   error: string
   runtimeUrl: string
+  /** 第一个模型文件 */
   modelUrl: string
+  /** 全部模型文件（抠图模型是编码器、解码器两个）；旧版启动器没有时只有 modelUrl */
+  modelUrls: string[]
 }
 
 /** 用户导入的 AI 模型（只在 EXE 版里，由启动器保存在模型目录的 custom 文件夹） */
@@ -64,9 +73,12 @@ export interface CustomModel {
   name: string
   size: number
   sha256: string
-  /** 文件还在、大小一致 */
+  /** 文件还在、大小一致（抠图模型两个文件都要在） */
   available: boolean
+  /** 模型文件；抠图模型是图像编码器 */
   modelUrl: string
+  /** 抠图模型的掩码解码器；其他用途为空串 */
+  decoderUrl: string
 }
 
 export interface ModelsSnapshot {
@@ -131,6 +143,10 @@ function toStatus(value: unknown): ModelStatus | null {
     error: typeof item.error === 'string' ? item.error : '',
     runtimeUrl: item.runtimeUrl,
     modelUrl: item.modelUrl,
+    modelUrls:
+      Array.isArray(item.modelUrls) && item.modelUrls.every((url) => typeof url === 'string')
+        ? (item.modelUrls as string[])
+        : [item.modelUrl],
   }
 }
 
@@ -147,12 +163,13 @@ function toCustom(value: unknown): CustomModel | null {
   return {
     id: item.id,
     // 旧版启动器不返回用途，当时只能导入清晰化模型。
-    kind: item.kind === 'heal' ? 'heal' : 'sharpen',
+    kind: CUSTOM_MODEL_KINDS.includes(item.kind as CustomModelKind) ? (item.kind as CustomModelKind) : 'sharpen',
     name: item.name,
     size: item.size,
     sha256: typeof item.sha256 === 'string' ? item.sha256 : '',
     available: item.available === true,
     modelUrl: item.modelUrl,
+    decoderUrl: typeof item.decoderUrl === 'string' ? item.decoderUrl : '',
   }
 }
 
@@ -217,7 +234,10 @@ export async function moveModelsDir(
   return { snapshot: toSnapshot(body), moved: body.moved === true }
 }
 
-/** 弹出系统「打开文件」窗口导入一个 ONNX 模型作为 kind 用途；取消时 imported 为 null。 */
+/**
+ * 弹出系统「打开文件」窗口导入一个 ONNX 模型作为 kind 用途；抠图模型会连续弹两次（编码器、解码器）。
+ * 取消时 imported 为 null。
+ */
 export async function importCustomModel(
   kind: CustomModelKind,
 ): Promise<{ snapshot: ModelsSnapshot; imported: string | null }> {

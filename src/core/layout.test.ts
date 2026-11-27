@@ -5,9 +5,14 @@ import {
   CANVAS_SAFE_SIDE,
   WEBP_MAX_SIDE,
   MAX_GAP,
+  applyCanvasSize,
   calculateStitchLayout,
+  clampDragDelta,
   clampGap,
   inspectOutputSize,
+  moveLayer,
+  paintOrder,
+  snapMove,
 } from './layout'
 
 const images = [
@@ -105,5 +110,78 @@ describe('inspectOutputSize', () => {
     const check = inspectOutputSize(9000, 9000)
     expect(check.ok).toBe(true)
     expect(check.isLarge).toBe(true)
+  })
+})
+
+describe('dragged images and layers', () => {
+  it('adds offsets to the automatic slot without changing the canvas size', () => {
+    const layout = calculateStitchLayout(
+      [images[0], { ...images[1], offsetX: -50, offsetY: 30 }, images[2]],
+      'vertical',
+      10,
+    )
+    const plain = calculateStitchLayout(images, 'vertical', 10)
+    expect(layout.width).toBe(plain.width)
+    expect(layout.height).toBe(plain.height)
+    expect(layout.items[1].x).toBe(plain.items[1].x - 50)
+    expect(layout.items[1].y).toBe(plain.items[1].y + 30)
+    expect(layout.items[2]).toEqual(plain.items[2])
+  })
+
+  it('paints by layer, unlayered images on top in queue order', () => {
+    const order = paintOrder([
+      { id: 'a' },
+      { id: 'b', layer: 1 },
+      { id: 'c', layer: 0 },
+      { id: 'd' },
+    ]).map((item) => item.id)
+    expect(order).toEqual(['c', 'b', 'a', 'd'])
+  })
+
+  it('moves layers and refuses moves past the ends', () => {
+    expect(moveLayer(['a', 'b', 'c'], 'a', 'up')).toEqual(['b', 'a', 'c'])
+    expect(moveLayer(['a', 'b', 'c'], 'a', 'top')).toEqual(['b', 'c', 'a'])
+    expect(moveLayer(['a', 'b', 'c'], 'c', 'bottom')).toEqual(['c', 'a', 'b'])
+    expect(moveLayer(['a', 'b', 'c'], 'c', 'up')).toBeNull()
+    expect(moveLayer(['a', 'b', 'c'], 'a', 'down')).toBeNull()
+    expect(moveLayer(['a', 'b'], 'x', 'up')).toBeNull()
+  })
+
+  it('keeps at least a strip of the image inside the canvas', () => {
+    const rect = { x: 100, y: 100, width: 200, height: 100 }
+    const bounds = { width: 1000, height: 800 }
+    expect(clampDragDelta(rect, 50, -20, bounds)).toEqual({ dx: 50, dy: -20 })
+    // 往左拖出去：右边至少留 24 px 在画布里
+    expect(clampDragDelta(rect, -1000, 0, bounds)).toEqual({ dx: -276, dy: 0 })
+    // 往下拖出去：上边留 24 px
+    expect(clampDragDelta(rect, 0, 5000, bounds)).toEqual({ dx: 0, dy: 676 })
+  })
+})
+
+describe('canvas size and snapping', () => {
+  it('resizes the canvas and moves content by the anchor', () => {
+    const base = calculateStitchLayout(images.slice(0, 2), 'vertical', 0)
+    const centered = applyCanvasSize(base, { width: 1400, height: 2000, anchorX: 0.5, anchorY: 0.5 })
+    expect(centered.width).toBe(1400)
+    expect(centered.height).toBe(2000)
+    expect(centered.items[0].x).toBe(base.items[0].x + 100)
+    expect(centered.items[0].y).toBe(base.items[0].y + 300)
+    const topLeft = applyCanvasSize(base, { width: 800, height: 800, anchorX: 0, anchorY: 0 })
+    expect(topLeft.items[1]).toEqual(base.items[1])
+    expect(applyCanvasSize(base, null)).toBe(base)
+  })
+
+  it('snaps edges to neighbours and canvas within the threshold', () => {
+    const moving = { x: 0, y: 0, width: 100, height: 100 }
+    const other = { x: 300, y: 50, width: 100, height: 100 }
+    const bounds = { width: 1000, height: 1000 }
+    // 右边离别人左边 6 px：贴上去
+    expect(snapMove(moving, 194, 300, [other], bounds, 8)).toMatchObject({ dx: 200, guideX: 300 })
+    // 上边离别人上边 5 px：对齐
+    expect(snapMove(moving, 500, 45, [other], bounds, 8)).toMatchObject({ dy: 50, guideY: 50 })
+    // 远了不吸
+    expect(snapMove(moving, 150, 300, [other], bounds, 8)).toEqual({ dx: 150, dy: 300, guideX: null, guideY: null })
+    // 靠近画布右边
+    expect(snapMove(moving, 897, 400, [], bounds, 8).dx).toBe(900)
   })
 })

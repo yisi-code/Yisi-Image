@@ -16,8 +16,10 @@ import {
   Mail,
   MessageCircle,
   MessageSquare,
+  Move,
   PenLine,
   RefreshCw,
+  Scissors,
   Settings2,
   ShieldCheck,
   SlidersHorizontal,
@@ -100,6 +102,16 @@ const features = [
     detail: '文字可再改；修瑕、清晰化均可选经典或 AI；缩放、裁剪、还原；前后对比',
   },
   {
+    icon: Scissors,
+    title: '抠图与去背景',
+    detail: '一键去除背景；点选物体抠出细部、部位或整体；可导入自己的模型',
+  },
+  {
+    icon: Move,
+    title: '自由摆放',
+    detail: '拼接时拖动换位置、调图层、吸附对齐，显示 X / Y，可改画布尺寸',
+  },
+  {
     icon: FilePlus2,
     title: '空白页',
     detail: '插入白底页，输入尺寸或拖手柄调整',
@@ -112,7 +124,7 @@ const features = [
   {
     icon: ImageIcon,
     title: '单图编辑',
-    detail: '逐张标注、修瑕，可按同一设置批量导出',
+    detail: '逐张标注、修瑕、抠图，每张可设底色，可按同一设置批量导出',
   },
   {
     icon: FolderDown,
@@ -138,6 +150,11 @@ const shortcuts = [
   { keys: ['0', '双击'], label: '适应窗口' },
   { keys: ['↑', '↓', '←', '→'], label: '平移画面' },
   { keys: ['Alt', '↑', '↓'], label: '调整队列顺序' },
+  { keys: ['Alt', '拖动'], label: '拖动图片时临时不吸附' },
+  { keys: ['Alt', '点击'], label: '抠图时加排除点' },
+  { keys: ['Enter'], label: '抠图：保留选中' },
+  { keys: ['Backspace'], label: '抠图：撤回最后一个点' },
+  { keys: ['Ctrl', 'Z'], label: '撤销标注与抠图' },
 ]
 
 async function checkForUpdate(): Promise<void> {
@@ -364,6 +381,7 @@ defineExpose({ focusTitle })
           </li>
           <li>GIF 只使用第一帧；视频、独立裁剪和滤镜不在本工具范围。</li>
           <li>局部修瑕按周围画面补全，被挡住的人脸、文字等独特内容无法凭空还原；AI 修瑕只在 EXE 版可用；画笔和修瑕笔画提交后不能单独移动。</li>
+          <li>去除背景与抠图只在 EXE 版可用；透明、反光的物体常常选不全，可加保留点或排除点再修；拖动位置、图层与画布尺寸不进撤销记录，用「归位」「贴合内容」回去。</li>
           <li>只保留最近一次清空的快照；刷新或关闭页面会释放，超大图片请留意内存。</li>
           <li>
             免安装 EXE 未签名，首次运行可能触发 SmartScreen；需要 Windows 自带的 .NET Framework 4.8。

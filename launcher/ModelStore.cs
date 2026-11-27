@@ -43,23 +43,50 @@ namespace Yisi.ImageTool
         }
     }
 
-    /// <summary>一个可选的 AI 模型：运行库 + 模型文件，两者都下载完才能用。</summary>
+    /// <summary>
+    /// 一个可选的 AI 模型：运行库 + 一个或几个模型文件（如抠图的编码器与解码器），全部下载完才能用。
+    /// Model 是第一个模型文件，页面的 modelUrl 指向它；modelUrls 按顺序列出全部。
+    /// </summary>
     internal sealed class ModelEntry
     {
         internal readonly string Id;
         internal readonly ModelFile Runtime;
-        internal readonly ModelFile Model;
+        internal readonly ModelFile[] Models;
 
-        internal ModelEntry(string id, ModelFile runtime, ModelFile model)
+        internal ModelEntry(string id, ModelFile runtime, params ModelFile[] models)
         {
             Id = id;
             Runtime = runtime;
-            Model = model;
+            Models = models;
+        }
+
+        internal ModelFile Model
+        {
+            get { return Models[0]; }
         }
 
         internal ModelFile[] Files
         {
-            get { return new ModelFile[] { Runtime, Model }; }
+            get
+            {
+                ModelFile[] files = new ModelFile[Models.Length + 1];
+                files[0] = Runtime;
+                Models.CopyTo(files, 1);
+                return files;
+            }
+        }
+
+        internal long ModelSize
+        {
+            get
+            {
+                long total = 0;
+                foreach (ModelFile file in Models)
+                {
+                    total += file.Size;
+                }
+                return total;
+            }
         }
     }
 
@@ -125,11 +152,73 @@ namespace Yisi.ImageTool
                 "https://huggingface.co/jonathanst29/tinier-upscale-models/resolve/899dc1e4b22bbf1955c2f1739c085edc080cb366/realesr-general-x4v3.onnx",
             });
 
+        /// <summary>
+        /// U²-Net-P（rembg 的 u2netp.onnx），用于快速去除背景；Apache-2.0。
+        /// 输入 float32 [1,3,320,320]（ImageNet 归一化），第一个输出 [1,1,320,320] 为 0–1 前景概率。
+        /// </summary>
+        private static readonly ModelFile U2netpFile = new ModelFile(
+            "u2netp.onnx",
+            4574861,
+            "309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8",
+            "application/octet-stream",
+            new string[]
+            {
+                "https://hf-mirror.com/BritishWerewolf/U-2-Netp/resolve/7112208dbac3a3642496c8d54e2f0f9bb3dc1dc8/onnx/model.onnx",
+                "https://huggingface.co/BritishWerewolf/U-2-Netp/resolve/7112208dbac3a3642496c8d54e2f0f9bb3dc1dc8/onnx/model.onnx",
+                "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx",
+            });
+
+        /// <summary>
+        /// IS-Net general use（DIS，rembg 的 isnet-general-use.onnx），用于精细去除背景；Apache-2.0。
+        /// 输入 float32 [1,3,1024,1024]（减均值、不除方差），第一个输出 [1,1,1024,1024] 为 0–1 前景概率。
+        /// </summary>
+        private static readonly ModelFile IsnetFile = new ModelFile(
+            "isnet-general-use.onnx",
+            178648008,
+            "60920e99c45464f2ba57bee2ad08c919a52bbf852739e96947fbb4358c0d964a",
+            "application/octet-stream",
+            new string[]
+            {
+                "https://hf-mirror.com/BritishWerewolf/IS-Net/resolve/9783722d9f964c0286a411e7e8e6fede947d5a53/onnx/model.onnx",
+                "https://huggingface.co/BritishWerewolf/IS-Net/resolve/9783722d9f964c0286a411e7e8e6fede947d5a53/onnx/model.onnx",
+                "https://github.com/danielgatis/rembg/releases/download/v0.0.0/isnet-general-use.onnx",
+            });
+
+        /// <summary>
+        /// MobileSAM 图像编码器（Acly/MobileSAM 的 ONNX 导出），用于点选抠图；MIT。
+        /// 输入 float32 [高, 宽, 3]（长边缩到 1024、RGB 0–255），输出 image_embeddings [1,256,64,64]。
+        /// </summary>
+        private static readonly ModelFile MobileSamEncoderFile = new ModelFile(
+            "mobile_sam_image_encoder.onnx",
+            28157093,
+            "580f5fb648ea1062c0aabc26217aed56921985f03f0cbbd852bba81d760cc749",
+            "application/octet-stream",
+            new string[]
+            {
+                "https://hf-mirror.com/Acly/MobileSAM/resolve/0d3b403339b4674a82493d5e97964dd78089ddc8/mobile_sam_image_encoder.onnx",
+                "https://huggingface.co/Acly/MobileSAM/resolve/0d3b403339b4674a82493d5e97964dd78089ddc8/mobile_sam_image_encoder.onnx",
+            });
+
+        /// <summary>SAM 掩码解码器（多掩码输出），与上面的编码器配套，标准 SAM ONNX 接口。</summary>
+        private static readonly ModelFile MobileSamDecoderFile = new ModelFile(
+            "sam_mask_decoder_multi.onnx",
+            16496559,
+            "8976b90a87ba50a6a72217a5ff994f7d25ce16f2229fcc1ed259e1294c622ffe",
+            "application/octet-stream",
+            new string[]
+            {
+                "https://hf-mirror.com/Acly/MobileSAM/resolve/0d3b403339b4674a82493d5e97964dd78089ddc8/sam_mask_decoder_multi.onnx",
+                "https://huggingface.co/Acly/MobileSAM/resolve/0d3b403339b4674a82493d5e97964dd78089ddc8/sam_mask_decoder_multi.onnx",
+            });
+
         private static readonly ModelEntry[] Entries = new ModelEntry[]
         {
             new ModelEntry("migan", RuntimeFile, MiganFile),
             new ModelEntry("lama", RuntimeFile, LamaFile),
             new ModelEntry("realesrgan", RuntimeFile, RealEsrganFile),
+            new ModelEntry("u2netp", RuntimeFile, U2netpFile),
+            new ModelEntry("isnet", RuntimeFile, IsnetFile),
+            new ModelEntry("mobilesam", RuntimeFile, MobileSamEncoderFile, MobileSamDecoderFile),
         };
 
         private static readonly object Sync = new object();
@@ -186,9 +275,9 @@ namespace Yisi.ImageTool
                             }
                         }
                         downloaded += fileBytes;
-                        if (file == entry.Model)
+                        if (file != entry.Runtime)
                         {
-                            modelDownloaded = fileBytes;
+                            modelDownloaded += fileBytes;
                         }
                     }
 
@@ -223,11 +312,17 @@ namespace Yisi.ImageTool
                     // 模型文件本身已下的字节；运行库各模型共用，只有它下好时模型仍算「未下载」。
                     item["modelDownloaded"] = modelDownloaded;
                     item["total"] = total;
-                    item["modelSize"] = entry.Model.Size;
+                    item["modelSize"] = entry.ModelSize;
                     item["runtimeSize"] = entry.Runtime.Size;
                     item["error"] = state == "error" ? error : string.Empty;
                     item["runtimeUrl"] = "/models/" + entry.Runtime.Name;
                     item["modelUrl"] = "/models/" + entry.Model.Name;
+                    List<string> modelUrls = new List<string>();
+                    foreach (ModelFile file in entry.Models)
+                    {
+                        modelUrls.Add("/models/" + file.Name);
+                    }
+                    item["modelUrls"] = modelUrls;
                     items.Add(item);
                 }
 
@@ -299,7 +394,10 @@ namespace Yisi.ImageTool
                 }
                 Errors.Remove(entry.Id);
                 string dir = CurrentDirectory();
-                DeleteFile(dir, entry.Model);
+                foreach (ModelFile file in entry.Models)
+                {
+                    DeleteFile(dir, file);
+                }
 
                 bool runtimeInUse = false;
                 foreach (ModelEntry other in Entries)
@@ -308,9 +406,15 @@ namespace Yisi.ImageTool
                     {
                         continue;
                     }
-                    string otherModel = Path.Combine(dir, other.Model.Name);
-                    if (File.Exists(otherModel) || File.Exists(otherModel + PartSuffix) ||
-                        activeId == other.Id || Queue.Contains(other.Id))
+                    foreach (ModelFile file in other.Models)
+                    {
+                        string otherModel = Path.Combine(dir, file.Name);
+                        if (File.Exists(otherModel) || File.Exists(otherModel + PartSuffix))
+                        {
+                            runtimeInUse = true;
+                        }
+                    }
+                    if (activeId == other.Id || Queue.Contains(other.Id))
                     {
                         runtimeInUse = true;
                     }

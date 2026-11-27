@@ -1,7 +1,7 @@
 <script lang="ts">
 import { ref } from 'vue'
 
-type SettingsCategory = 'thumbnail' | 'heal' | 'sharpen' | 'files'
+type SettingsCategory = 'thumbnail' | 'heal' | 'sharpen' | 'matte' | 'files'
 
 /**
  * 当前选中的设置分类。放在模块级：返回拼接时设置页会卸载，再进设置仍停在上次看的分类；
@@ -29,6 +29,7 @@ import {
   Maximize2,
   RefreshCw,
   RotateCcw,
+  Scissors,
   Settings2,
   Sparkles,
   Undo2,
@@ -47,11 +48,20 @@ import type {
   CustomModel,
   CustomModelKind,
   HealModelId,
+  MatteModelId,
   ModelId,
   ModelStatus,
   ModelsSnapshot,
 } from '../core/modelApi'
 import { BUILTIN_SHARPEN_MODELS, findBuiltinSharpenModel } from '../core/sharpenModels'
+import {
+  BUILTIN_MATTE_MODELS,
+  BUILTIN_SEGMENT_MODELS,
+  DEFAULT_MATTE_MODEL,
+  DEFAULT_SEGMENT_MODEL,
+  findBuiltinMatteModel,
+  findBuiltinSegmentModel,
+} from '../core/matteModels'
 import {
   HEAL_ENGINE_OPTIONS,
   SHARPEN_ENGINE_OPTIONS,
@@ -111,6 +121,7 @@ const categories: { key: SettingsCategory; label: string; icon: Component }[] = 
   { key: 'thumbnail', label: '预览缩略图', icon: GalleryThumbnails },
   { key: 'heal', label: '局部修瑕', icon: Wand2 },
   { key: 'sharpen', label: '清晰化', icon: Sparkles },
+  { key: 'matte', label: '抠图与去背景', icon: Scissors },
   { key: 'files', label: '文件管理', icon: FolderCog },
 ]
 
@@ -195,6 +206,23 @@ const sharpenIcons: Record<SharpenEngine, Component> = {
   ai: Brain,
 }
 
+const matteIcons: Record<MatteModelId, Component> = {
+  u2netp: Zap,
+  isnet: Brain,
+}
+
+/** 内置模型属于哪个设置分类 */
+function modelCategory(id: ModelId): 'heal' | 'sharpen' | 'matte' {
+  if (isHealModel(id)) {
+    return 'heal'
+  }
+  return findBuiltinSharpenModel(id) ? 'sharpen' : 'matte'
+}
+
+function isSegmentModel(id: ModelId): boolean {
+  return findBuiltinSegmentModel(id) !== null
+}
+
 const aiOptions = HEAL_ENGINE_OPTIONS.filter((option) => isAiEngine(option.value))
 
 /** 要用户确认下载 / 删除的模型；null 表示没有打开确认框。 */
@@ -224,7 +252,21 @@ function customModelsOf(kind: CustomModelKind): CustomModel[] {
 }
 
 function modelLabel(id: ModelId): string {
-  return isHealModel(id) ? engineLabel(id) : `AI · ${findBuiltinSharpenModel(id)?.label ?? id}`
+  if (isHealModel(id)) {
+    return engineLabel(id)
+  }
+  const label =
+    findBuiltinSharpenModel(id)?.label ?? findBuiltinMatteModel(id)?.label ?? findBuiltinSegmentModel(id)?.label
+  return `AI · ${label ?? id}`
+}
+
+/** 去背景 / 抠图默认模型的名字：内置模型或自定义模型。 */
+function matteModelLabel(key: string, kind: 'matte' | 'segment'): string {
+  return (
+    (kind === 'matte' ? findBuiltinMatteModel(key)?.label : findBuiltinSegmentModel(key)?.label) ??
+    customModelsOf(kind).find((model) => model.id === key)?.name ??
+    '未选择'
+  )
 }
 
 /** 清晰化默认模型的名字：内置模型或自定义模型。 */
@@ -244,18 +286,26 @@ function customStateText(model: CustomModel): { text: string; error: boolean } {
   if (!props.models?.runtimeReady) {
     return { text: '缺 AI 运行库：先下载上面的内置模型，运行库会一起下载', error: true }
   }
-  return model.kind === 'heal'
-    ? { text: '可以使用，第一次修瑕时会自动识别输入格式', error: false }
-    : { text: '可以使用，第一次用时会自动识别放大倍数', error: false }
+  const ready: Record<CustomModelKind, string> = {
+    heal: '可以使用，第一次修瑕时会自动识别输入格式',
+    sharpen: '可以使用，第一次用时会自动识别放大倍数',
+    matte: '可以使用，第一次去背景时会自动识别输入格式',
+    segment: '可以使用，第一次抠图时会检查是不是标准 SAM 接口',
+  }
+  return { text: ready[model.kind], error: false }
 }
 
 function isCustomUsable(model: CustomModel | undefined): boolean {
   return Boolean(model?.available && props.models?.runtimeReady)
 }
 
-/** 模型用在哪：修瑕或清晰化；提示文案按它说。 */
+/** 模型用在哪；提示文案按它说。 */
 function modelPurpose(id: ModelId): string {
-  return isHealModel(id) ? '修瑕' : '清晰化'
+  const category = modelCategory(id)
+  if (category === 'matte') {
+    return isSegmentModel(id) ? '抠图' : '去除背景'
+  }
+  return category === 'heal' ? '修瑕' : '清晰化'
 }
 
 function modelStatus(id: ModelId): ModelStatus | null {
@@ -318,6 +368,11 @@ const sharpenSummary = computed(() =>
     : `AI · ${sharpenModelLabel(props.settings.sharpenModel)}`,
 )
 
+const matteSummary = computed(
+  () =>
+    `去背景：${matteModelLabel(props.settings.matteModel, 'matte')} · 抠图：${matteModelLabel(props.settings.segmentModel, 'segment')}`,
+)
+
 const modelsDirStatus = computed<ConfigDirStatus | null>(() => {
   if (props.modelsStatus) {
     return props.modelsStatus
@@ -330,8 +385,9 @@ const modelsDirStatus = computed<ConfigDirStatus | null>(() => {
 /** 有错误的分类在页签上标出来：停在别的分类时，也能看到配置没保存上、模型下载失败。 */
 const categoryAlerts = computed<Record<SettingsCategory, boolean>>(() => ({
   thumbnail: false,
-  heal: props.models?.items.some((item) => isHealModel(item.id) && item.state === 'error') ?? false,
-  sharpen: props.models?.items.some((item) => !isHealModel(item.id) && item.state === 'error') ?? false,
+  heal: props.models?.items.some((item) => modelCategory(item.id) === 'heal' && item.state === 'error') ?? false,
+  sharpen: props.models?.items.some((item) => modelCategory(item.id) === 'sharpen' && item.state === 'error') ?? false,
+  matte: props.models?.items.some((item) => modelCategory(item.id) === 'matte' && item.state === 'error') ?? false,
   files: configStatus.value?.tone === 'error' || Boolean(props.modelsLoadError),
 }))
 
@@ -347,9 +403,14 @@ const downloadPrompt = computed(() => {
   const parts = runtimeReady
     ? `模型 ${formatFileSize(status.modelSize)}；运行库已就绪`
     : `模型 ${formatFileSize(status.modelSize)}，另需运行库 ${formatFileSize(status.runtimeSize)}，各 AI 模型共用`
-  const meanwhile = isHealModel(id)
-    ? `下载期间修瑕先用经典算法，下完自动改用 ${label}`
-    : `下完就能在清晰化面板里用 ${label}`
+  const meanwhileByCategory = {
+    heal: `下载期间修瑕先用经典算法，下完自动改用 ${label}`,
+    sharpen: `下完就能在清晰化面板里用 ${label}`,
+    matte: isSegmentModel(id)
+      ? `下完就能用标注栏的「抠图」工具点选物体`
+      : `下完就能用标注栏的「去除背景」按钮`,
+  }
+  const meanwhile = meanwhileByCategory[modelCategory(id)]
   return {
     title: `下载 ${label}？`,
     description:
@@ -368,7 +429,12 @@ const deletePrompt = computed(() => {
   const inUse =
     props.settings.healEngine === id ||
     (props.settings.sharpenEngine === 'ai' && props.settings.sharpenModel === id)
-  const current = inUse ? `当前选用的就是它，删除后${modelPurpose(id)}改用经典方式。` : ''
+  const matteInUse = props.settings.matteModel === id || props.settings.segmentModel === id
+  const current = inUse
+    ? `当前选用的就是它，删除后${modelPurpose(id)}改用经典方式。`
+    : matteInUse
+      ? `当前选用的就是它，删除后要重新下载才能${modelPurpose(id)}。`
+      : ''
   return {
     title: `删除 ${label} 模型？`,
     description: `将删除模型文件 ${formatFileSize(status.modelDownloaded)}（含下了一半的部分；运行库别的 AI 模型还在用时保留），之后再用需要重新下载。${current}`,
@@ -412,6 +478,22 @@ function selectSharpenModel(key: string): void {
   emit('update', { sharpenEngine: 'ai', sharpenModel: key })
 }
 
+/** 设为去背景 / 抠图默认的模型；内置模型还没下载时先问是否下载。 */
+function selectMatteModel(key: string, kind: 'matte' | 'segment'): void {
+  const builtinId = kind === 'matte' ? findBuiltinMatteModel(key)?.value : findBuiltinSegmentModel(key)?.id
+  if (builtinId) {
+    if (!props.modelsAvailable) {
+      return
+    }
+    const status = modelStatus(builtinId)
+    if (status && status.state !== 'ready' && !isModelBusy(status.state)) {
+      pendingDownload.value = builtinId
+      return
+    }
+  }
+  emit('update', kind === 'matte' ? { matteModel: key } : { segmentModel: key })
+}
+
 /** 导入的修瑕模型设为补全方式。 */
 function selectHealCustom(key: string): void {
   if (isCustomModelKey(key)) {
@@ -427,7 +509,11 @@ const customDeletePrompt = computed(() => {
   let inUse = ''
   if (model.kind === 'heal' && props.settings.healEngine === model.id) {
     inUse = '它是当前的补全方式，删除后修瑕改用经典算法。'
-  } else if (model.kind === 'sharpen' && props.settings.sharpenModel === model.id) {
+  } else if (
+    (model.kind === 'sharpen' && props.settings.sharpenModel === model.id) ||
+    (model.kind === 'matte' && props.settings.matteModel === model.id) ||
+    (model.kind === 'segment' && props.settings.segmentModel === model.id)
+  ) {
     inUse = '它是当前的默认模型，删除后改用内置模型。'
   }
   return {
@@ -448,6 +534,12 @@ function confirmCustomDelete(): void {
   if (model.kind === 'sharpen' && props.settings.sharpenModel === model.id) {
     emit('update', { sharpenModel: BUILTIN_SHARPEN_MODELS[0].id })
   }
+  if (model.kind === 'matte' && props.settings.matteModel === model.id) {
+    emit('update', { matteModel: DEFAULT_MATTE_MODEL })
+  }
+  if (model.kind === 'segment' && props.settings.segmentModel === model.id) {
+    emit('update', { segmentModel: DEFAULT_SEGMENT_MODEL })
+  }
   emit('delete-custom-model', model.id)
 }
 
@@ -457,7 +549,14 @@ function confirmDownload(): void {
   if (!id) {
     return
   }
-  emit('update', isHealModel(id) ? { healEngine: id } : { sharpenEngine: 'ai', sharpenModel: id })
+  const category = modelCategory(id)
+  if (category === 'heal' && isHealModel(id)) {
+    emit('update', { healEngine: id })
+  } else if (category === 'sharpen') {
+    emit('update', { sharpenEngine: 'ai', sharpenModel: id })
+  } else {
+    emit('update', isSegmentModel(id) ? { segmentModel: id } : { matteModel: id })
+  }
   emit('download-model', id)
 }
 
@@ -542,7 +641,7 @@ defineExpose({ focusTitle })
           <span class="settings-pill">仅本机</span>
         </div>
         <p v-if="isFileStorage">
-          按类别调整预览缩略图、局部修瑕与清晰化的方式和 AI 模型，以及配置文件和模型文件的存放位置。设置会自动保存到配置文件（默认在程序所在目录），不影响导出的原图。
+          按类别调整预览缩略图，局部修瑕、清晰化、抠图与去背景的方式和 AI 模型，以及配置文件和模型文件的存放位置。设置会自动保存到配置文件（默认在程序所在目录），不影响导出的原图。
         </p>
         <p v-else>
           按类别调整预览缩略图、局部修瑕与清晰化的方式。设置会自动保存在当前浏览器，不影响导出的原图。
@@ -931,6 +1030,176 @@ defineExpose({ focusTitle })
     </section>
 
     <section
+      v-show="activeCategory === 'matte'"
+      id="settings-panel-matte"
+      class="settings-card"
+      role="tabpanel"
+      aria-labelledby="settings-tab-matte"
+    >
+      <header class="settings-card__head">
+        <div>
+          <h3 id="matte-settings-title">抠图与去背景</h3>
+          <p>在预览标注栏里使用：「去除背景」按钮自动识别主体，把背景变透明；「抠图」工具点一下物体即可选中，可在细部、部位、整体之间切换。模型都在本机运行，图片不会上传。</p>
+        </div>
+        <span class="settings-summary">{{ matteSummary }}</span>
+      </header>
+
+      <div class="setting-block">
+        <div class="setting-label">
+          <h4>去除背景模型</h4>
+          <p>两个内置模型一快一精，可按图片选择，随时可以换；也可以在下面导入自己的去背景模型并设为默认。</p>
+        </div>
+        <div class="settings-choices settings-choices--two" role="group" aria-label="去除背景模型">
+          <button
+            v-for="option in BUILTIN_MATTE_MODELS"
+            :key="option.value"
+            class="settings-choice engine-choice"
+            :class="{ 'is-selected': settings.matteModel === option.value }"
+            type="button"
+            :aria-pressed="settings.matteModel === option.value"
+            :disabled="!modelsAvailable"
+            @click="selectMatteModel(option.value, 'matte')"
+          >
+            <span class="engine-choice__head">
+              <component :is="matteIcons[option.value]" :size="17" :stroke-width="1.8" />
+              <span class="engine-choice__name">{{ option.label }}</span>
+              <span class="engine-choice__tag">{{ option.tag }}</span>
+            </span>
+            <small>{{ option.summary }}</small>
+            <span class="engine-points">
+              <span
+                v-for="point in option.strengths"
+                :key="point"
+                class="engine-point engine-point--strength"
+              >
+                {{ point }}
+              </span>
+              <span
+                v-for="point in option.limits"
+                :key="point"
+                class="engine-point engine-point--limit"
+              >
+                {{ point }}
+              </span>
+            </span>
+            <span
+              class="engine-choice__state"
+              :class="{ 'is-ready': modelStatus(option.value)?.state === 'ready' }"
+            >
+              {{ modelStateText(modelStatus(option.value)) }}
+            </span>
+          </button>
+        </div>
+      </div>
+
+      <div class="setting-block setting-block--last">
+        <div class="setting-label">
+          <h4>AI 模型</h4>
+          <p>内置模型由本机程序下载，可暂停后接着下，下完按 SHA-256 校验；也可以导入自己找的 ONNX 去背景模型或抠图模型。都放在「文件管理」里的模型目录，运行库与其他 AI 模型共用一份。</p>
+        </div>
+        <div v-if="modelsAvailable" class="model-list">
+          <ModelRow
+            v-for="option in BUILTIN_MATTE_MODELS"
+            :key="option.value"
+            :label="`去除背景 · ${option.label}`"
+            :status="modelStatus(option.value)"
+            :state-text="modelStateText(modelStatus(option.value))"
+            :busy="modelsBusy"
+            selectable
+            :selected="settings.matteModel === option.value"
+            @download="emit('download-model', $event)"
+            @pause="emit('pause-model', $event)"
+            @reveal="emit('reveal-model', $event)"
+            @delete="pendingDelete = $event"
+            @select="selectMatteModel($event, 'matte')"
+          />
+          <CustomModelRow
+            v-for="model in customModelsOf('matte')"
+            :key="model.id"
+            :model="model"
+            :state-text="customStateText(model).text"
+            :state-error="customStateText(model).error"
+            :selected="settings.matteModel === model.id"
+            :busy="modelsBusy"
+            select-title="「去除背景」按钮用这个模型"
+            @select="selectMatteModel($event, 'matte')"
+            @rename="(id, name) => emit('rename-custom-model', id, name)"
+            @reveal="emit('reveal-model', $event)"
+            @delete="pendingCustomDelete = models?.custom.find((item) => item.id === $event) ?? null"
+          />
+          <ModelRow
+            v-for="model in BUILTIN_SEGMENT_MODELS"
+            :key="model.id"
+            :label="`抠图 · ${model.label} · ${model.summary}`"
+            :status="modelStatus(model.id)"
+            :state-text="modelStateText(modelStatus(model.id))"
+            :busy="modelsBusy"
+            selectable
+            :selected="settings.segmentModel === model.id"
+            @download="emit('download-model', $event)"
+            @pause="emit('pause-model', $event)"
+            @reveal="emit('reveal-model', $event)"
+            @delete="pendingDelete = $event"
+            @select="selectMatteModel($event, 'segment')"
+          />
+          <CustomModelRow
+            v-for="model in customModelsOf('segment')"
+            :key="model.id"
+            :model="model"
+            :state-text="customStateText(model).text"
+            :state-error="customStateText(model).error"
+            :selected="settings.segmentModel === model.id"
+            :busy="modelsBusy"
+            select-title="「抠图」工具用这个模型"
+            @select="selectMatteModel($event, 'segment')"
+            @rename="(id, name) => emit('rename-custom-model', id, name)"
+            @reveal="emit('reveal-model', $event)"
+            @delete="pendingCustomDelete = models?.custom.find((item) => item.id === $event) ?? null"
+          />
+          <div class="custom-import">
+            <div class="custom-import__buttons">
+              <button
+                class="button button-secondary"
+                type="button"
+                :disabled="modelsBusy"
+                @click="emit('import-custom-model', 'matte')"
+              >
+                <FolderInput :size="14" :stroke-width="1.9" />
+                导入去背景模型…
+              </button>
+              <button
+                class="button button-secondary"
+                type="button"
+                :disabled="modelsBusy"
+                @click="emit('import-custom-model', 'segment')"
+              >
+                <FolderInput :size="14" :stroke-width="1.9" />
+                导入抠图模型…
+              </button>
+            </div>
+            <p class="config-note">
+              去背景模型：一个输入 float32 [1, 3, 高, 宽]（固定尺寸只支持方形，不固定时按 1024 计算），输出里有一个单通道的前景图 [1, 1, 高, 宽]；输入归一化方式（ImageNet、只减均值或 0–1）会用一张试算图自动识别。
+            </p>
+            <p class="config-note">
+              抠图模型：标准 SAM 的 ONNX 导出，依次选两个文件——图像编码器（输入 [高, 宽, 3] 的 0–255 图像，或 [1, 3, 1024, 1024] 的归一化图像）和掩码解码器（输入 image_embeddings、point_coords、point_labels、mask_input、has_mask_input、orig_im_size）。不符合时用的时候会提示原因。注意查看模型的许可证。
+            </p>
+          </div>
+          <p
+            v-if="modelsDirStatus"
+            class="config-status"
+            :class="`config-status--${modelsDirStatus.tone}`"
+            role="status"
+          >
+            {{ modelsDirStatus.text }}
+          </p>
+        </div>
+        <p v-else class="config-note">
+          当前以浏览器页面运行。抠图与去除背景要用 AI 模型，由免安装 EXE 版的本机程序下载和提供，这里不能使用。
+        </p>
+      </div>
+    </section>
+
+    <section
       v-show="activeCategory === 'files'"
       id="settings-panel-files"
       class="settings-card"
@@ -940,7 +1209,7 @@ defineExpose({ focusTitle })
       <header class="settings-card__head">
         <div>
           <h3 id="files-settings-title">文件管理</h3>
-          <p>配置文件和 AI 模型文件放在哪里：可以打开所在目录、换到别的目录或移回程序目录。单个模型的「查看文件」在「局部修瑕」「清晰化」的模型列表里。</p>
+          <p>配置文件和 AI 模型文件放在哪里：可以打开所在目录、换到别的目录或移回程序目录。单个模型的「查看文件」在「局部修瑕」「清晰化」「抠图与去背景」的模型列表里。</p>
         </div>
         <span class="settings-summary">{{ filesSummary }}</span>
       </header>
@@ -1079,10 +1348,10 @@ defineExpose({ focusTitle })
 
     <footer class="settings-footer">
       <p v-if="isFileStorage">
-        设置自动保存到配置文件。恢复默认会同时重置拼接间距与背景、修瑕补全方式、导出设置和预览面板的位置与显示状态，不改变配置目录，也不删除已下载的模型。
+        设置自动保存到配置文件。恢复默认会同时重置拼接间距、背景与吸附开关，修瑕补全方式，去背景与抠图的默认模型，导出设置和预览面板的位置与显示状态，不改变配置目录，也不删除已下载的模型。
       </p>
       <p v-else>
-        设置自动保存在本机浏览器，换浏览器或清除站点数据后会恢复默认。恢复默认会同时重置拼接间距与背景、导出设置和预览面板的位置与显示状态。
+        设置自动保存在本机浏览器，换浏览器或清除站点数据后会恢复默认。恢复默认会同时重置拼接间距、背景与吸附开关，导出设置和预览面板的位置与显示状态。
       </p>
       <button class="button button-secondary" type="button" @click="emit('reset')">
         <RotateCcw :size="14" :stroke-width="1.9" />
@@ -1451,6 +1720,12 @@ defineExpose({ focusTitle })
   align-items: flex-start;
   gap: 6px;
   margin-top: 2px;
+}
+
+.custom-import__buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .settings-choice--size {

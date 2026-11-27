@@ -39,14 +39,22 @@ import type { HealEngineChoice } from './core/healEngine'
 import type { AiModelChoice, SharpenAiState } from './core/sharpenEngine'
 import { BUILTIN_SHARPEN_MODELS, CUSTOM_MODEL_MULTIPLE } from './core/sharpenModels'
 import type { BuiltinSharpenModel } from './core/sharpenModels'
-import type { CustomModel } from './core/modelApi'
+import type { CustomModel, CustomModelKind, ModelStatus } from './core/modelApi'
+import type { MatteModelChoice, SegmentModelChoice } from './core/matteEngine'
+import {
+  BUILTIN_MATTE_MODELS,
+  BUILTIN_SEGMENT_MODELS,
+  findBuiltinMatteModel,
+  findBuiltinSegmentModel,
+} from './core/matteModels'
 import {
   IMAGE_ACCEPT,
   SUPPORTED_FORMAT_LABEL,
   formatDimensions,
   formatFileSize,
 } from './core/image'
-import { calculateStitchLayout, inspectOutputSize } from './core/layout'
+import { applyCanvasSize, calculateStitchLayout, inspectOutputSize } from './core/layout'
+import type { CanvasSize } from './core/layout'
 import {
   displaySizeOf,
   frameFromTransform,
@@ -103,41 +111,144 @@ const healEngineChoice = computed<HealEngineChoice>(() => {
   if (status?.state === 'ready') {
     return { kind: 'ai', model: engine, label, modelUrl: status.modelUrl, runtimeUrl: status.runtimeUrl }
   }
-  let reason = '模型还没有下载完'
-  if (!status) {
-    reason = '读不到模型状态'
-  } else if (isModelBusy(status.state) && status.total > 0) {
-    reason = `模型还在下载（${Math.floor((status.downloaded / status.total) * 100)}%）`
+  return {
+    kind: 'classic',
+    notice: `${label} ${notReadyReason(status)}，这次用经典算法；可在「设置 · 局部修瑕」里查看下载`,
   }
-  return { kind: 'classic', notice: `${label} ${reason}，这次用经典算法；可在「设置 · 局部修瑕」里查看下载` }
 })
 
-/** 导入的修瑕模型：要在 EXE 版、清单里还有它、文件还在、共用运行库已下载。 */
-function customHealChoice(key: `custom-${string}`): HealEngineChoice {
+/** 内置模型还不能用的原因：读不到状态、还在下载（带进度）、还没下载完。 */
+function notReadyReason(status: ModelStatus | null): string {
+  if (!status) {
+    return '读不到模型状态'
+  }
+  if (isModelBusy(status.state) && status.total > 0) {
+    return `模型还在下载（${Math.floor((status.downloaded / status.total) * 100)}%）`
+  }
+  return '模型还没有下载完'
+}
+
+/**
+ * 导入的模型能不能用：要在 EXE 版、清单里还有它（用途对得上）、文件还在、共用运行库已下载。
+ * 能用时返回模型，否则返回原因（place 是去哪个设置页处理）。
+ */
+function customModelState(
+  key: string,
+  kind: CustomModelKind,
+  place: string,
+): { model: CustomModel; runtimeUrl: string } | { reason: string } {
   const snapshot = models.snapshot.value
-  const model = snapshot?.custom.find((item) => item.id === key && item.kind === 'heal')
-  const label = model ? `自定义 · ${model.name}` : '自定义修瑕模型'
-  const fallback = (reason: string): HealEngineChoice => ({
-    kind: 'classic',
-    notice: `${label} ${reason}，这次用经典算法`,
-  })
+  const model = snapshot?.custom.find((item) => item.id === key && item.kind === kind)
   if (!models.isAvailable) {
-    return fallback('只能在免安装 EXE 版里使用')
+    return { reason: '只能在免安装 EXE 版里使用' }
   }
   if (!snapshot) {
-    return fallback('读不到模型状态')
+    return { reason: '读不到模型状态' }
   }
   if (!model) {
-    return fallback('已不在模型目录里；可在「设置 · 局部修瑕」里重新导入')
+    return { reason: `已不在模型目录里；可在${place}里重新导入` }
   }
   if (!model.available) {
-    return fallback('的文件不见了；可在「设置 · 局部修瑕」里重新导入')
+    return { reason: `的文件不见了；可在${place}里重新导入` }
   }
   if (!snapshot.runtimeReady) {
-    return fallback('缺 AI 运行库；在「设置 · 局部修瑕」下载 MI-GAN 时会一起下载')
+    return { reason: `缺 AI 运行库；在${place}下载任一内置模型时会一起下载` }
   }
-  return { kind: 'ai', model: key, label, modelUrl: model.modelUrl, runtimeUrl: snapshot.runtimeUrl }
+  return { model, runtimeUrl: snapshot.runtimeUrl }
 }
+
+/** 自定义模型显示的名字 */
+function customLabel(key: string, fallback: string): string {
+  const name = models.snapshot.value?.custom.find((item) => item.id === key)?.name
+  return name ? `自定义 · ${name}` : fallback
+}
+
+/** 导入的修瑕模型：不能用时这次用经典算法，并说明原因。 */
+function customHealChoice(key: `custom-${string}`): HealEngineChoice {
+  const label = customLabel(key, '自定义修瑕模型')
+  const state = customModelState(key, 'heal', '「设置 · 局部修瑕」')
+  if ('reason' in state) {
+    return { kind: 'classic', notice: `${label} ${state.reason}，这次用经典算法` }
+  }
+  return { kind: 'ai', model: key, label, modelUrl: state.model.modelUrl, runtimeUrl: state.runtimeUrl }
+}
+
+const MATTE_PLACE = '「设置 · 抠图与去背景」'
+
+/** 去除背景用的模型（设置里选的，内置或导入的）能不能用。 */
+const matteModelChoice = computed<MatteModelChoice>(() => {
+  const key = settings.value.matteModel
+  if (isCustomModelKey(key)) {
+    const label = customLabel(key, '自定义去背景模型')
+    const state = customModelState(key, 'matte', MATTE_PLACE)
+    return 'reason' in state
+      ? { ready: false, key, label, reason: `${label} ${state.reason}` }
+      : { ready: true, key, label, modelUrl: state.model.modelUrl, runtimeUrl: state.runtimeUrl, spec: null }
+  }
+  const builtin = findBuiltinMatteModel(key) ?? BUILTIN_MATTE_MODELS[BUILTIN_MATTE_MODELS.length - 1]
+  const label = builtin.label
+  if (!models.isAvailable) {
+    return { ready: false, key: builtin.value, label, reason: '去除背景要用 AI 模型，只能在免安装 EXE 版里使用' }
+  }
+  const status = models.statusOf(builtin.value)
+  if (status?.state === 'ready') {
+    return {
+      ready: true,
+      key: builtin.value,
+      label,
+      modelUrl: status.modelUrl,
+      runtimeUrl: status.runtimeUrl,
+      spec: builtin.spec,
+    }
+  }
+  return {
+    ready: false,
+    key: builtin.value,
+    label,
+    reason: `${label} ${notReadyReason(status)}，可在${MATTE_PLACE}里下载`,
+  }
+})
+
+/** 点选抠图用的模型（图像编码器 + 掩码解码器）能不能用。 */
+const segmentModelChoice = computed<SegmentModelChoice>(() => {
+  const key = settings.value.segmentModel
+  if (isCustomModelKey(key)) {
+    const label = customLabel(key, '自定义抠图模型')
+    const state = customModelState(key, 'segment', MATTE_PLACE)
+    return 'reason' in state
+      ? { ready: false, key, label, reason: `${label} ${state.reason}` }
+      : {
+          ready: true,
+          key,
+          label,
+          encoderUrl: state.model.modelUrl,
+          decoderUrl: state.model.decoderUrl,
+          runtimeUrl: state.runtimeUrl,
+        }
+  }
+  const builtin = findBuiltinSegmentModel(key) ?? BUILTIN_SEGMENT_MODELS[0]
+  const label = builtin.label
+  if (!models.isAvailable) {
+    return { ready: false, key: builtin.id, label, reason: '抠图要用 AI 模型，只能在免安装 EXE 版里使用' }
+  }
+  const status = models.statusOf(builtin.id)
+  if (status?.state === 'ready' && status.modelUrls.length >= 2) {
+    return {
+      ready: true,
+      key: builtin.id,
+      label,
+      encoderUrl: status.modelUrls[0],
+      decoderUrl: status.modelUrls[1],
+      runtimeUrl: status.runtimeUrl,
+    }
+  }
+  return {
+    ready: false,
+    key: builtin.id,
+    label,
+    reason: `${label} ${notReadyReason(status)}，可在${MATTE_PLACE}里下载`,
+  }
+})
 
 const EXE_ONLY_REASON = 'AI 清晰化只能在免安装 EXE 版里使用，浏览器页面请用经典锐化。'
 
@@ -159,13 +270,7 @@ function builtinSharpenState(model: BuiltinSharpenModel): SharpenAiState {
       },
     }
   }
-  let reason = '模型还没下载'
-  if (!status) {
-    reason = '读不到模型状态'
-  } else if (isModelBusy(status.state) && status.total > 0) {
-    reason = `模型还在下载（${Math.floor((status.downloaded / status.total) * 100)}%）`
-  }
-  return { ready: false, reason: `${reason}，可在「设置 · 清晰化」里下载。` }
+  return { ready: false, reason: `${notReadyReason(status)}，可在「设置 · 清晰化」里下载。` }
 }
 
 /** 自定义模型要有共用的运行库才能跑；运行库随任一内置 AI 模型一起下载。 */
@@ -269,6 +374,8 @@ const {
   addBlankAt,
   resizeBlank,
   setTransform: setStitchTransform,
+  setPosition: setStitchPosition,
+  setLayerOrder: setStitchLayers,
   removeImage,
   moveImage,
   clearImages,
@@ -283,6 +390,7 @@ const {
   addFiles: addEditFiles,
   removeImage: removeEditImage,
   setTransform: setEditTransform,
+  setEditBackground,
   clearImages: clearEditImages,
   restoreCleared: restoreEditCleared,
 } = useImageQueue()
@@ -376,9 +484,13 @@ async function onPanelUpdate(key: PanelKey, state: PanelState): Promise<void> {
   }
 }
 
-const layout = computed(() =>
+/** 按方向、间距自动排出来的布局（画布刚好包住内容） */
+const contentLayout = computed(() =>
   calculateStitchLayout(images.value.map(layoutSourceOf), direction.value, gap.value),
 )
+/** 手动设定的画布尺寸（调整工具「整张」里的画布面板）；null 表示贴合内容。队列清空时一并清掉。 */
+const canvasSize = ref<CanvasSize | null>(null)
+const layout = computed(() => applyCanvasSize(contentLayout.value, canvasSize.value))
 /** 整张拼接图的缩放与裁剪（调整工具「整张」）；null 表示原样。队列清空时一并清掉。 */
 const stitchFrame = ref<StitchFrame | null>(null)
 const stitchFrameTransform = computed(() =>
@@ -392,6 +504,7 @@ watch(
   (count) => {
     if (count === 0) {
       stitchFrame.value = null
+      canvasSize.value = null
     }
   },
 )
@@ -509,6 +622,7 @@ const exportItems = computed<ExportItem[]>(() => {
     height: displaySizeOf(image).height,
     originalSize: image.size,
     detailScale: image.enhance?.resolution ?? 1,
+    background: image.editBackground ?? TRANSPARENT_BACKGROUND,
     render: (scale: number, background: string | null, region?: OutputRegion) =>
       renderStitch(
         document.createElement('canvas'),
@@ -521,9 +635,13 @@ const exportItems = computed<ExportItem[]>(() => {
 const exportCurrentId = computed(() =>
   isStitchMode.value ? 'stitch' : (editCurrent.value?.id ?? null),
 )
-// 单图导出保留原图透明（JPG 例外，按白底）；拼接用底栏选的背景。
+// 拼接用底栏选的背景；单图每张图各自设底色（在导出项里），没设时保留原图透明（JPG 例外，按白底）。
 const exportBackground = computed(() =>
   isStitchMode.value ? background.value : TRANSPARENT_BACKGROUND,
+)
+/** 预览的底色：拼接是底栏的背景，单图是正在编辑那张的底色 */
+const previewBackground = computed(() =>
+  isStitchMode.value ? background.value : (editCurrent.value?.editBackground ?? TRANSPARENT_BACKGROUND),
 )
 
 function summarize(names: string[]): string {
@@ -695,6 +813,14 @@ function onSharpenFailed(message: string): void {
 
 function onHealNotice(message: string): void {
   push({ tone: 'info', title: '修瑕', message })
+}
+
+function onMatteNotice(message: string): void {
+  push({ tone: 'info', title: '抠图与去背景', message })
+}
+
+function onMatteFailed(message: string): void {
+  push({ tone: 'error', title: '抠图与去背景失败', message: `${message}。图片保持原样，可以重试。` })
 }
 
 function insertBlankPage(): void {
@@ -902,7 +1028,7 @@ function onExported(summary: ExportSummary): void {
             ref="settingsButtonRef"
             class="button button-secondary header-page-button header-page-button--collapse"
             type="button"
-            title="调整预览缩略图、局部修瑕与配置文件"
+            title="调整预览缩略图、局部修瑕、清晰化、抠图与去背景和配置文件"
             aria-label="设置"
             @click="openSettings"
           >
@@ -1037,25 +1163,36 @@ function onExported(summary: ExportSummary): void {
           :zoom-toolbar="settings.zoomToolbar"
           :blank-panel="settings.blankPanel"
           :thumbnail-panel="settings.thumbnailPanel"
-          :background="exportBackground"
+          :background="previewBackground"
           :single-image="!isStitchMode"
           :sharpen-engine="settings.sharpenEngine"
           :ai-models="aiModelChoices"
           :ai-model-key="aiModelKey"
           :heal-engine="healEngineChoice"
+          :matte-model="matteModelChoice"
+          :segment-model="segmentModelChoice"
           :frame="isStitchMode ? stitchFrameTransform : null"
           :base-size="isStitchMode ? { width: layout.width, height: layout.height } : null"
+          :canvas-size="isStitchMode ? canvasSize : null"
+          :content-size="isStitchMode ? { width: contentLayout.width, height: contentLayout.height } : null"
+          :snap="settings.stitchSnap"
           @pick="openFilePicker"
           @add="handleAdd"
           @active-change="onActiveChange"
           @resize-blank="resizeBlankPage"
           @set-transform="setImageTransform"
           @set-frame="setStitchFrame"
+          @set-position="setStitchPosition"
+          @set-layers="setStitchLayers"
+          @set-canvas="canvasSize = $event"
+          @update-snap="updateSettings({ stitchSnap: $event })"
           @update-panel="onPanelUpdate"
           @heal-failed="onHealFailed"
           @heal-notice="onHealNotice"
           @busy-change="isPreviewBusy = $event"
           @sharpen-failed="onSharpenFailed"
+          @matte-notice="onMatteNotice"
+          @matte-failed="onMatteFailed"
           @update-sharpen-engine="updateSettings({ sharpenEngine: $event })"
           @update-sharpen-model="updateSettings({ sharpenModel: $event })"
         />
@@ -1072,7 +1209,9 @@ function onExported(summary: ExportSummary): void {
           :images="editImages"
           :current="editCurrent"
           :locked="isPreviewBusy"
+          :format="settings.exportOptions.format"
           @select="selectEditImage"
+          @update-background="setEditBackground"
         />
       </section>
     </main>

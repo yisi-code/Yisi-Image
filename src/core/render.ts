@@ -1,6 +1,7 @@
 import { drawAnnotations } from './annotations'
 import type { DrawAnnotationsOptions } from './annotations'
-import { getImageSource } from './image'
+import { getImageSource, pixelSizeOf } from './image'
+import { paintOrder } from './layout'
 import { transformOf } from './imageTransform'
 import { getPreviewFit } from './preview'
 import type { PreviewOffset } from './preview'
@@ -37,6 +38,11 @@ export interface ViewportRenderOptions {
   hiddenAnnotationId?: string | null
   /** 前后对比：中线在视口宽度的比例（0–1），左边画原图；null 不对比 */
   compareSplit?: number | null
+  /**
+   * 抠图选区的高亮：overlay 是已经着好色、与原图同比例的画布，按这张图的缩放与裁剪盖在图片上；
+   * 为空时不画。
+   */
+  highlight?: { imageId: string; overlay: HTMLCanvasElement } | null
 }
 
 /** 透明背景在预览里的棋盘格，格子按屏幕像素算，缩放时大小不变；导出对比预览也用它。 */
@@ -64,17 +70,6 @@ export function getCheckerPattern(context: CanvasRenderingContext2D): CanvasPatt
   return context.createPattern(checkerTile, 'repeat') ?? CHECKER_LIGHT
 }
 
-/** 绘制源的实际像素尺寸：清晰化结果画布可能是原图的 2 倍、4 倍。 */
-function sourcePixelSize(source: CanvasImageSource, fallback: { width: number; height: number }) {
-  if (source instanceof HTMLImageElement) {
-    return { width: source.naturalWidth || fallback.width, height: source.naturalHeight || fallback.height }
-  }
-  if (source instanceof HTMLCanvasElement || source instanceof ImageBitmap) {
-    return { width: source.width, height: source.height }
-  }
-  return fallback
-}
-
 /**
  * 画一张图到 (x, y, width, height)：按变换只取裁剪区域，标注与修瑕在原图坐标里，
  * 跟着同样的裁剪与缩放画上去；裁剪过时把区域外的标注裁掉。
@@ -98,7 +93,7 @@ function paintStitchImage(
   } else {
     const source = original ? image.element : getImageSource(image)
     if (source) {
-      const pixels = sourcePixelSize(source, image)
+      const pixels = pixelSizeOf(source, image)
       const kx = pixels.width / image.width
       const ky = pixels.height / image.height
       context.drawImage(
@@ -165,7 +160,7 @@ export function renderStitch(
   context.imageSmoothingQuality = 'high'
 
   const imageById = new Map(images.map((image) => [image.id, image]))
-  for (const item of layout.items) {
+  for (const item of paintOrder(layout.items)) {
     const image = imageById.get(item.id)
     if (!image) {
       continue
@@ -252,7 +247,8 @@ export function renderStitchView(
   context.imageSmoothingQuality = 'high'
 
   const imageById = new Map(images.map((image) => [image.id, image]))
-  for (const item of layout.items) {
+  const ordered = paintOrder(layout.items)
+  for (const item of ordered) {
     const image = imageById.get(item.id)
     if (!image) {
       continue
@@ -261,6 +257,25 @@ export function renderStitchView(
       isPreview: true,
       hiddenId: options.hiddenAnnotationId,
     })
+  }
+  const highlight = options.highlight
+  const highlightImage = highlight ? imageById.get(highlight.imageId) : null
+  const highlightItem = highlight ? layout.items.find((item) => item.id === highlight.imageId) : null
+  if (highlight && highlightImage && highlightItem) {
+    const { crop } = transformOf(highlightImage)
+    const kx = highlight.overlay.width / highlightImage.width
+    const ky = highlight.overlay.height / highlightImage.height
+    context.drawImage(
+      highlight.overlay,
+      crop.x * kx,
+      crop.y * ky,
+      crop.width * kx,
+      crop.height * ky,
+      highlightItem.x,
+      highlightItem.y,
+      highlightItem.width,
+      highlightItem.height,
+    )
   }
   context.restore()
 
@@ -281,7 +296,7 @@ export function renderStitchView(
     context.scale(contentWidth / layout.width, contentHeight / layout.height)
     context.imageSmoothingEnabled = true
     context.imageSmoothingQuality = 'high'
-    for (const item of layout.items) {
+    for (const item of ordered) {
       const image = imageById.get(item.id)
       if (image) {
         paintStitchImage(context, image, item.x, item.y, item.width, item.height, {}, true)

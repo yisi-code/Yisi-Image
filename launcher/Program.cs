@@ -354,7 +354,7 @@ namespace Yisi.ImageTool
             return selected;
         }
 
-        private string PickModelFileOnUiThread(string initialDirectory)
+        private string PickModelFileOnUiThread(string title)
         {
             string selected = null;
             Exception failure = null;
@@ -370,9 +370,9 @@ namespace Yisi.ImageTool
                 try
                 {
                     selected = FolderPicker.PickFile(
-                        "选择要导入的 ONNX 清晰化模型",
+                        title,
                         "ONNX 模型 (*.onnx)|*.onnx",
-                        initialDirectory);
+                        null);
                 }
                 catch (Exception ex)
                 {
@@ -537,7 +537,7 @@ namespace Yisi.ImageTool
         /// </summary>
         internal Func<string, string> PickFolderRequested { get; set; }
 
-        /// <summary>设置页请求导入模型文件时调用，参数是初始目录；返回选中的文件，取消时返回 null。</summary>
+        /// <summary>设置页请求导入模型文件时调用，参数是窗口标题；返回选中的文件，取消时返回 null。</summary>
         internal Func<string, string> PickFileRequested { get; set; }
 
         public StaticServer(string url)
@@ -961,11 +961,30 @@ namespace Yisi.ImageTool
                     {
                         // 先校验用途再弹窗，免得选完文件才报错。
                         string kind = CustomModelStore.NormalizeKind(ReadOptionalStringField(request.Body, "kind"));
-                        string selected = picker(null);
-                        json = selected == null
+                        string purpose = CustomModelStore.PurposeText(kind);
+                        string imported = null;
+                        if (kind == CustomModelStore.KindSegment)
+                        {
+                            // 抠图模型是一对文件：先选图像编码器，再选掩码解码器；任一步取消都不导入。
+                            string encoder = picker("第 1 步：选择抠图模型的图像编码器（ONNX）");
+                            string decoder = encoder == null ? null : picker("第 2 步：选择配套的掩码解码器（ONNX）");
+                            if (decoder != null)
+                            {
+                                imported = CustomModelStore.ImportPair(encoder, decoder);
+                            }
+                        }
+                        else
+                        {
+                            string selected = picker("选择要导入的 ONNX " + purpose + "模型");
+                            if (selected != null)
+                            {
+                                imported = CustomModelStore.Import(selected, kind);
+                            }
+                        }
+                        json = imported == null
                             ? "{\"canceled\":true," + ModelStore.DescribeJson().Substring(1)
                             : "{\"imported\":" +
-                                new JavaScriptSerializer().Serialize(CustomModelStore.Import(selected, kind)) +
+                                new JavaScriptSerializer().Serialize(imported) +
                                 "," + ModelStore.DescribeJson().Substring(1);
                     }
                 }

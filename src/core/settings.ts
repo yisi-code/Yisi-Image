@@ -5,6 +5,7 @@ import type { ExportOptions } from './exportOptions'
 import { normalizeFloatingPosition } from './floating'
 import type { FloatingPosition } from './floating'
 import { DEFAULT_GAP, clampGap } from './layout'
+import { DEFAULT_MATTE_MODEL, DEFAULT_SEGMENT_MODEL } from './matteModels'
 import { isCustomModelKey } from './modelApi'
 import type { CustomModelKey, HealModelId } from './modelApi'
 
@@ -40,6 +41,8 @@ export interface ToolSettings {
   gap: number
   /** 拼接背景，与底部控制条同步。 */
   background: StitchBackground
+  /** 拼接时拖动图片是否吸附到其他图片和画布的边、中线 */
+  stitchSnap: boolean
   annotationToolbar: PanelState
   zoomToolbar: PanelState
   blankPanel: PanelState
@@ -49,6 +52,10 @@ export interface ToolSettings {
   sharpenEngine: SharpenEngine
   /** AI 清晰化用的模型编号 */
   sharpenModel: string
+  /** 去除背景用的模型：内置模型编号或自定义模型编号（custom-…） */
+  matteModel: string
+  /** 点选抠图用的模型：内置模型编号或自定义模型编号 */
+  segmentModel: string
   /** 上次使用的工作区，下次打开沿用 */
   workMode: WorkMode
   /** 导出对话框的格式与压缩设置，拼接与单图共用 */
@@ -208,6 +215,7 @@ export const DEFAULT_SETTINGS: Readonly<ToolSettings> = Object.freeze({
   thumbnailFit: 'contain',
   gap: DEFAULT_GAP,
   background: DEFAULT_BACKGROUND,
+  stitchSnap: true,
   annotationToolbar: DEFAULT_PANEL_STATE,
   zoomToolbar: DEFAULT_PANEL_STATE,
   blankPanel: DEFAULT_PANEL_STATE,
@@ -215,6 +223,8 @@ export const DEFAULT_SETTINGS: Readonly<ToolSettings> = Object.freeze({
   healEngine: 'classic',
   sharpenEngine: 'classic',
   sharpenModel: DEFAULT_SHARPEN_MODEL,
+  matteModel: DEFAULT_MATTE_MODEL,
+  segmentModel: DEFAULT_SEGMENT_MODEL,
   workMode: 'stitch',
   exportOptions: DEFAULT_EXPORT_OPTIONS,
 })
@@ -233,6 +243,11 @@ function isFit(value: unknown): value is ThumbnailFit {
 
 function isHealEngine(value: unknown): value is HealEngine {
   return value === 'classic' || value === 'migan' || value === 'lama' || isCustomModelKey(value)
+}
+
+/** 模型编号：内置编号或 custom-…；格式不对时用默认 */
+function normalizeModelKey(value: unknown, fallback: string): string {
+  return typeof value === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(value) ? value : fallback
 }
 
 function normalizeGap(value: unknown): number {
@@ -262,6 +277,7 @@ export function normalizeSettings(value: unknown): ToolSettings {
       : DEFAULT_SETTINGS.thumbnailFit,
     gap: normalizeGap(parsed.gap),
     background: normalizeBackground(parsed.background),
+    stitchSnap: parsed.stitchSnap !== false,
     annotationToolbar: normalizePanelState(parsed.annotationToolbar),
     zoomToolbar: normalizePanelState(parsed.zoomToolbar),
     blankPanel: normalizePanelState(parsed.blankPanel),
@@ -270,10 +286,9 @@ export function normalizeSettings(value: unknown): ToolSettings {
     // 旧版本存的是模型编号 realesrgan，等于「AI + Real-ESRGAN」。
     sharpenEngine:
       parsed.sharpenEngine === 'ai' || parsed.sharpenEngine === 'realesrgan' ? 'ai' : 'classic',
-    sharpenModel:
-      typeof parsed.sharpenModel === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(parsed.sharpenModel)
-        ? parsed.sharpenModel
-        : DEFAULT_SHARPEN_MODEL,
+    sharpenModel: normalizeModelKey(parsed.sharpenModel, DEFAULT_SHARPEN_MODEL),
+    matteModel: normalizeModelKey(parsed.matteModel, DEFAULT_MATTE_MODEL),
+    segmentModel: normalizeModelKey(parsed.segmentModel, DEFAULT_SEGMENT_MODEL),
     workMode: parsed.workMode === 'single' ? 'single' : 'stitch',
     exportOptions: normalizeExportOptions(parsed.exportOptions),
   }

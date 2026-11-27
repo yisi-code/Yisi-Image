@@ -266,13 +266,21 @@ export function displaySizeOf(image: TransformSource): Size {
   return { width: transform.width, height: transform.height }
 }
 
-/** 给布局计算用：编号加显示尺寸。 */
-export function layoutSourceOf(image: TransformSource & Pick<StitchImage, 'id'>): {
+/** 给布局计算用：编号、显示尺寸，以及拼接时拖出的位移和图层。 */
+export function layoutSourceOf(image: TransformSource & Pick<StitchImage, 'id' | 'position' | 'layer'>): {
   id: string
   width: number
   height: number
+  offsetX?: number
+  offsetY?: number
+  layer?: number
 } {
-  return { id: image.id, ...displaySizeOf(image) }
+  return {
+    id: image.id,
+    ...displaySizeOf(image),
+    ...(image.position ? { offsetX: image.position.x, offsetY: image.position.y } : {}),
+    ...(image.layer === undefined ? {} : { layer: image.layer }),
+  }
 }
 
 /**

@@ -1,29 +1,21 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed } from 'vue'
 import type { CSSProperties } from 'vue'
-import { AlertTriangle, Columns3, Rows3 } from 'lucide-vue-next'
+import { Columns3, Rows3 } from 'lucide-vue-next'
+import BackgroundPicker from './BackgroundPicker.vue'
 import { getExportFormat, isTransparencyDropped } from '../core/exportFormats'
 import type { ExportFormat } from '../core/exportFormats'
 import { MAX_GAP, MIN_GAP, clampGap } from '../core/layout'
-import { TRANSPARENT_BACKGROUND, normalizeBackground } from '../core/settings'
+import { TRANSPARENT_BACKGROUND } from '../core/settings'
 import type { StitchBackground } from '../core/settings'
 import type { StitchDirection } from '../core/types'
 
-interface BackgroundPreset {
-  value: StitchBackground
-  label: string
-  /** 提示里的底色叫法 */
-  name: string
+/** 提示里的底色叫法 */
+const BACKGROUND_NAMES: Record<string, string> = {
+  '#ffffff': '白底',
+  '#000000': '黑底',
+  [TRANSPARENT_BACKGROUND]: '透明底',
 }
-
-const BACKGROUND_PRESETS: readonly BackgroundPreset[] = [
-  { value: '#ffffff', label: '白', name: '白底' },
-  { value: '#000000', label: '黑', name: '黑底' },
-  { value: TRANSPARENT_BACKGROUND, label: '透明', name: '透明底' },
-]
-
-/** 还没选过自定义颜色时，取色器打开时的初始颜色 */
-const DEFAULT_CUSTOM_BACKGROUND = '#808080'
 
 const props = withDefaults(
   defineProps<{
@@ -53,30 +45,8 @@ const rangeStyle = computed(
   () => ({ '--range-progress': `${gapPercent.value}%` }) as CSSProperties,
 )
 
-const activePreset = computed(
-  () => BACKGROUND_PRESETS.find((preset) => preset.value === props.background) ?? null,
-)
-
-/** 取色器显示的颜色：当前是自定义色就用它，否则记住上次选过的自定义色。 */
-const customBackground = ref(activePreset.value ? DEFAULT_CUSTOM_BACKGROUND : props.background)
-
-watch(
-  () => props.background,
-  (value) => {
-    if (!BACKGROUND_PRESETS.some((preset) => preset.value === value)) {
-      customBackground.value = value
-    }
-  },
-)
-
 const transparencyDropped = computed(() =>
   isTransparencyDropped(props.background, getExportFormat(props.format)),
-)
-
-const transparentTitle = computed(() =>
-  transparencyDropped.value
-    ? 'JPG 不支持透明，导出时按白底填充；PNG、WebP 保留透明'
-    : '背景透明，导出 PNG / WebP 时保留透明',
 )
 
 const backgroundHint = computed(() => {
@@ -84,25 +54,13 @@ const backgroundHint = computed(() => {
     return 'JPG 不支持透明 · 按白底导出'
   }
   // 图片可在「调整」里缩放、裁剪，不再写「原图尺寸」。
-  return `底色 · ${activePreset.value?.name ?? '自定义'}`
+  return `底色 · ${BACKGROUND_NAMES[props.background] ?? '自定义'}`
 })
 
 function setDirection(value: StitchDirection): void {
   if (value !== props.direction) {
     emit('update:direction', value)
   }
-}
-
-function setBackground(value: StitchBackground): void {
-  if (!props.disabled && value !== props.background) {
-    emit('update:background', value)
-  }
-}
-
-function onCustomBackgroundInput(event: Event): void {
-  const value = normalizeBackground((event.target as HTMLInputElement).value)
-  customBackground.value = value
-  setBackground(value)
 }
 
 function applyGap(raw: string, input?: HTMLInputElement): void {
@@ -204,60 +162,15 @@ function onRangeInput(event: Event): void {
       />
     </div>
 
-    <div class="control-group background-group">
-      <span class="control-label">背景</span>
-      <div class="segmented" role="group" aria-label="拼接背景">
-        <button
-          v-for="preset in BACKGROUND_PRESETS"
-          :key="preset.value"
-          type="button"
-          class="segment"
-          :class="{ 'is-active': background === preset.value }"
-          :aria-pressed="background === preset.value"
-          :disabled="disabled"
-          :title="
-            preset.value === TRANSPARENT_BACKGROUND
-              ? transparentTitle
-              : `图片之间的空位和间距填${preset.label}色`
-          "
-          @click="setBackground(preset.value)"
-        >
-          <span
-            class="background-swatch"
-            :class="{ 'background-swatch--transparent': preset.value === TRANSPARENT_BACKGROUND }"
-            :style="preset.value === TRANSPARENT_BACKGROUND ? undefined : { background: preset.value }"
-            aria-hidden="true"
-          />
-          <span>{{ preset.label }}</span>
-          <AlertTriangle
-            v-if="preset.value === TRANSPARENT_BACKGROUND && transparencyDropped"
-            class="background-warning"
-            :size="12"
-            :stroke-width="2"
-            aria-hidden="true"
-          />
-        </button>
-        <label
-          class="segment background-custom"
-          :class="{ 'is-active': !activePreset, 'is-disabled': disabled }"
-          title="自定义背景色"
-        >
-          <span
-            class="background-swatch"
-            :style="{ background: customBackground }"
-            aria-hidden="true"
-          />
-          <span>自定义</span>
-          <input
-            type="color"
-            :value="customBackground"
-            :disabled="disabled"
-            aria-label="自定义背景色"
-            @input="onCustomBackgroundInput"
-          />
-        </label>
-      </div>
-    </div>
+    <BackgroundPicker
+      class="background-group"
+      :background="background"
+      :format="format"
+      :disabled="disabled"
+      fill-target="图片之间的空位和间距"
+      group-label="拼接背景"
+      @update:background="emit('update:background', $event)"
+    />
 
     <span class="control-hint" :class="{ 'is-warning': transparencyDropped }">
       {{ backgroundHint }}
@@ -297,72 +210,12 @@ function onRangeInput(event: Event): void {
   gap: 12px;
 }
 
-.direction-group,
-.background-group {
+.direction-group {
   flex: 0 0 auto;
 }
 
 .stitch-controls .segment {
   white-space: nowrap;
-}
-
-.background-group .segment {
-  padding: 0 9px;
-}
-
-.background-swatch {
-  width: 12px;
-  height: 12px;
-  flex: 0 0 12px;
-  border: 1px solid var(--border-strong);
-  border-radius: 50%;
-}
-
-.background-warning {
-  flex: 0 0 auto;
-  margin-left: -1px;
-  color: var(--warning);
-}
-
-.background-swatch--transparent {
-  background: repeating-conic-gradient(var(--surface-inset) 0 25%, var(--surface) 0 50%) 0 0 /
-    6px 6px;
-}
-
-/* 取色器铺满整个分段并设为透明：点哪里都打开取色器，弹出位置也贴着按钮。 */
-.background-custom {
-  position: relative;
-  cursor: pointer;
-}
-
-.background-custom input {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  padding: 0;
-  border: 0;
-  opacity: 0;
-  cursor: pointer;
-}
-
-.background-custom:hover:not(.is-active):not(.is-disabled) {
-  color: var(--text);
-}
-
-/* 取色器本身透明看不到焦点框，键盘聚焦时把焦点框画在分段上。 */
-.background-custom:has(input:focus-visible) {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-.background-custom.is-disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-.background-custom.is-disabled input {
-  cursor: not-allowed;
 }
 
 .control-hint {

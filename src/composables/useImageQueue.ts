@@ -131,6 +131,33 @@ export function useImageQueue() {
     }
   }
 
+  /** 拼接时拖动一张图：position 是相对自动位置的位移（布局像素）；null 表示归位。 */
+  function setPosition(id: string, position: { x: number; y: number } | null): void {
+    const target = images.value.find((image) => image.id === id)
+    if (target) {
+      target.position = position && (position.x !== 0 || position.y !== 0) ? { ...position } : undefined
+    }
+  }
+
+  /** 按从下往上的编号顺序重排图层：每张图的图层就是它在顺序里的位置。 */
+  function setLayerOrder(order: readonly string[]): void {
+    const rank = new Map(order.map((id, index) => [id, index]))
+    for (const image of images.value) {
+      const layer = rank.get(image.id)
+      if (layer !== undefined) {
+        image.layer = layer
+      }
+    }
+  }
+
+  /** 单图编辑：这张图透明处填的底色；transparent 时去掉。 */
+  function setEditBackground(id: string, background: string): void {
+    const target = images.value.find((image) => image.id === id)
+    if (target) {
+      target.editBackground = background === 'transparent' ? undefined : background
+    }
+  }
+
   function moveImage(from: number, to: number): void {
     const lastIndex = images.value.length - 1
     if (from === to || from < 0 || to < 0 || from > lastIndex || to > lastIndex) {
@@ -187,6 +214,9 @@ export function useImageQueue() {
     addBlankAt,
     resizeBlank,
     setTransform,
+    setPosition,
+    setLayerOrder,
+    setEditBackground,
     removeImage,
     moveImage,
     clearImages,
